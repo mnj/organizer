@@ -179,15 +179,13 @@ pub fn load_or_create(source_folder: &Path) -> std::io::Result<Config> {
     let mut file = OpenOptions::new().read(true).open(&path)?;
     #[cfg(unix)]
     {
-        use fs2::FileExt;
-        let _ = file.lock_shared();
+        let _ = fs2::FileExt::lock_shared(&file);
     }
     let mut buf = String::new();
     file.read_to_string(&mut buf)?;
     #[cfg(unix)]
     {
-        use fs2::FileExt;
-        let _ = file.unlock();
+        let _ = fs2::FileExt::unlock(&file);
     }
     let cfg: Config = toml::from_str(&buf).map_err(|e| {
         std::io::Error::new(
@@ -200,15 +198,14 @@ pub fn load_or_create(source_folder: &Path) -> std::io::Result<Config> {
     Ok(cfg)
 }
 
-/// Save config atomically: write temp + fsync + rename + fsync parent, with flock exclusive.
-/// Uses tempfile in same directory then rename.
+/// Save config atomically: write temp + fsync + rename + flock+fsync parent.
+/// Pattern: write temp in same dir, fsync temp, rename atomic, then open dest,
+/// flock exclusive, fsync, unlock, then fsync parent dir.
 pub fn save_config(source_folder: &Path, config: &Config) -> std::io::Result<()> {
-    // Validate before saving? Keep strict: caller should validate, but we also guard max/min
     let toml_str = toml::to_string(config).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, format!("toml serialize: {e}"))
     })?;
     let dir = source_folder;
-    // ensure dir exists
     std::fs::create_dir_all(dir)?;
     let path = config_path(dir);
     // write to temp file in same dir
@@ -216,24 +213,25 @@ pub fn save_config(source_folder: &Path, config: &Config) -> std::io::Result<()>
     tmp.write_all(toml_str.as_bytes())?;
     tmp.flush()?;
     tmp.as_file().sync_all()?;
-    // flock exclusive on temp? Actually lock destination after rename. Keep simple: lock temp then rename.
-    #[cfg(unix)]
+    // atomic rename - this is the critical section; temp file is fsynced before rename
+    tmp.persist(&path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("persist: {e}")))?;
+    // flock exclusive + fsync on the final file (holds lock across fsync, per ADR 0001/0006)
     {
-        use fs2::FileExt;
-        let _ = tmp.as_file().lock_exclusive();
+        let f = OpenOptions::new().read(true).write(true).open(&path)?;
+        #[cfg(unix)]
+        {
+            use fs2::FileExt;
+            f.lock_exclusive()?;
+            f.sync_all()?;
+            f.unlock()?;
+        }
+        #[cfg(not(unix))]
+        {
+            f.sync_all()?;
+        }
     }
-    // persist via rename
-    tmp.persist(&path).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("persist: {e}")))?;
-    // fsync the file and parent dir
-    let f = OpenOptions::new().read(true).open(&path)?;
-    f.sync_all()?;
-    #[cfg(unix)]
-    {
-        use fs2::FileExt;
-        let _ = f.lock_exclusive();
-        let _ = f.unlock();
-    }
-    // fsync parent dir
+    // fsync parent dir to persist rename
     if let Ok(dir_file) = OpenOptions::new().read(true).open(dir) {
         let _ = dir_file.sync_all();
     }

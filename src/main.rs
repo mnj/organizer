@@ -5,7 +5,7 @@ use gtk4::{
     gdk, gio, glib, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, Entry,
     Label, Orientation, Paned, Stack,
 };
-use organizer_lib::config::{load_or_create, save_config, slugify, validate_actions, Action};
+use organizer_lib::config::{load_or_create, Action};
 use organizer_lib::queue::build_snapshot;
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -68,529 +68,7 @@ fn is_entry_focused(window: &ApplicationWindow) -> bool {
     false
 }
 
-fn open_settings(
-    parent: &ApplicationWindow,
-    source_folder: PathBuf,
-    live_actions: Rc<RefCell<Vec<Action>>>,
-    disk_actions: Rc<RefCell<Vec<Action>>>,
-    rebuild_action_bar: Rc<dyn Fn()>,
-    config_version: u32,
-) {
-    let win = gtk4::Window::builder()
-        .transient_for(parent)
-        .modal(true)
-        .title("Settings — Actions")
-        .default_width(760)
-        .default_height(520)
-        .build();
-
-    let vbox = GtkBox::new(Orientation::Vertical, 8);
-    vbox.set_margin_top(12);
-    vbox.set_margin_bottom(12);
-    vbox.set_margin_start(12);
-    vbox.set_margin_end(12);
-
-    let title = Label::new(Some("Actions — per-folder organizer.toml"));
-    title.add_css_class("title-3");
-    title.set_halign(gtk4::Align::Start);
-    vbox.append(&title);
-
-    let hint = Label::new(Some("Per-folder config: copied with the folder, slug a-z0-9_-"));
-    hint.add_css_class("dim-label");
-    hint.set_halign(gtk4::Align::Start);
-    vbox.append(&hint);
-
-    let scrolled = gtk4::ScrolledWindow::new();
-    scrolled.set_vexpand(true);
-    scrolled.set_hexpand(true);
-    let rows_box = GtkBox::new(Orientation::Vertical, 8);
-    rows_box.set_margin_top(8);
-    scrolled.set_child(Some(&rows_box));
-    vbox.append(&scrolled);
-
-    let validation_label = Label::new(None);
-    validation_label.add_css_class("error");
-    validation_label.set_wrap(true);
-    validation_label.set_halign(gtk4::Align::Start);
-    vbox.append(&validation_label);
-
-    let bottom = GtkBox::new(Orientation::Horizontal, 8);
-    let btn_add = Button::with_label("Add Action");
-    btn_add.set_tooltip_text(Some("Add new action (max 9)"));
-    let btn_save = Button::with_label("Save");
-    btn_save.add_css_class("suggested-action");
-    let btn_cancel = Button::with_label("Cancel");
-    bottom.append(&btn_add);
-    let spacer = GtkBox::new(Orientation::Horizontal, 0);
-    spacer.set_hexpand(true);
-    bottom.append(&spacer);
-    bottom.append(&btn_cancel);
-    bottom.append(&btn_save);
-    vbox.append(&bottom);
-
-    // ui_actions mirrors current UI edits, starts as live
-    let ui_actions: Rc<RefCell<Vec<Action>>> = Rc::new(RefCell::new(live_actions.borrow().clone()));
-
-    // Keep row containers and entries for Up/Down/Remove handling
-    // Store per-row widgets to allow swapping
-    struct RowHandle {
-        container: GtkBox,
-        display: Entry,
-        folder: Entry,
-        slug: Label,
-        dropdown: gtk4::DropDown,
-    }
-    let handles: Rc<RefCell<Vec<RowHandle>>> = Rc::new(RefCell::new(Vec::new()));
-
-    // validation closure
-    let validate_and_live = {
-        let ui_clone = ui_actions.clone();
-        let validation_c = validation_label.clone();
-        let btn_save_c = btn_save.clone();
-        let btn_add_c = btn_add.clone();
-        let live_c = live_actions.clone();
-        let rebuild_c = rebuild_action_bar.clone();
-        let handles_c = handles.clone();
-        Rc::new(move || {
-            let actions = ui_clone.borrow().clone();
-            // Update dropdown tooltips for conflict preview
-            {
-                let hs = handles_c.borrow();
-                for h in hs.iter() {
-                    let cur = format!("{}", h.dropdown.selected() + 1);
-                    let count = actions.iter().filter(|a| a.shortcut == cur).count();
-                    if count > 1 {
-                        if let Some(owner) = actions.iter().find(|a| a.shortcut == cur) {
-                            h.dropdown
-                                .set_tooltip_text(Some(&format!("Shortcut {} already used by '{}'", cur, owner.display_name)));
-                        }
-                    } else {
-                        h.dropdown.set_tooltip_text(Some(&format!("Shortcut {} — {} or Ctrl+{}", cur, cur, cur)));
-                    }
-                }
-            }
-            match validate_actions(&actions) {
-                Ok(()) => {
-                    validation_c.set_text("");
-                    btn_save_c.set_sensitive(true);
-                    for h in handles_c.borrow().iter() {
-                        h.display.remove_css_class("error");
-                        h.folder.remove_css_class("error");
-                    }
-                    *live_c.borrow_mut() = actions.clone();
-                    rebuild_c();
-                }
-                Err(errs) => {
-                    let msg = errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
-                    validation_c.set_text(&msg);
-                    btn_save_c.set_sensitive(false);
-                    // mark errors
-                    let has_display = errs.iter().any(|e| matches!(e, organizer_lib::config::ValidationError::DuplicateDisplayName(_) | organizer_lib::config::ValidationError::EmptyDisplayName(_)));
-                    let has_folder = errs.iter().any(|e| matches!(e, organizer_lib::config::ValidationError::DuplicateFolderName(_) | organizer_lib::config::ValidationError::ReservedDuplicate(_) | organizer_lib::config::ValidationError::EmptySlug(_) | organizer_lib::config::ValidationError::ReservedPath(_)));
-                    for h in handles_c.borrow().iter() {
-                        if has_display {
-                            h.display.add_css_class("error");
-                        } else {
-                            h.display.remove_css_class("error");
-                        }
-                        if has_folder {
-                            h.folder.add_css_class("error");
-                        } else {
-                            h.folder.remove_css_class("error");
-                        }
-                    }
-                }
-            }
-            btn_add_c.set_sensitive(ui_clone.borrow().len() < 9);
-            if ui_clone.borrow().len() >= 9 {
-                btn_add_c.set_tooltip_text(Some("Max 9 actions"));
-            } else {
-                btn_add_c.set_tooltip_text(Some("Add new action (max 9)"));
-            }
-            // Update Up/Down sensitivities
-            let len = handles_c.borrow().len();
-            for (idx, h) in handles_c.borrow().iter().enumerate() {
-                // need mutable handle to set sensitive? Button set_sensitive takes &self
-                // we can call directly
-                let up_btn_sensitive = idx > 0;
-                let down_btn_sensitive = idx + 1 < len;
-                // Find Up/Down buttons via container children - we stored only entries, but we need buttons
-                // Instead we will update via stored RowHandle's container search
-                // Simpler: we stored only handles for entries; we need to update button sensitivities via handles' container children lookup
-                // We'll do search for buttons inside container
-                let mut child = h.container.first_child();
-                while let Some(c) = child {
-                    if let Some(btn) = c.downcast_ref::<Button>() {
-                        if let Some(t) = btn.tooltip_text() {
-                            if t == "Move up" {
-                                btn.set_sensitive(up_btn_sensitive);
-                            } else if t == "Move down" {
-                                btn.set_sensitive(down_btn_sensitive);
-                            } else if t.contains("Remove") || t.contains("At least") {
-                                btn.set_sensitive(len > 1);
-                                if len <= 1 {
-                                    btn.set_tooltip_text(Some("At least 1 action required"));
-                                } else {
-                                    btn.set_tooltip_text(Some("Remove"));
-                                }
-                            }
-                        }
-                    }
-                    child = c.next_sibling();
-                }
-            }
-        }) as Rc<dyn Fn()>
-    };
-
-    // Helper to create a row for a given index and Action
-    let create_row = {
-        let rows_box_c = rows_box.clone();
-        let ui_actions_c = ui_actions.clone();
-        let handles_c = handles.clone();
-        let validate_c = validate_and_live.clone();
-        Rc::new(move |idx: usize, act: Action| {
-            let row = GtkBox::new(Orientation::Horizontal, 8);
-            row.set_margin_bottom(4);
-
-            let display_entry = Entry::new();
-            display_entry.set_placeholder_text(Some("Display name"));
-            display_entry.set_text(&act.display_name);
-            display_entry.set_hexpand(true);
-            display_entry.set_width_chars(12);
-
-            let folder_entry = Entry::new();
-            folder_entry.set_placeholder_text(Some("Folder name"));
-            folder_entry.set_text(&act.folder_name);
-            folder_entry.set_hexpand(true);
-            folder_entry.set_width_chars(12);
-
-            let slug = slugify(&act.folder_name);
-            let slug_label = Label::new(Some(&format!("→ ../{}/", if slug.is_empty() { "—".to_string() } else { slug.clone() })));
-            slug_label.add_css_class("dim-label");
-            slug_label.set_width_chars(14);
-            slug_label.set_xalign(0.0);
-            slug_label.set_tooltip_text(Some(&format!("sibling ../{}/, slug a-z0-9_-", slug)));
-
-            let list = gtk4::StringList::new(&["1","2","3","4","5","6","7","8","9"]);
-            let dropdown = gtk4::DropDown::new(Some(list), None::<gtk4::Expression>);
-            let sel = act.shortcut.parse::<u32>().ok().and_then(|n| if (1..=9).contains(&n) { Some(n-1) } else { None }).unwrap_or(0);
-            dropdown.set_selected(sel);
-            dropdown.set_tooltip_text(Some(&format!("Shortcut {} — {} or Ctrl+{}", act.shortcut, act.shortcut, act.shortcut)));
-
-            let btn_up = Button::builder().icon_name("go-up-symbolic").tooltip_text("Move up").build();
-            let btn_down = Button::builder().icon_name("go-down-symbolic").tooltip_text("Move down").build();
-            let btn_remove = Button::builder().icon_name("edit-delete-symbolic").tooltip_text("Remove").build();
-            btn_remove.add_css_class("destructive-action");
-
-            row.append(&display_entry);
-            row.append(&folder_entry);
-            row.append(&slug_label);
-            row.append(&dropdown);
-            row.append(&btn_up);
-            row.append(&btn_down);
-            row.append(&btn_remove);
-
-            rows_box_c.append(&row);
-
-            // store handle
-            handles_c.borrow_mut().push(RowHandle {
-                container: row.clone(),
-                display: display_entry.clone(),
-                folder: folder_entry.clone(),
-                slug: slug_label.clone(),
-                dropdown: dropdown.clone(),
-            });
-
-            // Wire signals
-            {
-                let ui_c = ui_actions_c.clone();
-                let slug_c = slug_label.clone();
-                let validate_cc = validate_c.clone();
-                display_entry.connect_changed(move |e| {
-                    let txt = e.text().to_string();
-                    if let Some(a) = ui_c.borrow_mut().get_mut(idx) {
-                        a.display_name = txt;
-                    }
-                    validate_cc();
-                });
-            }
-            {
-                let ui_c = ui_actions_c.clone();
-                let slug_c = slug_label.clone();
-                let validate_cc = validate_c.clone();
-                folder_entry.connect_changed(move |e| {
-                    let txt = e.text().to_string();
-                    let slug = slugify(&txt);
-                    slug_c.set_text(&format!("→ ../{}/", if slug.is_empty() { "—".into() } else { slug.clone() }));
-                    slug_c.set_tooltip_text(Some(&format!("sibling ../{}/, slug a-z0-9_-", slug)));
-                    if let Some(a) = ui_c.borrow_mut().get_mut(idx) {
-                        a.folder_name = txt;
-                    }
-                    validate_cc();
-                });
-            }
-            {
-                let ui_c = ui_actions_c.clone();
-                let validate_cc = validate_c.clone();
-                dropdown.connect_selected_notify(move |dd| {
-                    let sel = dd.selected();
-                    let sc = format!("{}", sel + 1);
-                    if let Some(a) = ui_c.borrow_mut().get_mut(idx) {
-                        a.shortcut = sc;
-                    }
-                    validate_cc();
-                });
-            }
-
-            // Up
-            {
-                let ui_c = ui_actions_c.clone();
-                let handles_c2 = handles_c.clone();
-                let validate_cc = validate_c.clone();
-                let rows_box_c2 = rows_box_c.clone();
-                btn_up.connect_clicked(move |_| {
-                    if idx == 0 { return; }
-                    // swap in ui_actions
-                    {
-                        let mut v = ui_c.borrow_mut();
-                        if idx < v.len() && idx > 0 {
-                            v.swap(idx, idx - 1);
-                        }
-                    }
-                    // swap widget texts by swapping entries' contents
-                    let hs = handles_c2.borrow();
-                    if idx < hs.len() && idx > 0 {
-                        let a = &hs[idx];
-                        let b = &hs[idx - 1];
-                        let a_disp = a.display.text().to_string();
-                        let b_disp = b.display.text().to_string();
-                        let a_fold = a.folder.text().to_string();
-                        let b_fold = b.folder.text().to_string();
-                        let a_sel = a.dropdown.selected();
-                        let b_sel = b.dropdown.selected();
-                        // block signals? just set
-                        a.display.set_text(&b_disp);
-                        b.display.set_text(&a_disp);
-                        a.folder.set_text(&b_fold);
-                        b.folder.set_text(&a_fold);
-                        a.dropdown.set_selected(b_sel);
-                        b.dropdown.set_selected(a_sel);
-                        // ui_actions already swapped, but entries' changed signals will overwrite; we need to ensure ui_actions matches swapped texts
-                        // After set_text, changed handlers will have updated ui_actions to swapped values again (double swap). To avoid, we already swapped ui_actions, then setting text will trigger changed which will set ui_actions[idx] to b's old value again — which is correct because we want ui_actions[idx] = previous idx-1 value. The first swap put ui[idx]=old idx-1, then setting a.display to b_disp will set ui[idx] to b_disp which equals old idx-1, so okay (no extra swap needed). But we swapped twice: first swap made ui[idx]=old idx-1, then setting display will set ui[idx] to b_disp (which is old idx-1) — same. So fine.
-                        // Similarly for idx-1
-                    }
-                    drop(hs);
-                    validate_cc();
-                });
-            }
-            {
-                let ui_c = ui_actions_c.clone();
-                let handles_c2 = handles_c.clone();
-                let validate_cc = validate_c.clone();
-                btn_down.connect_clicked(move |_| {
-                    let len = ui_c.borrow().len();
-                    if idx + 1 >= len { return; }
-                    {
-                        let mut v = ui_c.borrow_mut();
-                        v.swap(idx, idx + 1);
-                    }
-                    let hs = handles_c2.borrow();
-                    if idx + 1 < hs.len() {
-                        let a = &hs[idx];
-                        let b = &hs[idx + 1];
-                        let a_disp = a.display.text().to_string();
-                        let b_disp = b.display.text().to_string();
-                        let a_fold = a.folder.text().to_string();
-                        let b_fold = b.folder.text().to_string();
-                        let a_sel = a.dropdown.selected();
-                        let b_sel = b.dropdown.selected();
-                        a.display.set_text(&b_disp);
-                        b.display.set_text(&a_disp);
-                        a.folder.set_text(&b_fold);
-                        b.folder.set_text(&a_fold);
-                        a.dropdown.set_selected(b_sel);
-                        b.dropdown.set_selected(a_sel);
-                    }
-                    drop(hs);
-                    validate_cc();
-                });
-            }
-            {
-                let ui_c = ui_actions_c.clone();
-                let handles_c2 = handles_c.clone();
-                let rows_box_c2 = rows_box_c.clone();
-                let validate_cc = validate_c.clone();
-                let row_clone = row.clone();
-                btn_remove.connect_clicked(move |_| {
-                    if ui_c.borrow().len() <= 1 { return; }
-                    // remove from ui_actions
-                    {
-                        let mut v = ui_c.borrow_mut();
-                        if idx < v.len() {
-                            v.remove(idx);
-                        }
-                    }
-                    // remove from handles and UI
-                    // This is tricky because indices shift after removal; easiest: rebuild all rows from ui_actions
-                    // Full rebuild: clear rows_box and handles, recreate
-                    // To do full rebuild we need to call a function that recreates rows — we can trigger via idle that clears and rebuilds
-                    // For now, just remove this row's container and entry from handles vector at idx
-                    // Note: other rows' idx closures will be stale after removal — acceptable for minimal v1 but may cause wrong swap indices
-                    // We will do full rebuild via a helper closure that we can call here by clearing and re-adding
-                    // Quick path: remove UI element and handle entry
-                    rows_box_c2.remove(&row_clone);
-                    let mut hs = handles_c2.borrow_mut();
-                    if idx < hs.len() {
-                        hs.remove(idx);
-                    }
-                    drop(hs);
-                    // Need to fix remaining rows' indices? Their closures captured old idx, so after removal they point wrong.
-                    // For correctness we should rebuild entirely: clear and recreate rows from ui_actions
-                    // Let's do rebuild: save current ui_actions, clear rows_box and handles, then recreate all rows
-                    let current = ui_c.borrow().clone();
-                    // clear already partly, but we removed one — need to clear remaining
-                    while let Some(child) = rows_box_c2.first_child() {
-                        rows_box_c2.remove(&child);
-                    }
-                    handles_c2.borrow_mut().clear();
-                    // Recreate all rows by iterating current
-                    for (i, act) in current.into_iter().enumerate() {
-                        // To avoid infinite recursion, we need to not call create_row recursively inside this closure that is inside create_row
-                        // Instead we will manually duplicate row creation inline here without using create_row's captured idx logic
-                        // Simpler: just close and reopen settings? For now we will just validate and let user close/reopen
-                        // We'll instead just trigger a full window recreation via closing and reopening? Keep simple: remove row and validate, indices may drift but acceptable for test
-                    }
-                    validate_cc();
-                });
-            }
-        }) as Rc<dyn Fn(usize, Action)>
-    };
-
-    // Build initial rows
-    let initial = ui_actions.borrow().clone();
-    for (i, act) in initial.into_iter().enumerate() {
-        create_row(i, act);
-    }
-    // Initial validation
-    validate_and_live();
-
-    // Add button handling - creates new row via ui_actions push and create_row
-    {
-        let ui_c = ui_actions.clone();
-        let create_row_c = create_row.clone();
-        let validate_c = validate_and_live.clone();
-        btn_add.connect_clicked(move |_| {
-            let len = ui_c.borrow().len();
-            if len >= 9 { return; }
-            let used: std::collections::HashSet<String> = ui_c.borrow().iter().map(|a| a.shortcut.clone()).collect();
-            let mut new_short = "1".to_string();
-            for n in 1..=9 {
-                let s = format!("{n}");
-                if !used.contains(&s) {
-                    new_short = s;
-                    break;
-                }
-            }
-            let new_act = Action { display_name: "New Action".into(), folder_name: "new_action".into(), shortcut: new_short };
-            ui_c.borrow_mut().push(new_act.clone());
-            let idx = ui_c.borrow().len() - 1;
-            create_row_c(idx, new_act);
-            validate_c();
-        });
-    }
-
-    // Save/Cancel
-    {
-        let win_c = win.clone();
-        let source_c = source_folder.clone();
-        let ui_c = ui_actions.clone();
-        let live_c = live_actions.clone();
-        let disk_c = disk_actions.clone();
-        let rebuild_c = rebuild_action_bar.clone();
-        btn_save.connect_clicked(move |_| {
-            let collected = ui_c.borrow().clone();
-            if validate_actions(&collected).is_err() { return; }
-            let cfg = organizer_lib::config::Config { config_version, actions: collected.clone() };
-            match save_config(&source_c, &cfg) {
-                Ok(()) => {
-                    *live_c.borrow_mut() = collected.clone();
-                    *disk_c.borrow_mut() = collected.clone();
-                    rebuild_c();
-                    win_c.close();
-                }
-                Err(e) => {
-                    let dlg = gtk4::AlertDialog::builder().message(format!("Failed to save: {e}")).build();
-                    dlg.show(Some(&win_c));
-                }
-            }
-        });
-    }
-    {
-        let win_c = win.clone();
-        let live_c = live_actions.clone();
-        let disk_c = disk_actions.clone();
-        let rebuild_c = rebuild_action_bar.clone();
-        btn_cancel.connect_clicked(move |_| {
-            *live_c.borrow_mut() = disk_c.borrow().clone();
-            rebuild_c();
-            win_c.close();
-        });
-    }
-
-    // Close without Save prompts Save/Discard/Cancel
-    {
-        let win_c = win.clone();
-        let ui_c = ui_actions.clone();
-        let live_c = live_actions.clone();
-        let disk_c = disk_actions.clone();
-        let source_c = source_folder.clone();
-        let rebuild_c = rebuild_action_bar.clone();
-        win.connect_close_request(move |w| {
-            let collected = ui_c.borrow().clone();
-            let disk = disk_c.borrow().clone();
-            if collected == disk {
-                return glib::Propagation::Proceed;
-            }
-            let alert = gtk4::AlertDialog::builder()
-                .message("Save changes?")
-                .detail("You have unsaved changes to Actions. Save, discard, or cancel?")
-                .buttons(vec!["Save", "Discard", "Cancel"])
-                .default_button(2)
-                .cancel_button(2)
-                .build();
-            let win_clone = w.clone();
-            let source_clone = source_c.clone();
-            let live_clone = live_c.clone();
-            let disk_clone = disk_c.clone();
-            let rebuild_clone = rebuild_c.clone();
-            let collected_clone = collected.clone();
-            alert.choose(Some(w), gio::Cancellable::NONE, move |res| {
-                if let Ok(idx) = res {
-                    match idx {
-                        0 => {
-                            let cfg = organizer_lib::config::Config { config_version, actions: collected_clone.clone() };
-                            let _ = save_config(&source_clone, &cfg);
-                            *live_clone.borrow_mut() = collected_clone.clone();
-                            *disk_clone.borrow_mut() = collected_clone.clone();
-                            rebuild_clone();
-                            win_clone.close();
-                        }
-                        1 => {
-                            *live_clone.borrow_mut() = disk_clone.borrow().clone();
-                            rebuild_clone();
-                            win_clone.close();
-                        }
-                        _ => {}
-                    }
-                }
-            });
-            glib::Propagation::Stop
-        });
-    }
-
-    win.set_child(Some(&vbox));
-    win.present();
-}
+use organizer_lib::settings::{open_settings, SettingsContext};
 
 fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf) {
     let provider = css();
@@ -963,7 +441,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let rebuild_c = rebuild_action_bar.clone();
         let source_c = source_folder.clone();
         btn_settings.connect_clicked(move |_| {
-            open_settings(&win_c, source_c.clone(), live_c.clone(), disk_c.clone(), rebuild_c.clone(), config_version);
+            open_settings(&win_c, SettingsContext { source_folder: source_c.clone(), live_actions: live_c.clone(), disk_actions: disk_c.clone(), rebuild_action_bar: rebuild_c.clone(), config_version });
         });
     }
 
@@ -976,7 +454,6 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let show_toast_k = show_toast.clone();
         let live_k = live_actions.clone();
         let window_weak = window.downgrade();
-        let btn_settings_k = btn_settings.clone();
         let live_for_settings = live_actions.clone();
         let disk_for_settings = disk_actions.clone();
         let rebuild_for_settings = rebuild_action_bar.clone();
@@ -988,7 +465,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
             // Ctrl+, opens settings (comma)
             if is_ctrl && (key == gdk::Key::comma || key == gdk::Key::less) {
                 if let Some(win) = window_weak.upgrade() {
-                    open_settings(&win, source_for_settings.clone(), live_for_settings.clone(), disk_for_settings.clone(), rebuild_for_settings.clone(), config_version);
+                    open_settings(&win, SettingsContext { source_folder: source_for_settings.clone(), live_actions: live_for_settings.clone(), disk_actions: disk_for_settings.clone(), rebuild_action_bar: rebuild_for_settings.clone(), config_version });
                     return glib::Propagation::Stop;
                 }
             }
@@ -1085,7 +562,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let source_c = source_folder.clone();
         let action = gio::SimpleAction::new("preferences", None);
         action.connect_activate(move |_, _| {
-            open_settings(&win_c, source_c.clone(), live_c.clone(), disk_c.clone(), rebuild_c.clone(), config_version);
+            open_settings(&win_c, SettingsContext { source_folder: source_c.clone(), live_actions: live_c.clone(), disk_actions: disk_c.clone(), rebuild_action_bar: rebuild_c.clone(), config_version });
         });
         window.add_action(&action);
         // Also register in app for menu? For now window action
@@ -1112,6 +589,15 @@ fn main() -> glib::ExitCode {
     let app = Application::builder()
         .application_id("com.example.organizer")
         .build();
+
+    // Edit → Preferences menubar (third trigger per ADR 0006)
+    {
+        let edit_menu = gio::Menu::new();
+        edit_menu.append(Some("Preferences"), Some("win.preferences"));
+        let menu = gio::Menu::new();
+        menu.append_submenu(Some("Edit"), &edit_menu);
+        app.set_menubar(Some(&menu));
+    }
 
     let source_opt = args.source_folder.clone();
 

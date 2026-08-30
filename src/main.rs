@@ -92,6 +92,15 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
     file_label.set_halign(gtk4::Align::Center);
     file_label.set_valign(gtk4::Align::Center);
 
+    // Picture Contain HiDPI stub (real Texture lands here in tickets 06/07)
+    let picture = gtk4::Picture::new();
+    picture.set_content_fit(gtk4::ContentFit::Contain);
+    picture.set_can_shrink(true);
+    picture.set_hexpand(true);
+    picture.set_vexpand(true);
+    picture.set_halign(gtk4::Align::Fill);
+    picture.set_valign(gtk4::Align::Fill);
+
     let preview_center = GtkBox::new(Orientation::Vertical, 8);
     preview_center.set_halign(gtk4::Align::Center);
     preview_center.set_valign(gtk4::Align::Center);
@@ -99,6 +108,12 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
     preview_center.set_vexpand(true);
     let icon = Label::new(None);
     icon.set_markup(r#"<span size="60000">🖼️</span>"#);
+    // Overlay Picture as HiDPI stub underneath the emoji+label
+    let file_overlay = gtk4::Overlay::new();
+    file_overlay.set_hexpand(true);
+    file_overlay.set_vexpand(true);
+    file_overlay.set_child(Some(&picture));
+    file_overlay.add_overlay(&preview_center);
     preview_center.append(&icon);
     preview_center.append(&file_label);
 
@@ -129,7 +144,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
     empty_box.append(&empty_label);
     empty_box.append(&empty_btn);
 
-    stack.add_named(&preview_center, Some("file"));
+    stack.add_named(&file_overlay, Some("file"));
     stack.add_named(&ph_box, Some("unsupported"));
     stack.add_named(&empty_box, Some("empty"));
     preview_box.append(&stack);
@@ -261,7 +276,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         }
     };
 
-    // Empty button re-opens picker
+    // Empty button re-opens picker — rebuild shell with new Snapshot
     {
         let app_w = window.clone();
         let app_clone = app.clone();
@@ -269,16 +284,24 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
             let dlg = gtk4::FileDialog::new();
             dlg.set_title("Choose Source Folder");
             let app_c = app_clone.clone();
-            let win_c = app_w.clone();
-            dlg.select_folder(Some(&win_c), gio::Cancellable::NONE, move |res| {
+            let win_for_dialog = app_w.clone();
+            let win_for_closure = app_w.clone();
+            dlg.select_folder(Some(&win_for_dialog), gio::Cancellable::NONE, move |res| {
                 if let Ok(f) = res {
                     if let Some(p) = f.path() {
-                        if let Ok(snap) = build_snapshot(&p) {
-                            // rebuild shell with new folder — for scaffold, just toast
-                            let _ = &snap;
-                            // In real app we would rebuild; for scaffold we restart
-                            // Simplest: quit and ask user to relaunch
-                            let _ = app_c;
+                        match build_snapshot(&p) {
+                            Ok(snap) => {
+                                win_for_closure.close();
+                                build_shell(&app_c, snap, p);
+                            }
+                            Err(e) => {
+                                let lbl = Label::new(Some(&format!(
+                                    "Failed to read {}: {}",
+                                    p.display(),
+                                    e
+                                )));
+                                win_for_closure.set_child(Some(&lbl));
+                            }
                         }
                     }
                 }

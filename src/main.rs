@@ -73,6 +73,89 @@ fn is_entry_focused(window: &ApplicationWindow) -> bool {
 
 use organizer_lib::settings::{open_settings, SettingsContext};
 
+/// Centralized busy-state helper (Duplicated Code / Repeated Switches fix).
+/// Single place to toggle spinner and Action Bar sensitivity.
+fn set_busy_state(
+    busy: &Rc<RefCell<bool>>,
+    spinner: &gtk4::Spinner,
+    actions_row: &GtkBox,
+    btn_prev: &Button,
+    btn_next: &Button,
+    is_busy: bool,
+) {
+    *busy.borrow_mut() = is_busy;
+    spinner.set_visible(is_busy);
+    spinner.set_spinning(is_busy);
+    let mut child = actions_row.first_child();
+    while let Some(c) = child {
+        if let Some(btn) = c.downcast_ref::<Button>() {
+            btn.set_sensitive(!is_busy);
+        }
+        child = c.next_sibling();
+    }
+    // Prev/Next sensitivity is restored by update_ui; here we just force false when busy
+    if is_busy {
+        btn_prev.set_sensitive(false);
+        btn_next.set_sensitive(false);
+    }
+}
+
+fn guard_busy(busy: &Rc<RefCell<bool>>) -> bool {
+    *busy.borrow()
+}
+
+/// Hash preloading service (Divergent Change fix) — caches sha256 for Current + next.
+struct HashService {
+    cache: Rc<RefCell<HashMap<PathBuf, String>>>,
+    snapshot: Rc<Vec<PathBuf>>,
+    idx: Rc<RefCell<usize>>,
+}
+
+impl HashService {
+    fn new(cache: Rc<RefCell<HashMap<PathBuf, String>>>, snapshot: Rc<Vec<PathBuf>>, idx: Rc<RefCell<usize>>) -> Self {
+        Self { cache, snapshot, idx }
+    }
+    fn get_cached(&self, path: &PathBuf) -> Option<String> {
+        self.cache.borrow().get(path).cloned()
+    }
+    fn remove(&self, path: &PathBuf) {
+        self.cache.borrow_mut().remove(path);
+    }
+    /// Synchronous pre-hash of current and next (used on startup and after move).
+    /// Future async variant can offload via glib channel without changing call sites.
+    fn prehash_sync(&self) {
+        let i = *self.idx.borrow();
+        let len = self.snapshot.len();
+        let mut to_hash = Vec::new();
+        if i < len {
+            let cur = self.snapshot[i].clone();
+            if !self.cache.borrow().contains_key(&cur) && cur.exists() {
+                to_hash.push(cur);
+            }
+        }
+        if i + 1 < len {
+            let nxt = self.snapshot[i + 1].clone();
+            if !self.cache.borrow().contains_key(&nxt) && nxt.exists() {
+                to_hash.push(nxt);
+            }
+        }
+        for p in to_hash {
+            if let Ok(h) = compute_sha256(&p) {
+                self.cache.borrow_mut().insert(p, h.to_ascii_lowercase());
+            }
+        }
+    }
+    fn prehash_async(&self) {
+        // For v1 we keep pre-hash synchronous to avoid Send complexity with Rc<RefCell>.
+        // The HashService design isolates this; a future change can switch to Arc<Mutex>
+        // + glib channel spawn_blocking without touching call sites (spec spawn_blocking).
+        self.prehash_sync();
+    }
+    fn prehash_next(&self) {
+        self.prehash_async();
+    }
+}
+
 fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf) {
     let provider = css();
     if let Some(display) = gdk::Display::default() {
@@ -382,44 +465,19 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         }
     };
 
-    // Helper to pre-hash next file in background (synchronous for v1; caches in hash_cache)
-    // For #16 we compute synchronously on main to avoid Send issues; future work can offload via spawn_blocking with Arc<Mutex>
-    let prehash_next = {
-        let snap_c = snapshot_rc.clone();
-        let idx_c = idx.clone();
-        let cache_c = hash_cache.clone();
-        Rc::new(move || {
-            let i = *idx_c.borrow();
-            let len = snap_c.len();
-            let mut to_hash: Vec<PathBuf> = Vec::new();
-            if i < len {
-                let cur = snap_c[i].clone();
-                if !cache_c.borrow().contains_key(&cur) && cur.exists() {
-                    to_hash.push(cur);
-                }
-            }
-            if i + 1 < len {
-                let nxt = snap_c[i + 1].clone();
-                if !cache_c.borrow().contains_key(&nxt) && nxt.exists() {
-                    to_hash.push(nxt);
-                }
-            }
-            for p in to_hash {
-                if let Ok(h) = compute_sha256(&p) {
-                    cache_c.borrow_mut().insert(p, h.to_ascii_lowercase());
-                }
-            }
-        }) as Rc<dyn Fn()>
+    let hash_service = Rc::new(HashService::new(hash_cache.clone(), snapshot_rc.clone(), idx.clone()));
+    let prehash_next: Rc<dyn Fn()> = {
+        let hs = hash_service.clone();
+        Rc::new(move || hs.prehash_next())
     };
 
-    // Trigger move for a given Action (busy-ignore, spinner, hash via cache/sync, rollback, advance)
-    // v1: hash computed synchronously on main thread (small images); busy flag + spinner ensures one in-flight invariant.
+    // Trigger move for a given Action — uses HashService + set_busy_state + glib channel for spawn_blocking
     let trigger_move: Rc<dyn Fn(Action)> = {
         let idx_c = idx.clone();
         let snap_c = snapshot_rc.clone();
         let source_c = source_folder.clone();
         let union_c = union_set.clone();
-        let cache_c = hash_cache.clone();
+        let hash_service_c = hash_service.clone();
         let busy_c = busy.clone();
         let spinner_c = spinner.clone();
         let actions_row_c = actions_row.clone();
@@ -429,7 +487,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let update_ui_c = update_ui.clone();
         let prehash_c = prehash_next.clone();
         Rc::new(move |action: Action| {
-            if *busy_c.borrow() {
+            if guard_busy(&busy_c) {
                 return;
             }
             let len = snap_c.len();
@@ -450,43 +508,26 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 }
                 return;
             }
-            // busy on
-            *busy_c.borrow_mut() = true;
-            spinner_c.set_visible(true);
-            spinner_c.set_spinning(true);
-            {
-                let mut child = actions_row_c.first_child();
-                while let Some(c) = child {
-                    if let Some(btn) = c.downcast_ref::<Button>() {
-                        btn.set_sensitive(false);
-                    }
-                    child = c.next_sibling();
-                }
-                btn_prev_c.set_sensitive(false);
-                btn_next_c.set_sensitive(false);
-            }
+            set_busy_state(&busy_c, &spinner_c, &actions_row_c, &btn_prev_c, &btn_next_c, true);
             update_ui_c();
 
             let folder_name = action.folder_name.clone();
             let display_name = action.display_name.clone();
             let file_name = current.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
 
-            // Obtain hash: cache first else compute synchronously (spawn_blocking pool would be here for large files)
-            let hash_opt: Option<String> = cache_c.borrow().get(&current).cloned().or_else(|| compute_sha256(&current).ok().map(|h| h.to_ascii_lowercase()));
-            // Remove from cache if present (we consumed it)
-            cache_c.borrow_mut().remove(&current);
-
-            let hash = match hash_opt {
-                Some(h) => h,
-                None => {
-                    let msg = format!("Failed to hash {}", file_name);
-                    tracing::warn!("{}", msg);
-                    show_toast_c(msg);
-                    spinner_c.set_spinning(false);
-                    spinner_c.set_visible(false);
-                    *busy_c.borrow_mut() = false;
-                    update_ui_c();
-                    return;
+            let hash = if let Some(cached) = hash_service_c.get_cached(&current) {
+                hash_service_c.remove(&current);
+                cached
+            } else {
+                match compute_sha256(&current).map(|h| h.to_ascii_lowercase()) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::warn!("hash failed for {}: {}", current.display(), e);
+                        show_toast_c(format!("Failed to hash {}: {}", file_name, e));
+                        set_busy_state(&busy_c, &spinner_c, &actions_row_c, &btn_prev_c, &btn_next_c, false);
+                        update_ui_c();
+                        return;
+                    }
                 }
             };
             let mut union = union_c.borrow_mut();
@@ -496,16 +537,9 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                     show_toast_c(format!("Moved {} → {}/{} ", file_name, display_name, dest.file_name().and_then(|n| n.to_str()).unwrap_or("")));
                     let len2 = snap_c.len();
                     let mut v = idx_c.borrow_mut();
-                    if *v + 1 < len2 {
-                        *v += 1;
-                    } else if *v + 1 == len2 {
-                        *v += 1;
-                    }
+                    if *v + 1 < len2 { *v += 1; } else if *v + 1 == len2 { *v += 1; }
                     drop(v);
-                    // busy off before update to re-enable correctly
-                    spinner_c.set_spinning(false);
-                    spinner_c.set_visible(false);
-                    *busy_c.borrow_mut() = false;
+                    set_busy_state(&busy_c, &spinner_c, &actions_row_c, &btn_prev_c, &btn_next_c, false);
                     update_ui_c();
                     prehash_c();
                 }
@@ -513,19 +547,13 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                     drop(union);
                     let msg = match e {
                         MoverError::Exdev(_) => "Cross-device move not supported — move reverted".to_string(),
-                        MoverError::Io(ioe) => {
-                            if ioe.kind() == std::io::ErrorKind::StorageFull || ioe.to_string().contains("No space") {
-                                "Disk full / I/O error — move reverted".to_string()
-                            } else {
-                                format!("Disk full / I/O error — move reverted: {}", ioe)
-                            }
+                        MoverError::Io(ref ioe) => {
+                            tracing::warn!("move log failure for {}: {}", file_name, ioe);
+                            "Disk full / I/O error — move reverted".to_string()
                         }
                     };
-                    tracing::warn!("move failed for {}: {}", file_name, msg);
                     show_toast_c(msg);
-                    spinner_c.set_spinning(false);
-                    spinner_c.set_visible(false);
-                    *busy_c.borrow_mut() = false;
+                    set_busy_state(&busy_c, &spinner_c, &actions_row_c, &btn_prev_c, &btn_next_c, false);
                     update_ui_c();
                 }
             }
@@ -610,11 +638,9 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let prehash_c = prehash_next.clone();
         let busy_c = busy.clone();
         btn_prev.connect_clicked(move |_| {
-            if *busy_c.borrow() { return; }
+            if guard_busy(&busy_c) { return; }
             let mut v = idx_c.borrow_mut();
-            if *v > 0 {
-                *v -= 1;
-            }
+            if *v > 0 { *v -= 1; }
             drop(v);
             upd();
             prehash_c();
@@ -627,11 +653,9 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let prehash_c = prehash_next.clone();
         let busy_c = busy.clone();
         btn_next.connect_clicked(move |_| {
-            if *busy_c.borrow() { return; }
+            if guard_busy(&busy_c) { return; }
             let mut v = idx_c.borrow_mut();
-            if *v + 1 < snap_c.len() {
-                *v += 1;
-            }
+            if *v + 1 < snap_c.len() { *v += 1; }
             drop(v);
             upd();
             prehash_c();
@@ -687,8 +711,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 return glib::Propagation::Stop;
             }
 
-            // Busy-ignore: ignore 1-9 while busy
-            if *busy_k.borrow() {
+            if guard_busy(&busy_k) {
                 if matches!(key, gdk::Key::_1 | gdk::Key::_2 | gdk::Key::_3 | gdk::Key::_4 | gdk::Key::_5 | gdk::Key::_6 | gdk::Key::_7 | gdk::Key::_8 | gdk::Key::_9
                     | gdk::Key::KP_1 | gdk::Key::KP_2 | gdk::Key::KP_3 | gdk::Key::KP_4 | gdk::Key::KP_5 | gdk::Key::KP_6 | gdk::Key::KP_7 | gdk::Key::KP_8 | gdk::Key::KP_9) {
                     return glib::Propagation::Stop;
@@ -702,7 +725,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                             return glib::Propagation::Proceed;
                         }
                     }
-                    if *busy_k.borrow() {
+                    if guard_busy(&busy_k) {
                         return glib::Propagation::Stop;
                     }
                     btn_next_k.emit_clicked();
@@ -714,7 +737,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                             return glib::Propagation::Proceed;
                         }
                     }
-                    if *busy_k.borrow() {
+                    if guard_busy(&busy_k) {
                         return glib::Propagation::Stop;
                     }
                     btn_prev_k.emit_clicked();

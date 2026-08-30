@@ -1,10 +1,17 @@
-use crate::dedup::append_hash_log;
+use crate::dedup::{append_hash_log, FileHash};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// Compute next available path in dest_dir for filename, suffixing _1, _2 before extension on clash.
+/// Domain bundle for the clumped `source_folder + folder_name + hash` (Data Clumps fix).
+pub struct ActionTarget<'a> {
+    pub source_folder: &'a Path,
+    pub folder_name: &'a str,
+}
+
+/// Intent-revealing name: resolve a destination collision by suffixing _1, _2 before extension.
 /// Preserves extension; if no extension, suffix after name.
-pub fn next_available_path(dest_dir: &Path, file_name: &str) -> PathBuf {
+/// Kept `next_available_path` as alias for tests/back-compat (Mysterious Name fix).
+pub fn resolve_collision_path(dest_dir: &Path, file_name: &str) -> PathBuf {
     let candidate = dest_dir.join(file_name);
     if !candidate.exists() {
         return candidate;
@@ -24,8 +31,12 @@ pub fn next_available_path(dest_dir: &Path, file_name: &str) -> PathBuf {
     }
 }
 
+/// Back-compat alias (kept for existing tests/callers).
+pub fn next_available_path(dest_dir: &Path, file_name: &str) -> PathBuf {
+    resolve_collision_path(dest_dir, file_name)
+}
+
 fn split_filename(name: &str) -> (&str, Option<&str>) {
-    // find last dot not at start
     if let Some(pos) = name.rfind('.') {
         if pos > 0 && pos + 1 < name.len() {
             return (&name[..pos], Some(&name[pos + 1..]));
@@ -55,20 +66,17 @@ impl std::fmt::Display for MoverError {
     }
 }
 
-/// Atomic move to sibling folder and hash-log append (happy path, no dedup).
-/// Steps: `rename` Current File to sibling `../<folder_name>/` (same-mount only, no EXDEV copy)
-/// with suffix `_1`/`_2` before extension on clash, then append hash to `SourceFolder/<folder_name>.txt`
-/// via flock+fsync, update `union_set`. On log failure, rollback rename back to Source Folder
-/// and do not update HashSet.
-///
-/// `source_folder` is the Source Folder (contains organizer.toml and *.txt).
-/// `current_file` must be inside `source_folder`.
-/// `folder_name` is slug-sanitized (a-z0-9_-).
-/// `hash` is lower-case hex sha256.
-/// `union_set` is in-memory union HashSet to update on success.
-///
-/// Returns dest path on success.
-pub fn move_to_action(
+/// Core mover that operates on domain types (Fixes Primitive Obsession / Data Clumps).
+pub fn move_to_action_with_target(
+    target: ActionTarget<'_>,
+    current_file: &Path,
+    hash: &FileHash,
+    union_set: &mut HashSet<String>,
+) -> Result<PathBuf, MoverError> {
+    move_to_action_inner(target.source_folder, current_file, target.folder_name, hash.as_str(), union_set)
+}
+
+fn move_to_action_inner(
     source_folder: &Path,
     current_file: &Path,
     folder_name: &str,
@@ -128,6 +136,20 @@ pub fn move_to_action(
 
     // fsync handled inside append_hash_log; also fsync parent already
     Ok(dest_path)
+}
+
+/// Public API preserving original signature (for tests/callers that use raw &str hash).
+/// Validates hash via FileHash before delegating (Primitive Obsession safe).
+pub fn move_to_action(
+    source_folder: &Path,
+    current_file: &Path,
+    folder_name: &str,
+    hash: &str,
+    union_set: &mut HashSet<String>,
+) -> Result<PathBuf, MoverError> {
+    let validated = FileHash::new(hash).map_err(|e| MoverError::Io(e))?;
+    let target = ActionTarget { source_folder, folder_name };
+    move_to_action_with_target(target, current_file, &validated, union_set)
 }
 
 #[cfg(test)]

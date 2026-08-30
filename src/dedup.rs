@@ -30,6 +30,78 @@ pub fn is_valid_hash(s: &str) -> bool {
     s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f' | 'A'..='F'))
 }
 
+/// Domain type for a validated lower-case sha256 hex (Primitive Obsession fix).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FileHash(String);
+
+impl FileHash {
+    /// Validate and normalize to lower-case. Accepts case-insensitive 64 hex.
+    pub fn new(raw: &str) -> std::io::Result<Self> {
+        let lower = raw.to_ascii_lowercase();
+        if !is_valid_hash(&lower) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid hash: {}", raw),
+            ));
+        }
+        Ok(Self(lower))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for FileHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<FileHash> for String {
+    fn from(h: FileHash) -> Self {
+        h.0
+    }
+}
+
+/// Helper: run closure while holding a shared lock (unix) or direct on non-unix.
+/// Centralizes flock boilerplate (Duplicated Code fix).
+fn with_shared_lock<R>(file: &std::fs::File, f: impl FnOnce() -> R) -> R {
+    #[cfg(unix)]
+    {
+        let _ = fs2::FileExt::lock_shared(file);
+        let r = f();
+        let _ = fs2::FileExt::unlock(file);
+        r
+    }
+    #[cfg(not(unix))]
+    {
+        f()
+    }
+}
+
+/// Helper: run closure while holding an exclusive lock + fsync on unix.
+fn with_exclusive_lock_and_fsync(file: &mut std::fs::File, data: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use fs2::FileExt;
+        file.lock_exclusive()?;
+        file.write_all(data)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        file.sync_all()?;
+        file.unlock()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        file.write_all(data)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    }
+}
+
 /// Load union HashSet from all `SourceFolder/*.txt` logs (inside Source Folder).
 /// Each line trimmed, lower-cased, validated as hex; corrupted lines are skipped
 /// with `tracing::warn` and counted. Returns (union, warning_count).
@@ -53,32 +125,30 @@ pub fn load_union(source_folder: &Path) -> (HashSet<String>, usize) {
         } else {
             continue;
         }
-        // flock shared lock for reading
         let file = match OpenOptions::new().read(true).open(&path) {
             Ok(f) => f,
             Err(_) => continue,
         };
-        #[cfg(unix)]
-        {
-            let _ = fs2::FileExt::lock_shared(&file);
-        }
-        let reader = BufReader::new(&file);
-        for line in reader.lines().flatten() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+        let (inner_set, inner_warnings) = with_shared_lock(&file, || {
+            let mut local_set = HashSet::new();
+            let mut local_warnings = 0usize;
+            let reader = BufReader::new(&file);
+            for line in reader.lines().flatten() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if !is_valid_hash(trimmed) {
+                    local_warnings += 1;
+                    tracing::warn!("corrupted log line skipped in {}: {:?}", path.display(), trimmed);
+                    continue;
+                }
+                local_set.insert(trimmed.to_ascii_lowercase());
             }
-            if !is_valid_hash(trimmed) {
-                warnings += 1;
-                tracing::warn!("corrupted log line skipped in {}: {:?}", path.display(), trimmed);
-                continue;
-            }
-            set.insert(trimmed.to_ascii_lowercase());
-        }
-        #[cfg(unix)]
-        {
-            let _ = fs2::FileExt::unlock(&file);
-        }
+            (local_set, local_warnings)
+        });
+        set.extend(inner_set);
+        warnings += inner_warnings;
     }
     (set, warnings)
 }
@@ -86,41 +156,17 @@ pub fn load_union(source_folder: &Path) -> (HashSet<String>, usize) {
 /// Append one lower-case hash line to `SourceFolder/<folder_name>.txt` with
 /// `O_APPEND` + `flock` exclusive + `fsync`, fsync parent dir.
 /// `folder_name` is already slug-sanitized; we use it as given.
+/// On non-unix (spec is Linux-only per ADR 0004) we still fsync without flock.
 pub fn append_hash_log(source_folder: &Path, folder_name: &str, hash: &str) -> std::io::Result<()> {
-    let hash_lower = hash.to_ascii_lowercase();
-    if !is_valid_hash(&hash_lower) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("invalid hash: {}", hash),
-        ));
-    }
+    let validated = FileHash::new(hash)?;
     let log_path = source_folder.join(format!("{}.txt", folder_name));
-    // Ensure source_folder exists
     std::fs::create_dir_all(source_folder)?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .read(true)
         .open(&log_path)?;
-    #[cfg(unix)]
-    {
-        use fs2::FileExt;
-        file.lock_exclusive()?;
-        // write with newline
-        file.write_all(hash_lower.as_bytes())?;
-        file.write_all(b"\n")?;
-        file.flush()?;
-        file.sync_all()?;
-        file.unlock()?;
-    }
-    #[cfg(not(unix))]
-    {
-        file.write_all(hash_lower.as_bytes())?;
-        file.write_all(b"\n")?;
-        file.flush()?;
-        file.sync_all()?;
-    }
-    // fsync parent dir to persist append
+    with_exclusive_lock_and_fsync(&mut file, validated.as_str().as_bytes())?;
     if let Ok(dir_file) = OpenOptions::new().read(true).open(source_folder) {
         let _ = dir_file.sync_all();
     }

@@ -126,59 +126,45 @@ impl HashService {
             m.remove(path);
         }
     }
-    #[allow(dead_code)]
-    /// Synchronous pre-hash of current and next (fallback).
-    fn prehash_sync(&self) {
+    fn pending_targets(&self) -> Vec<PathBuf> {
         let i = *self.idx.borrow();
         let len = self.snapshot.len();
-        let mut to_hash = Vec::new();
-        {
-            let cache = self.cache.lock().unwrap();
-            if i < len {
-                let cur = self.snapshot[i].clone();
-                if !cache.contains_key(&cur) && cur.exists() {
-                    to_hash.push(cur);
-                }
-            }
-            if i + 1 < len {
-                let nxt = self.snapshot[i + 1].clone();
-                if !cache.contains_key(&nxt) && nxt.exists() {
-                    to_hash.push(nxt);
-                }
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        if i < len {
+            let cur = self.snapshot[i].clone();
+            if !cache.contains_key(&cur) && cur.exists() {
+                out.push(cur);
             }
         }
-        for p in to_hash {
+        if i + 1 < len {
+            let nxt = self.snapshot[i + 1].clone();
+            if !cache.contains_key(&nxt) && nxt.exists() {
+                out.push(nxt);
+            }
+        }
+        out
+    }
+    #[allow(dead_code)]
+    /// Synchronous pre-hash of current and next (used in tests).
+    fn prehash_sync(&self) {
+        for p in self.pending_targets() {
             if let Ok(h) = compute_sha256(&p) {
-                if let Ok(mut m) = self.cache.lock() {
-                    m.insert(p, h.to_ascii_lowercase());
-                }
+                let mut m = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+                m.insert(p, h.to_ascii_lowercase());
             }
         }
     }
     fn prehash_async(&self) {
-        let i = *self.idx.borrow();
-        let len = self.snapshot.len();
-        let mut to_hash = Vec::new();
-        {
-            let cache = self.cache.lock().unwrap();
-            if i < len {
-                let cur = self.snapshot[i].clone();
-                if !cache.contains_key(&cur) && cur.exists() {
-                    to_hash.push(cur);
-                }
-            }
-            if i + 1 < len {
-                let nxt = self.snapshot[i + 1].clone();
-                if !cache.contains_key(&nxt) && nxt.exists() {
-                    to_hash.push(nxt);
-                }
-            }
-        }
-        for p in to_hash {
+        for p in self.pending_targets() {
             let cache_c = self.cache.clone();
             std::thread::spawn(move || {
                 if let Ok(h) = compute_sha256(&p) {
                     if let Ok(mut m) = cache_c.lock() {
+                        m.insert(p, h.to_ascii_lowercase());
+                    } else {
+                        // recover from poisoned lock
+                        let mut m = cache_c.lock().unwrap_or_else(|e| e.into_inner());
                         m.insert(p, h.to_ascii_lowercase());
                     }
                 }
@@ -186,6 +172,7 @@ impl HashService {
         }
     }
     fn prehash_next(&self) {
+        // Single entry point for callers; delegates to async background
         self.prehash_async();
     }
 }
@@ -550,64 +537,113 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
             let display_name = action.display_name.clone();
             let file_name = current.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
 
-            let hash = if let Some(cached) = hash_service_c.get_cached(&current) {
-                hash_service_c.remove(&current);
-                cached
-            } else {
-                match compute_sha256(&current).map(|h| h.to_ascii_lowercase()) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        tracing::warn!("hash failed for {}: {}", current.display(), e);
-                        show_toast_c(format!("Failed to hash {}: {}", file_name, e));
-                        set_busy_state(&busy_c, &spinner_c, &actions_row_c, &btn_prev_c, &btn_next_c, false);
-                        update_ui_c();
-                        return;
-                    }
-                }
-            };
-            let hash_lower = hash.to_ascii_lowercase();
-            // Check duplicate before move to craft toast (ADR 0003)
-            let is_duplicate = union_c.borrow().contains(&hash_lower);
-            let duplicate_origin_folder = if is_duplicate {
-                find_duplicate_origin(&source_c, &hash_lower)
-            } else {
-                None
-            };
-            let duplicate_origin_display = duplicate_origin_folder.as_ref().and_then(|folder| {
-                live_actions_c.borrow().iter().find(|a| &a.folder_name == folder).map(|a| a.display_name.clone())
-            }).or(duplicate_origin_folder.clone());
-            let mut union = union_c.borrow_mut();
-            match move_to_action(&source_c, &current, &folder_name, &hash, &mut union) {
-                Ok(dest) => {
-                    let is_dup_dest = dest.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("duplicate");
-                    drop(union);
-                    if is_dup_dest || is_duplicate {
-                        let origin = duplicate_origin_display.unwrap_or_else(|| display_name.clone());
-                        show_toast_c(format!("Duplicate — already in ‘{}’ — moved to duplicate/{}", origin, dest.file_name().and_then(|n| n.to_str()).unwrap_or(&file_name)));
+            // Shared continuation for move after hash is ready (sync or async)
+            let do_move: Rc<dyn Fn(String)> = {
+                let idx_c = idx_c.clone();
+                let snap_c = snap_c.clone();
+                let source_c = source_c.clone();
+                let union_c = union_c.clone();
+                let live_actions_c = live_actions_c.clone();
+                let busy_c = busy_c.clone();
+                let spinner_c = spinner_c.clone();
+                let actions_row_c = actions_row_c.clone();
+                let btn_prev_c = btn_prev_c.clone();
+                let btn_next_c = btn_next_c.clone();
+                let show_toast_c = show_toast_c.clone();
+                let update_ui_c = update_ui_c.clone();
+                let prehash_c = prehash_c.clone();
+                let folder_name = folder_name.clone();
+                let display_name = display_name.clone();
+                let file_name = file_name.clone();
+                let current = current.clone();
+                Rc::new(move |hash: String| {
+                    let hash_lower = hash.to_ascii_lowercase();
+                    let is_duplicate = union_c.borrow().contains(&hash_lower);
+                    let duplicate_origin_folder = if is_duplicate {
+                        find_duplicate_origin(&source_c, &hash_lower)
                     } else {
-                        show_toast_c(format!("Moved {} → {}/{} ", file_name, display_name, dest.file_name().and_then(|n| n.to_str()).unwrap_or("")));
-                    }
-                    let len2 = snap_c.len();
-                    let mut v = idx_c.borrow_mut();
-                    if *v + 1 < len2 { *v += 1; } else if *v + 1 == len2 { *v += 1; }
-                    drop(v);
-                    set_busy_state(&busy_c, &spinner_c, &actions_row_c, &btn_prev_c, &btn_next_c, false);
-                    update_ui_c();
-                    prehash_c();
-                }
-                Err(e) => {
-                    drop(union);
-                    let msg = match e {
-                        MoverError::Exdev(_) => "Cross-device move not supported — move reverted".to_string(),
-                        MoverError::Io(ref ioe) => {
-                            tracing::warn!("move log failure for {}: {}", file_name, ioe);
-                            "Disk full / I/O error — move reverted".to_string()
-                        }
+                        None
                     };
-                    show_toast_c(msg);
-                    set_busy_state(&busy_c, &spinner_c, &actions_row_c, &btn_prev_c, &btn_next_c, false);
-                    update_ui_c();
-                }
+                    let duplicate_origin_display = duplicate_origin_folder.as_ref().and_then(|folder| {
+                        live_actions_c.borrow().iter().find(|a| &a.folder_name == folder).map(|a| a.display_name.clone())
+                    }).or(duplicate_origin_folder.clone());
+                    let mut union = union_c.borrow_mut();
+                    match move_to_action(&source_c, &current, &folder_name, &hash, &mut union) {
+                        Ok(dest) => {
+                            let is_dup_dest = dest.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("duplicate");
+                            drop(union);
+                            if is_dup_dest || is_duplicate {
+                                let origin = duplicate_origin_display.unwrap_or_else(|| display_name.clone());
+                                show_toast_c(format!("Duplicate — already in ‘{}’ — moved to duplicate/{}", origin, dest.file_name().and_then(|n| n.to_str()).unwrap_or(&file_name)));
+                            } else {
+                                show_toast_c(format!("Moved {} → {}/{} ", file_name, display_name, dest.file_name().and_then(|n| n.to_str()).unwrap_or("")));
+                            }
+                            let len2 = snap_c.len();
+                            let mut v = idx_c.borrow_mut();
+                            if *v + 1 < len2 { *v += 1; } else if *v + 1 == len2 { *v += 1; }
+                            drop(v);
+                            set_busy_state(&busy_c, &spinner_c, &actions_row_c, &btn_prev_c, &btn_next_c, false);
+                            update_ui_c();
+                            prehash_c();
+                        }
+                        Err(e) => {
+                            drop(union);
+                            let msg = match e {
+                                MoverError::Exdev(_) => "Cross-device move not supported — move reverted".to_string(),
+                                MoverError::Io(ref ioe) => {
+                                    tracing::warn!("move log failure for {}: {}", file_name, ioe);
+                                    "Disk full / I/O error — move reverted".to_string()
+                                }
+                            };
+                            show_toast_c(msg);
+                            set_busy_state(&busy_c, &spinner_c, &actions_row_c, &btn_prev_c, &btn_next_c, false);
+                            update_ui_c();
+                        }
+                    }
+                })
+            };
+
+            if let Some(cached) = hash_service_c.get_cached(&current) {
+                hash_service_c.remove(&current);
+                do_move(cached);
+            } else {
+                // Hash not yet ready — compute in background without blocking UI (spinner already visible)
+                let current_clone = current.clone();
+                let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+                let rx_cell = Rc::new(RefCell::new(rx));
+                let rx_cell_clone = rx_cell.clone();
+                let do_move_clone = do_move.clone();
+                let show_toast_err = show_toast_c.clone();
+                let busy_c2 = busy_c.clone();
+                let spinner_c2 = spinner_c.clone();
+                let actions_row_c2 = actions_row_c.clone();
+                let btn_prev_c2 = btn_prev_c.clone();
+                let btn_next_c2 = btn_next_c.clone();
+                let update_ui_c2 = update_ui_c.clone();
+                let file_name_err = file_name.clone();
+                // Polling idle on main thread — checks channel without requiring Send closure capture
+                glib::idle_add_local(move || {
+                    match rx_cell_clone.borrow_mut().try_recv() {
+                        Ok(Ok(hash)) => {
+                            do_move_clone(hash);
+                            glib::ControlFlow::Break
+                        }
+                        Ok(Err(err_msg)) => {
+                            tracing::warn!("hash failed for {}: {}", file_name_err, err_msg);
+                            show_toast_err(format!("Failed to hash {}: {}", file_name_err, err_msg));
+                            set_busy_state(&busy_c2, &spinner_c2, &actions_row_c2, &btn_prev_c2, &btn_next_c2, false);
+                            update_ui_c2();
+                            glib::ControlFlow::Break
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                    }
+                });
+                std::thread::spawn(move || {
+                    let res = compute_sha256(&current_clone).map(|h| h.to_ascii_lowercase()).map_err(|e| e.to_string());
+                    let _ = tx.send(res);
+                });
+                return;
             }
         })
     };

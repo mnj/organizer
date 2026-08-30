@@ -76,19 +76,16 @@ pub fn move_to_action_with_target(
     move_to_action_inner(target.source_folder, current_file, target.folder_name, hash.as_str(), union_set)
 }
 
-/// Move file directly to fixed sibling `../duplicate/` without log or union change.
-/// Used when hash already exists in union (ADR 0003).
-fn move_to_duplicate_inner(
-    source_folder: &Path,
-    current_file: &Path,
-    file_name: &str,
-) -> Result<PathBuf, MoverError> {
+fn sibling_dir(source_folder: &Path, sibling: &str) -> Result<PathBuf, MoverError> {
     let parent = source_folder
         .parent()
         .ok_or_else(|| MoverError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "source_folder has no parent")))?;
-    let dest_dir = parent.join("duplicate");
-    std::fs::create_dir_all(&dest_dir).map_err(MoverError::Io)?;
-    let dest_path = next_available_path(&dest_dir, file_name);
+    Ok(parent.join(sibling))
+}
+
+fn atomic_rename_with_suffix(dest_dir: &Path, current_file: &Path, file_name: &str) -> Result<PathBuf, MoverError> {
+    std::fs::create_dir_all(dest_dir).map_err(MoverError::Io)?;
+    let dest_path = next_available_path(dest_dir, file_name);
     match std::fs::rename(current_file, &dest_path) {
         Ok(()) => Ok(dest_path),
         Err(e) => {
@@ -98,6 +95,17 @@ fn move_to_duplicate_inner(
             Err(MoverError::Io(e))
         }
     }
+}
+
+/// Move file directly to fixed sibling `../duplicate/` without log or union change.
+/// Used when hash already exists in union (ADR 0003).
+fn move_to_duplicate_inner(
+    source_folder: &Path,
+    current_file: &Path,
+    file_name: &str,
+) -> Result<PathBuf, MoverError> {
+    let dest_dir = sibling_dir(source_folder, "duplicate")?;
+    atomic_rename_with_suffix(&dest_dir, current_file, file_name)
 }
 
 fn move_to_action_inner(
@@ -120,29 +128,8 @@ fn move_to_action_inner(
         return move_to_duplicate_inner(source_folder, current_file, &file_name);
     }
 
-    // Sibling is parent of source_folder joined with folder_name
-    let parent = source_folder
-        .parent()
-        .ok_or_else(|| MoverError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "source_folder has no parent")))?;
-    let dest_dir = parent.join(folder_name);
-    std::fs::create_dir_all(&dest_dir).map_err(MoverError::Io)?;
-
-    let dest_path = next_available_path(&dest_dir, &file_name);
-
-    // Attempt atomic rename (same-mount only). EXDEV is surfaced as CrossesDevices.
-    match std::fs::rename(current_file, &dest_path) {
-        Ok(()) => {},
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::CrossesDevices {
-                return Err(MoverError::Exdev(dest_path));
-            }
-            // Also handle raw EXDEV (18) on platforms where kind is Other
-            if e.raw_os_error() == Some(18) {
-                return Err(MoverError::Exdev(dest_path));
-            }
-            return Err(MoverError::Io(e));
-        }
-    }
+    let dest_dir = sibling_dir(source_folder, folder_name)?;
+    let dest_path = atomic_rename_with_suffix(&dest_dir, current_file, &file_name)?;
 
     // Append hash log; on failure rollback rename back
     if let Err(e) = append_hash_log(source_folder, folder_name, hash) {

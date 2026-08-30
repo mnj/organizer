@@ -102,29 +102,30 @@ fn with_exclusive_lock_and_fsync(file: &mut std::fs::File, data: &[u8]) -> std::
     }
 }
 
+fn is_txt_log(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    matches!(path.extension().and_then(|e| e.to_str()), Some(ext) if ext.eq_ignore_ascii_case("txt"))
+}
+
+fn txt_log_paths(source_folder: &Path) -> Vec<std::path::PathBuf> {
+    let Ok(dir) = std::fs::read_dir(source_folder) else {
+        return Vec::new();
+    };
+    dir.flatten()
+        .map(|e| e.path())
+        .filter(|p| is_txt_log(p))
+        .collect()
+}
+
 /// Load union HashSet from all `SourceFolder/*.txt` logs (inside Source Folder).
 /// Each line trimmed, lower-cased, validated as hex; corrupted lines are skipped
 /// with `tracing::warn` and counted. Returns (union, warning_count).
 pub fn load_union(source_folder: &Path) -> (HashSet<String>, usize) {
     let mut set = HashSet::new();
     let mut warnings = 0usize;
-    let dir = match std::fs::read_dir(source_folder) {
-        Ok(d) => d,
-        Err(_) => return (set, warnings),
-    };
-    for entry in dir.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        // Only .txt files (case-insensitive) inside SourceFolder
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if !ext.eq_ignore_ascii_case("txt") {
-                continue;
-            }
-        } else {
-            continue;
-        }
+    for path in txt_log_paths(source_folder) {
         let file = match OpenOptions::new().read(true).open(&path) {
             Ok(f) => f,
             Err(_) => continue,
@@ -161,19 +162,7 @@ pub fn find_duplicate_origin(source_folder: &Path, hash: &str) -> Option<String>
     if !is_valid_hash(&lower) {
         return None;
     }
-    let dir = std::fs::read_dir(source_folder).ok()?;
-    for entry in dir.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if !ext.eq_ignore_ascii_case("txt") {
-                continue;
-            }
-        } else {
-            continue;
-        }
+    for path in txt_log_paths(source_folder) {
         let file = OpenOptions::new().read(true).open(&path).ok()?;
         let found = with_shared_lock(&file, || {
             let reader = BufReader::new(&file);

@@ -6,13 +6,14 @@ use gtk4::{
     Label, Orientation, Paned, Stack,
 };
 use organizer_lib::config::{load_or_create, Action};
-use organizer_lib::dedup::{compute_sha256, load_union};
+use organizer_lib::dedup::{compute_sha256, find_duplicate_origin, load_union};
 use organizer_lib::mover::{move_to_action, MoverError};
 use organizer_lib::queue::build_snapshot;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Parser, Debug)]
 #[command(name = "organizer", about = "File-triaging desktop app")]
@@ -105,51 +106,84 @@ fn guard_busy(busy: &Rc<RefCell<bool>>) -> bool {
 }
 
 /// Hash preloading service (Divergent Change fix) — caches sha256 for Current + next.
+/// Uses background `std::thread` with `Arc<Mutex>` cache to avoid blocking UI.
+/// Falls back to synchronous when needed (e.g. immediate hash on press).
 struct HashService {
-    cache: Rc<RefCell<HashMap<PathBuf, String>>>,
+    cache: Arc<Mutex<HashMap<PathBuf, String>>>,
     snapshot: Rc<Vec<PathBuf>>,
     idx: Rc<RefCell<usize>>,
 }
 
 impl HashService {
-    fn new(cache: Rc<RefCell<HashMap<PathBuf, String>>>, snapshot: Rc<Vec<PathBuf>>, idx: Rc<RefCell<usize>>) -> Self {
+    fn new(cache: Arc<Mutex<HashMap<PathBuf, String>>>, snapshot: Rc<Vec<PathBuf>>, idx: Rc<RefCell<usize>>) -> Self {
         Self { cache, snapshot, idx }
     }
     fn get_cached(&self, path: &PathBuf) -> Option<String> {
-        self.cache.borrow().get(path).cloned()
+        self.cache.lock().ok()?.get(path).cloned()
     }
     fn remove(&self, path: &PathBuf) {
-        self.cache.borrow_mut().remove(path);
+        if let Ok(mut m) = self.cache.lock() {
+            m.remove(path);
+        }
     }
-    /// Synchronous pre-hash of current and next (used on startup and after move).
-    /// Future async variant can offload via glib channel without changing call sites.
+    #[allow(dead_code)]
+    /// Synchronous pre-hash of current and next (fallback).
     fn prehash_sync(&self) {
         let i = *self.idx.borrow();
         let len = self.snapshot.len();
         let mut to_hash = Vec::new();
-        if i < len {
-            let cur = self.snapshot[i].clone();
-            if !self.cache.borrow().contains_key(&cur) && cur.exists() {
-                to_hash.push(cur);
+        {
+            let cache = self.cache.lock().unwrap();
+            if i < len {
+                let cur = self.snapshot[i].clone();
+                if !cache.contains_key(&cur) && cur.exists() {
+                    to_hash.push(cur);
+                }
             }
-        }
-        if i + 1 < len {
-            let nxt = self.snapshot[i + 1].clone();
-            if !self.cache.borrow().contains_key(&nxt) && nxt.exists() {
-                to_hash.push(nxt);
+            if i + 1 < len {
+                let nxt = self.snapshot[i + 1].clone();
+                if !cache.contains_key(&nxt) && nxt.exists() {
+                    to_hash.push(nxt);
+                }
             }
         }
         for p in to_hash {
             if let Ok(h) = compute_sha256(&p) {
-                self.cache.borrow_mut().insert(p, h.to_ascii_lowercase());
+                if let Ok(mut m) = self.cache.lock() {
+                    m.insert(p, h.to_ascii_lowercase());
+                }
             }
         }
     }
     fn prehash_async(&self) {
-        // For v1 we keep pre-hash synchronous to avoid Send complexity with Rc<RefCell>.
-        // The HashService design isolates this; a future change can switch to Arc<Mutex>
-        // + glib channel spawn_blocking without touching call sites (spec spawn_blocking).
-        self.prehash_sync();
+        let i = *self.idx.borrow();
+        let len = self.snapshot.len();
+        let mut to_hash = Vec::new();
+        {
+            let cache = self.cache.lock().unwrap();
+            if i < len {
+                let cur = self.snapshot[i].clone();
+                if !cache.contains_key(&cur) && cur.exists() {
+                    to_hash.push(cur);
+                }
+            }
+            if i + 1 < len {
+                let nxt = self.snapshot[i + 1].clone();
+                if !cache.contains_key(&nxt) && nxt.exists() {
+                    to_hash.push(nxt);
+                }
+            }
+        }
+        for p in to_hash {
+            let cache_c = self.cache.clone();
+            std::thread::spawn(move || {
+                if let Ok(h) = compute_sha256(&p) {
+                    if let Ok(mut m) = cache_c.lock() {
+                        m.insert(p, h.to_ascii_lowercase());
+                    }
+                }
+            });
+        }
     }
     fn prehash_next(&self) {
         self.prehash_async();
@@ -193,7 +227,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         tracing::warn!("{} corrupted log lines skipped at startup in {}", warning_count, source_folder.display());
     }
     let union_set: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(union_initial));
-    let hash_cache: Rc<RefCell<HashMap<PathBuf, String>>> = Rc::new(RefCell::new(HashMap::new()));
+    let hash_cache: Arc<Mutex<HashMap<PathBuf, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let busy: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
     let window = ApplicationWindow::builder()
@@ -471,7 +505,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         Rc::new(move || hs.prehash_next())
     };
 
-    // Trigger move for a given Action — uses HashService + set_busy_state + glib channel for spawn_blocking
+    // Trigger move for a given Action — uses HashService + set_busy_state + background hash
     let trigger_move: Rc<dyn Fn(Action)> = {
         let idx_c = idx.clone();
         let snap_c = snapshot_rc.clone();
@@ -486,6 +520,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let show_toast_c = show_toast.clone();
         let update_ui_c = update_ui.clone();
         let prehash_c = prehash_next.clone();
+        let live_actions_c = live_actions.clone();
         Rc::new(move |action: Action| {
             if guard_busy(&busy_c) {
                 return;
@@ -530,11 +565,28 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                     }
                 }
             };
+            let hash_lower = hash.to_ascii_lowercase();
+            // Check duplicate before move to craft toast (ADR 0003)
+            let is_duplicate = union_c.borrow().contains(&hash_lower);
+            let duplicate_origin_folder = if is_duplicate {
+                find_duplicate_origin(&source_c, &hash_lower)
+            } else {
+                None
+            };
+            let duplicate_origin_display = duplicate_origin_folder.as_ref().and_then(|folder| {
+                live_actions_c.borrow().iter().find(|a| &a.folder_name == folder).map(|a| a.display_name.clone())
+            }).or(duplicate_origin_folder.clone());
             let mut union = union_c.borrow_mut();
             match move_to_action(&source_c, &current, &folder_name, &hash, &mut union) {
                 Ok(dest) => {
+                    let is_dup_dest = dest.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("duplicate");
                     drop(union);
-                    show_toast_c(format!("Moved {} → {}/{} ", file_name, display_name, dest.file_name().and_then(|n| n.to_str()).unwrap_or("")));
+                    if is_dup_dest || is_duplicate {
+                        let origin = duplicate_origin_display.unwrap_or_else(|| display_name.clone());
+                        show_toast_c(format!("Duplicate — already in ‘{}’ — moved to duplicate/{}", origin, dest.file_name().and_then(|n| n.to_str()).unwrap_or(&file_name)));
+                    } else {
+                        show_toast_c(format!("Moved {} → {}/{} ", file_name, display_name, dest.file_name().and_then(|n| n.to_str()).unwrap_or("")));
+                    }
                     let len2 = snap_c.len();
                     let mut v = idx_c.borrow_mut();
                     if *v + 1 < len2 { *v += 1; } else if *v + 1 == len2 { *v += 1; }

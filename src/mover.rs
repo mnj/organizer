@@ -76,6 +76,30 @@ pub fn move_to_action_with_target(
     move_to_action_inner(target.source_folder, current_file, target.folder_name, hash.as_str(), union_set)
 }
 
+/// Move file directly to fixed sibling `../duplicate/` without log or union change.
+/// Used when hash already exists in union (ADR 0003).
+fn move_to_duplicate_inner(
+    source_folder: &Path,
+    current_file: &Path,
+    file_name: &str,
+) -> Result<PathBuf, MoverError> {
+    let parent = source_folder
+        .parent()
+        .ok_or_else(|| MoverError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "source_folder has no parent")))?;
+    let dest_dir = parent.join("duplicate");
+    std::fs::create_dir_all(&dest_dir).map_err(MoverError::Io)?;
+    let dest_path = next_available_path(&dest_dir, file_name);
+    match std::fs::rename(current_file, &dest_path) {
+        Ok(()) => Ok(dest_path),
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::CrossesDevices || e.raw_os_error() == Some(18) {
+                return Err(MoverError::Exdev(dest_path));
+            }
+            Err(MoverError::Io(e))
+        }
+    }
+}
+
 fn move_to_action_inner(
     source_folder: &Path,
     current_file: &Path,
@@ -89,6 +113,12 @@ fn move_to_action_inner(
         .and_then(|n| n.to_str())
         .ok_or_else(|| MoverError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid filename")))?
         .to_string();
+    let hash_lower = hash.to_ascii_lowercase();
+
+    // ADR 0003: if hash already in union -> route to fixed sibling ../duplicate/, no log
+    if union_set.contains(&hash_lower) {
+        return move_to_duplicate_inner(source_folder, current_file, &file_name);
+    }
 
     // Sibling is parent of source_folder joined with folder_name
     let parent = source_folder
@@ -132,7 +162,7 @@ fn move_to_action_inner(
     }
 
     // Update union set with lower-case hash
-    union_set.insert(hash.to_ascii_lowercase());
+    union_set.insert(hash_lower);
 
     // fsync handled inside append_hash_log; also fsync parent already
     Ok(dest_path)
@@ -348,5 +378,103 @@ mod tests {
         // Simulate that UI would advance idx; we just check that mover didn't delete b.jpg
         idx += 1;
         assert_eq!(snap[idx].file_name().unwrap(), "b.jpg");
+    }
+
+    #[test]
+    fn duplicate_routing_moves_to_duplicate_no_log_union_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let source = base.join("source");
+        fs::create_dir_all(&source).unwrap();
+        // first file a.jpg with hash X -> keep
+        let a = source.join("a.jpg");
+        fs::write(&a, b"same content").unwrap();
+        let hash = compute_sha256(&a).unwrap();
+        let mut union = HashSet::new();
+        let dest_a = move_to_action(&source, &a, "keep", &hash, &mut union).unwrap();
+        assert_eq!(dest_a, base.join("keep").join("a.jpg"));
+        assert!(union.contains(&hash.to_ascii_lowercase()));
+        let log_before = fs::read_to_string(source.join("keep.txt")).unwrap();
+        assert_eq!(log_before.lines().count(), 1);
+
+        // second file b.jpg same hash X -> should go to duplicate, not keep
+        let b = source.join("b.jpg");
+        fs::write(&b, b"same content").unwrap();
+        let hash_b = compute_sha256(&b).unwrap();
+        assert_eq!(hash, hash_b);
+        let dest_b = move_to_action(&source, &b, "keep", &hash_b, &mut union).unwrap();
+        assert_eq!(dest_b, base.join("duplicate").join("b.jpg"), "duplicate hash must route to ../duplicate/");
+        assert!(dest_b.exists());
+        assert!(!source.join("b.jpg").exists());
+        // keep.txt must not gain second line, no duplicate.txt
+        let log_after = fs::read_to_string(source.join("keep.txt")).unwrap();
+        assert_eq!(log_after.lines().count(), 1, "duplicate must not append log");
+        assert!(!source.join("duplicate.txt").exists(), "no duplicate.txt");
+        assert_eq!(union.len(), 1, "union unchanged on duplicate");
+        assert!(base.join("duplicate").is_dir());
+    }
+
+    #[test]
+    fn duplicate_routing_suffix_on_clash() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let source = base.join("source");
+        fs::create_dir_all(&source).unwrap();
+        // prime union with hash X via first move to keep
+        let first = source.join("orig.jpg");
+        fs::write(&first, b"dup").unwrap();
+        let h = compute_sha256(&first).unwrap();
+        let mut union = HashSet::new();
+        move_to_action(&source, &first, "keep", &h, &mut union).unwrap();
+        // pre-create file in duplicate to cause clash
+        let dup_dir = base.join("duplicate");
+        fs::create_dir_all(&dup_dir).unwrap();
+        fs::write(dup_dir.join("b.jpg"), b"existing").unwrap();
+        let b = source.join("b.jpg");
+        fs::write(&b, b"dup").unwrap();
+        let hb = compute_sha256(&b).unwrap();
+        assert_eq!(h, hb);
+        let dest = move_to_action(&source, &b, "keep", &hb, &mut union).unwrap();
+        assert_eq!(dest, dup_dir.join("b_1.jpg"));
+        assert!(dest.exists());
+    }
+
+    #[test]
+    fn headless_dedup_a_keep_b_duplicate_c_keep() {
+        // Acceptance: a.jpg hash X -> keep, b.jpg same hash X -> duplicate, c.jpg new hash Y -> keep
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let source = base.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let a = source.join("a.jpg");
+        let b = source.join("b.jpg");
+        let c = source.join("c.jpg");
+        fs::write(&a, b"hash X content").unwrap();
+        fs::write(&b, b"hash X content").unwrap();
+        fs::write(&c, b"hash Y content").unwrap();
+        let ha = compute_sha256(&a).unwrap();
+        let hb = compute_sha256(&b).unwrap();
+        let hc = compute_sha256(&c).unwrap();
+        assert_eq!(ha, hb);
+        assert_ne!(ha, hc);
+        let mut union = HashSet::new();
+        let da = move_to_action(&source, &a, "keep", &ha, &mut union).unwrap();
+        assert_eq!(da, base.join("keep").join("a.jpg"));
+        assert_eq!(union.len(), 1);
+        let db = move_to_action(&source, &b, "keep", &hb, &mut union).unwrap();
+        assert_eq!(db, base.join("duplicate").join("b.jpg"));
+        assert_eq!(union.len(), 1, "duplicate must not grow union");
+        let dc = move_to_action(&source, &c, "keep", &hc, &mut union).unwrap();
+        assert_eq!(dc, base.join("keep").join("c.jpg"));
+        assert_eq!(union.len(), 2);
+        // filesystem asserts
+        assert!(base.join("keep").join("a.jpg").exists());
+        assert!(base.join("duplicate").join("b.jpg").exists());
+        assert!(base.join("keep").join("c.jpg").exists());
+        let keep_log = fs::read_to_string(source.join("keep.txt")).unwrap();
+        assert_eq!(keep_log.lines().count(), 2);
+        assert!(keep_log.contains(&ha.to_ascii_lowercase()));
+        assert!(keep_log.contains(&hc.to_ascii_lowercase()));
+        assert!(!source.join("duplicate.txt").exists());
     }
 }

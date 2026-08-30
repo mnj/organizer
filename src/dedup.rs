@@ -153,6 +153,46 @@ pub fn load_union(source_folder: &Path) -> (HashSet<String>, usize) {
     (set, warnings)
 }
 
+/// Find the first Action folder name whose `SourceFolder/<folder>.txt` contains `hash`.
+/// Scans `*.txt` inside Source Folder, case-insensitive hash compare. Returns the stem
+/// (e.g. "keep") without extension, or None if not found.
+pub fn find_duplicate_origin(source_folder: &Path, hash: &str) -> Option<String> {
+    let lower = hash.to_ascii_lowercase();
+    if !is_valid_hash(&lower) {
+        return None;
+    }
+    let dir = std::fs::read_dir(source_folder).ok()?;
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if !ext.eq_ignore_ascii_case("txt") {
+                continue;
+            }
+        } else {
+            continue;
+        }
+        let file = OpenOptions::new().read(true).open(&path).ok()?;
+        let found = with_shared_lock(&file, || {
+            let reader = BufReader::new(&file);
+            for line in reader.lines().flatten() {
+                if line.trim().to_ascii_lowercase() == lower {
+                    return true;
+                }
+            }
+            false
+        });
+        if found {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                return Some(stem.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Append one lower-case hash line to `SourceFolder/<folder_name>.txt` with
 /// `O_APPEND` + `flock` exclusive + `fsync`, fsync parent dir.
 /// `folder_name` is already slug-sanitized; we use it as given.
@@ -268,5 +308,27 @@ mod tests {
         let (set, warnings) = load_union(dir.path());
         assert!(set.is_empty());
         assert_eq!(warnings, 0);
+    }
+
+    #[test]
+    fn find_duplicate_origin_returns_owning_folder() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        let h_keep = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let h_maybe = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        {
+            let mut f = File::create(p.join("keep.txt")).unwrap();
+            writeln!(f, "{}", h_keep).unwrap();
+        }
+        {
+            let mut f = File::create(p.join("maybe.txt")).unwrap();
+            writeln!(f, "{}", h_maybe).unwrap();
+        }
+        assert_eq!(find_duplicate_origin(p, h_keep).unwrap(), "keep");
+        assert_eq!(find_duplicate_origin(p, &h_keep.to_ascii_uppercase()).unwrap(), "keep");
+        assert_eq!(find_duplicate_origin(p, h_maybe).unwrap(), "maybe");
+        assert!(find_duplicate_origin(p, "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc").is_none());
+        // invalid hash returns None
+        assert!(find_duplicate_origin(p, "not-a-hash").is_none());
     }
 }

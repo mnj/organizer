@@ -9,6 +9,7 @@ use organizer_lib::config::{load_or_create, Action};
 use organizer_lib::dedup::{compute_sha256, find_duplicate_origin, load_union};
 use organizer_lib::mover::{move_to_action, MoverError};
 use organizer_lib::queue::build_snapshot;
+use organizer_lib::undo::{push_undo, redo_move, undo_move, UndoEntry};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -216,6 +217,8 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
     let union_set: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(union_initial));
     let hash_cache: Arc<Mutex<HashMap<PathBuf, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let busy: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    let undo_stack: Rc<RefCell<Vec<UndoEntry>>> = Rc::new(RefCell::new(Vec::new()));
+    let redo_stack: Rc<RefCell<Vec<UndoEntry>>> = Rc::new(RefCell::new(Vec::new()));
 
     let window = ApplicationWindow::builder()
         .application(app)
@@ -344,6 +347,12 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         .tooltip_text("Undo (Ctrl+Z)")
         .build();
     btn_undo.set_sensitive(false);
+    let btn_redo = Button::builder()
+        .label("Redo")
+        .icon_name("edit-redo-symbolic")
+        .tooltip_text("Redo (Ctrl+Shift+Z / Ctrl+Y)")
+        .build();
+    btn_redo.set_sensitive(false);
     let btn_settings = Button::builder()
         .icon_name("emblem-system-symbolic")
         .tooltip_text("Settings (Ctrl+,)")
@@ -352,13 +361,14 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
 
     nav_row.append(&btn_prev);
     nav_row.append(&btn_next);
+    nav_row.append(&btn_undo);
+    nav_row.append(&btn_redo);
     nav_row.append(&sep);
     nav_row.append(&index_label);
     nav_row.append(&dup_badge);
     let spacer = GtkBox::new(Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
     nav_row.append(&spacer);
-    nav_row.append(&btn_undo);
     nav_row.append(&btn_settings);
     action_bar.append(&nav_row);
 
@@ -422,11 +432,15 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let index_label_c = index_label.clone();
         let btn_prev_c = btn_prev.clone();
         let btn_next_c = btn_next.clone();
+        let btn_undo_c = btn_undo.clone();
+        let btn_redo_c = btn_redo.clone();
         let empty_label_c = empty_label.clone();
         let hint_c = hint.clone();
         let source_c = source_folder.clone();
         let busy_c = busy.clone();
         let actions_row_c = actions_row.clone();
+        let undo_c = undo_stack.clone();
+        let redo_c = redo_stack.clone();
         move || {
             let len = snap_c.len();
             if len == 0 {
@@ -439,6 +453,8 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 index_label_c.set_text("—");
                 btn_prev_c.set_sensitive(false);
                 btn_next_c.set_sensitive(false);
+                btn_undo_c.set_sensitive(false);
+                btn_redo_c.set_sensitive(false);
                 hint_c.set_text("");
                 return;
             }
@@ -459,8 +475,11 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                     source_c.display()
                 ));
                 index_label_c.set_text(&format!("{len} / {len} — done"));
-                btn_prev_c.set_sensitive(len > 0 && !*busy_c.borrow());
+                let is_busy = *busy_c.borrow();
+                btn_prev_c.set_sensitive(len > 0 && !is_busy);
                 btn_next_c.set_sensitive(false);
+                btn_undo_c.set_sensitive(!undo_c.borrow().is_empty() && !is_busy);
+                btn_redo_c.set_sensitive(!redo_c.borrow().is_empty() && !is_busy);
                 hint_c.set_text("");
                 return;
             }
@@ -470,6 +489,8 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
             let is_busy = *busy_c.borrow();
             btn_prev_c.set_sensitive(i > 0 && !is_busy);
             btn_next_c.set_sensitive(i + 1 < len && !is_busy);
+            btn_undo_c.set_sensitive(!undo_c.borrow().is_empty() && !is_busy);
+            btn_redo_c.set_sensitive(!redo_c.borrow().is_empty() && !is_busy);
             // disable action buttons while busy
             let mut child = actions_row_c.first_child();
             while let Some(c) = child {
@@ -508,6 +529,8 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let update_ui_c = update_ui.clone();
         let prehash_c = prehash_next.clone();
         let live_actions_c = live_actions.clone();
+        let undo_stack_c = undo_stack.clone();
+        let redo_stack_c = redo_stack.clone();
         Rc::new(move |action: Action| {
             if guard_busy(&busy_c) {
                 return;
@@ -552,6 +575,8 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 let show_toast_c = show_toast_c.clone();
                 let update_ui_c = update_ui_c.clone();
                 let prehash_c = prehash_c.clone();
+                let undo_stack_c = undo_stack_c.clone();
+                let redo_stack_c = redo_stack_c.clone();
                 let folder_name = folder_name.clone();
                 let display_name = display_name.clone();
                 let file_name = file_name.clone();
@@ -571,6 +596,13 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                     match move_to_action(&source_c, &current, &folder_name, &hash, &mut union) {
                         Ok(dest) => {
                             let is_dup_dest = dest.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("duplicate");
+                            let was_duplicate = is_dup_dest || is_duplicate;
+                            // push onto undo stack, clear redo
+                            {
+                                let entry = UndoEntry::new(&hash_lower, &file_name, dest.clone(), was_duplicate, &folder_name, &display_name);
+                                push_undo(&mut undo_stack_c.borrow_mut(), entry);
+                                redo_stack_c.borrow_mut().clear();
+                            }
                             drop(union);
                             if is_dup_dest || is_duplicate {
                                 let origin = duplicate_origin_display.unwrap_or_else(|| display_name.clone());
@@ -644,6 +676,153 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                     let _ = tx.send(res);
                 });
                 return;
+            }
+        })
+    };
+
+    // Undo / Redo handlers (ADR 0005)
+    let perform_undo: Rc<dyn Fn()> = {
+        let source_c = source_folder.clone();
+        let union_c = union_set.clone();
+        let undo_c = undo_stack.clone();
+        let redo_c = redo_stack.clone();
+        let idx_c = idx.clone();
+        let snap_c = snapshot_rc.clone();
+        let show_toast_c = show_toast.clone();
+        let update_ui_c = update_ui.clone();
+        let prehash_c = prehash_next.clone();
+        let busy_c = busy.clone();
+        Rc::new(move || {
+            if guard_busy(&busy_c) {
+                return;
+            }
+            let entry_opt = undo_c.borrow_mut().pop();
+            let entry = match entry_opt {
+                Some(e) => e,
+                None => {
+                    show_toast_c("Nothing to undo".into());
+                    return;
+                }
+            };
+            // do the filesystem undo
+            let mut union = union_c.borrow_mut();
+            match undo_move(&source_c, &entry, &mut union) {
+                Ok(restored_path) => {
+                    drop(union);
+                    // push to redo with adjusted src_name (actual restored file name)
+                    let restored_name = restored_path.file_name().and_then(|n| n.to_str()).unwrap_or(&entry.src_name).to_string();
+                    let redo_entry = UndoEntry::new(&entry.hash, &restored_name, entry.dest_path.clone(), entry.was_duplicate, &entry.folder_name, &entry.display_name);
+                    // Actually redo needs src_name = restored_name, dest_path is original dest (not used), hash same
+                    // Store redo entry with restored_name so redo can find the file
+                    redo_c.borrow_mut().push(redo_entry);
+                    // Make file Current File again (adjust queue index)
+                    // Find index of src_name in snapshot (original position)
+                    let search_name = entry.src_name.clone();
+                    let mut found_idx: Option<usize> = None;
+                    for (i, p) in snap_c.iter().enumerate() {
+                        if let Some(n) = p.file_name().and_then(|x| x.to_str()) {
+                            if n == search_name {
+                                found_idx = Some(i);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(fi) = found_idx {
+                        *idx_c.borrow_mut() = fi;
+                    } else {
+                        // If suffix was used, try to find restored_name? snapshot won't have it, keep at current or 0
+                        // Fallback: stay where we are, but ensure toast shows suffix name
+                        if let Some(fi2) = snap_c.iter().position(|p| p.file_name().and_then(|x| x.to_str()) == Some(restored_name.as_str())) {
+                            *idx_c.borrow_mut() = fi2;
+                        }
+                    }
+                    show_toast_c(format!("Undid {}: {} → Source", entry.display_name, restored_name));
+                    update_ui_c();
+                    prehash_c();
+                }
+                Err(e) => {
+                    drop(union);
+                    // push back onto undo_stack since it failed? ADR says stay, but we popped. Put it back.
+                    undo_c.borrow_mut().push(entry);
+                    tracing::warn!("undo failed: {}", e);
+                    show_toast_c(format!("Undo failed: {}", e));
+                    update_ui_c();
+                }
+            }
+        })
+    };
+
+    let perform_redo: Rc<dyn Fn()> = {
+        let source_c = source_folder.clone();
+        let union_c = union_set.clone();
+        let undo_c = undo_stack.clone();
+        let redo_c = redo_stack.clone();
+        let idx_c = idx.clone();
+        let snap_c = snapshot_rc.clone();
+        let show_toast_c = show_toast.clone();
+        let update_ui_c = update_ui.clone();
+        let prehash_c = prehash_next.clone();
+        let busy_c = busy.clone();
+        Rc::new(move || {
+            if guard_busy(&busy_c) {
+                return;
+            }
+            let entry_opt = redo_c.borrow_mut().pop();
+            let entry = match entry_opt {
+                Some(e) => e,
+                None => {
+                    show_toast_c("Nothing to redo".into());
+                    return;
+                }
+            };
+            // current file is the restored file in source_folder
+            let current_file = source_c.join(&entry.src_name);
+            if !current_file.exists() {
+                tracing::warn!("redo source missing: {}", current_file.display());
+                show_toast_c(format!("Redo failed: {} not found", entry.src_name));
+                // push back?
+                redo_c.borrow_mut().push(entry);
+                return;
+            }
+            let mut union = union_c.borrow_mut();
+            match redo_move(&source_c, &current_file, &entry.folder_name, &entry.hash, &mut union) {
+                Ok(dest) => {
+                    drop(union);
+                    // push back onto undo stack with original src_name? But need src_name for next undo to be the file name
+                    // The new undo entry should have src_name = current_file file_name, dest_path = dest
+                    let redo_was_duplicate = dest.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("duplicate");
+                    let new_undo = UndoEntry::new(&entry.hash, &entry.src_name, dest.clone(), redo_was_duplicate || entry.was_duplicate, &entry.folder_name, &entry.display_name);
+                    push_undo(&mut undo_c.borrow_mut(), new_undo);
+                    show_toast_c(format!("Redid {}: {} → {}", entry.display_name, entry.src_name, dest.file_name().and_then(|n| n.to_str()).unwrap_or("")));
+                    // Advance idx past this file? Redo reapplies move, so we go to next (like normal move)
+                    let len2 = snap_c.len();
+                    let cur_name = entry.src_name.clone();
+                    if let Some(pos) = snap_c.iter().position(|p| p.file_name().and_then(|x| x.to_str()) == Some(cur_name.as_str())) {
+                        if pos == *idx_c.borrow() {
+                            let mut v = idx_c.borrow_mut();
+                            if *v + 1 < len2 { *v += 1; } else if *v + 1 == len2 { *v += 1; }
+                        }
+                    } else {
+                        // fallback advance
+                        let mut v = idx_c.borrow_mut();
+                        if *v + 1 < len2 { *v += 1; } else if *v + 1 == len2 { *v += 1; }
+                    }
+                    update_ui_c();
+                    prehash_c();
+                }
+                Err(e) => {
+                    drop(union);
+                    redo_c.borrow_mut().push(entry);
+                    let msg = match e {
+                        MoverError::Exdev(_) => "Cross-device move not supported".to_string(),
+                        MoverError::Io(ref ioe) => {
+                            tracing::warn!("redo log failure: {}", ioe);
+                            "Disk full / I/O error — move reverted".to_string()
+                        }
+                    };
+                    show_toast_c(format!("Redo failed: {}", msg));
+                    update_ui_c();
+                }
             }
         })
     };
@@ -749,6 +928,22 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
             prehash_c();
         });
     }
+    {
+        let undo_c = perform_undo.clone();
+        let busy_c = busy.clone();
+        btn_undo.connect_clicked(move |_| {
+            if guard_busy(&busy_c) { return; }
+            undo_c();
+        });
+    }
+    {
+        let redo_c = perform_redo.clone();
+        let busy_c = busy.clone();
+        btn_redo.connect_clicked(move |_| {
+            if guard_busy(&busy_c) { return; }
+            redo_c();
+        });
+    }
 
     // Settings trigger via gear button
     {
@@ -768,7 +963,6 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let snap_k = snapshot_rc.clone();
         let btn_next_k = btn_next.clone();
         let btn_prev_k = btn_prev.clone();
-        let show_toast_k = show_toast.clone();
         let live_k = live_actions.clone();
         let window_weak = window.downgrade();
         let live_for_settings = live_actions.clone();
@@ -777,6 +971,8 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let source_for_settings = source_folder.clone();
         let trigger_k = trigger_move.clone();
         let busy_k = busy.clone();
+        let undo_k = perform_undo.clone();
+        let redo_k = perform_redo.clone();
         key_ctl.connect_key_pressed(move |_, key, _code, state| {
             let is_ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
             let is_shift = state.contains(gdk::ModifierType::SHIFT_MASK);
@@ -789,19 +985,29 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 }
             }
 
-            // Undo/Redo stubs still? Keep Ctrl+Z
+            // Undo / Redo global even when Preview has focus (EventControllerKey)
             if is_ctrl && key == gdk::Key::z && !is_shift {
-                show_toast_k("Undo (Ctrl+Z) — stub for ticket 01".into());
+                if guard_busy(&busy_k) {
+                    return glib::Propagation::Stop;
+                }
+                undo_k();
                 return glib::Propagation::Stop;
             }
             if is_ctrl && ((key == gdk::Key::z && is_shift) || key == gdk::Key::y) {
-                show_toast_k("Redo (Ctrl+Shift+Z / Ctrl+Y) — stub".into());
+                if guard_busy(&busy_k) {
+                    return glib::Propagation::Stop;
+                }
+                redo_k();
                 return glib::Propagation::Stop;
             }
 
             if guard_busy(&busy_k) {
                 if matches!(key, gdk::Key::_1 | gdk::Key::_2 | gdk::Key::_3 | gdk::Key::_4 | gdk::Key::_5 | gdk::Key::_6 | gdk::Key::_7 | gdk::Key::_8 | gdk::Key::_9
                     | gdk::Key::KP_1 | gdk::Key::KP_2 | gdk::Key::KP_3 | gdk::Key::KP_4 | gdk::Key::KP_5 | gdk::Key::KP_6 | gdk::Key::KP_7 | gdk::Key::KP_8 | gdk::Key::KP_9) {
+                    return glib::Propagation::Stop;
+                }
+                // also block undo/redo while busy
+                if is_ctrl && (key == gdk::Key::z || key == gdk::Key::y) {
                     return glib::Propagation::Stop;
                 }
             }
@@ -874,7 +1080,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
     }
     window.add_controller(key_ctl);
 
-    // Also add shortcut action for Edit → Preferences fallback via gio::SimpleAction
+    // Also add shortcut actions for Edit menu: Undo, Redo, Preferences
     {
         let win_c = window.clone();
         let live_c = live_actions.clone();
@@ -884,6 +1090,22 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let action = gio::SimpleAction::new("preferences", None);
         action.connect_activate(move |_, _| {
             open_settings(&win_c, SettingsContext { source_folder: source_c.clone(), live_actions: live_c.clone(), disk_actions: disk_c.clone(), rebuild_action_bar: rebuild_c.clone(), config_version });
+        });
+        window.add_action(&action);
+    }
+    {
+        let undo_c = perform_undo.clone();
+        let action = gio::SimpleAction::new("undo", None);
+        action.connect_activate(move |_, _| {
+            undo_c();
+        });
+        window.add_action(&action);
+    }
+    {
+        let redo_c = perform_redo.clone();
+        let action = gio::SimpleAction::new("redo", None);
+        action.connect_activate(move |_, _| {
+            redo_c();
         });
         window.add_action(&action);
     }
@@ -912,9 +1134,11 @@ fn main() -> glib::ExitCode {
         .application_id("com.example.organizer")
         .build();
 
-    // Edit → Preferences menubar (third trigger per ADR 0006)
+    // Edit → Undo/Redo/Preferences menubar
     {
         let edit_menu = gio::Menu::new();
+        edit_menu.append(Some("Undo"), Some("win.undo"));
+        edit_menu.append(Some("Redo"), Some("win.redo"));
         edit_menu.append(Some("Preferences"), Some("win.preferences"));
         let menu = gio::Menu::new();
         menu.append_submenu(Some("Edit"), &edit_menu);

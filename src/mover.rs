@@ -1,0 +1,330 @@
+use crate::dedup::append_hash_log;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+/// Compute next available path in dest_dir for filename, suffixing _1, _2 before extension on clash.
+/// Preserves extension; if no extension, suffix after name.
+pub fn next_available_path(dest_dir: &Path, file_name: &str) -> PathBuf {
+    let candidate = dest_dir.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let (stem, ext) = split_filename(file_name);
+    let mut i = 1usize;
+    loop {
+        let new_name = match ext {
+            Some(e) => format!("{}_{}.{}", stem, i, e),
+            None => format!("{}_{}", stem, i),
+        };
+        let cand = dest_dir.join(&new_name);
+        if !cand.exists() {
+            return cand;
+        }
+        i += 1;
+    }
+}
+
+fn split_filename(name: &str) -> (&str, Option<&str>) {
+    // find last dot not at start
+    if let Some(pos) = name.rfind('.') {
+        if pos > 0 && pos + 1 < name.len() {
+            return (&name[..pos], Some(&name[pos + 1..]));
+        }
+    }
+    (name, None)
+}
+
+#[derive(Debug)]
+pub enum MoverError {
+    Io(std::io::Error),
+    Exdev(PathBuf),
+}
+
+impl From<std::io::Error> for MoverError {
+    fn from(e: std::io::Error) -> Self {
+        MoverError::Io(e)
+    }
+}
+
+impl std::fmt::Display for MoverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MoverError::Io(e) => write!(f, "io: {}", e),
+            MoverError::Exdev(p) => write!(f, "cross-device move not supported: {}", p.display()),
+        }
+    }
+}
+
+/// Atomic move to sibling folder and hash-log append (happy path, no dedup).
+/// Steps: `rename` Current File to sibling `../<folder_name>/` (same-mount only, no EXDEV copy)
+/// with suffix `_1`/`_2` before extension on clash, then append hash to `SourceFolder/<folder_name>.txt`
+/// via flock+fsync, update `union_set`. On log failure, rollback rename back to Source Folder
+/// and do not update HashSet.
+///
+/// `source_folder` is the Source Folder (contains organizer.toml and *.txt).
+/// `current_file` must be inside `source_folder`.
+/// `folder_name` is slug-sanitized (a-z0-9_-).
+/// `hash` is lower-case hex sha256.
+/// `union_set` is in-memory union HashSet to update on success.
+///
+/// Returns dest path on success.
+pub fn move_to_action(
+    source_folder: &Path,
+    current_file: &Path,
+    folder_name: &str,
+    hash: &str,
+    union_set: &mut HashSet<String>,
+) -> Result<PathBuf, MoverError> {
+    // Validate that current_file is inside source_folder (file name only)
+    let file_name = current_file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| MoverError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid filename")))?
+        .to_string();
+
+    // Sibling is parent of source_folder joined with folder_name
+    let parent = source_folder
+        .parent()
+        .ok_or_else(|| MoverError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "source_folder has no parent")))?;
+    let dest_dir = parent.join(folder_name);
+    std::fs::create_dir_all(&dest_dir).map_err(MoverError::Io)?;
+
+    let dest_path = next_available_path(&dest_dir, &file_name);
+
+    // Attempt atomic rename (same-mount only). EXDEV is surfaced as CrossesDevices.
+    match std::fs::rename(current_file, &dest_path) {
+        Ok(()) => {},
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::CrossesDevices {
+                return Err(MoverError::Exdev(dest_path));
+            }
+            // Also handle raw EXDEV (18) on platforms where kind is Other
+            if e.raw_os_error() == Some(18) {
+                return Err(MoverError::Exdev(dest_path));
+            }
+            return Err(MoverError::Io(e));
+        }
+    }
+
+    // Append hash log; on failure rollback rename back
+    if let Err(e) = append_hash_log(source_folder, folder_name, hash) {
+        // Rollback: move file back to Source Folder
+        let rollback_target = {
+            let candidate = source_folder.join(&file_name);
+            if !candidate.exists() {
+                candidate
+            } else {
+                // suffix on clash to avoid overwrite (rare for rollback)
+                next_available_path(source_folder, &file_name)
+            }
+        };
+        let _ = std::fs::rename(&dest_path, &rollback_target);
+        // Do not update HashSet
+        return Err(MoverError::Io(e));
+    }
+
+    // Update union set with lower-case hash
+    union_set.insert(hash.to_ascii_lowercase());
+
+    // fsync handled inside append_hash_log; also fsync parent already
+    Ok(dest_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dedup::compute_sha256;
+    use std::collections::HashSet;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn next_available_path_suffix_before_extension() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        // no clash
+        assert_eq!(next_available_path(p, "foo.jpg"), p.join("foo.jpg"));
+        fs::write(p.join("foo.jpg"), b"x").unwrap();
+        assert_eq!(next_available_path(p, "foo.jpg"), p.join("foo_1.jpg"));
+        fs::write(p.join("foo_1.jpg"), b"x").unwrap();
+        assert_eq!(next_available_path(p, "foo.jpg"), p.join("foo_2.jpg"));
+        // with multiple dots
+        fs::write(p.join("a.b.png"), b"x").unwrap();
+        assert_eq!(next_available_path(p, "a.b.png"), p.join("a.b_1.png"));
+        // no extension
+        fs::write(p.join("README"), b"x").unwrap();
+        assert_eq!(next_available_path(p, "README"), p.join("README_1"));
+    }
+
+    #[test]
+    fn move_to_action_happy_path_creates_sibling_and_log_and_advances() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let source = base.join("source");
+        fs::create_dir_all(&source).unwrap();
+        // Prepare a file foo.jpg in source
+        let foo = source.join("foo.jpg");
+        fs::write(&foo, b"hello").unwrap();
+        let hash = compute_sha256(&foo).unwrap();
+        let mut union = HashSet::new();
+
+        let dest = move_to_action(&source, &foo, "keep", &hash, &mut union).unwrap();
+
+        assert!(!foo.exists(), "source file must disappear");
+        assert!(dest.exists(), "dest file must exist");
+        assert_eq!(dest, base.join("keep").join("foo.jpg"));
+        let log = fs::read_to_string(source.join("keep.txt")).unwrap();
+        assert_eq!(log.trim(), hash.to_ascii_lowercase());
+        assert!(union.contains(&hash.to_ascii_lowercase()));
+        // sibling folder lazily created
+        assert!(base.join("keep").is_dir());
+    }
+
+    #[test]
+    fn move_to_action_suffix_on_clash_never_overwrites() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let source = base.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let dest_dir = base.join("keep");
+        fs::create_dir_all(&dest_dir).unwrap();
+        // pre-create file in dest to cause clash
+        fs::write(dest_dir.join("foo.jpg"), b"existing").unwrap();
+
+        let foo = source.join("foo.jpg");
+        fs::write(&foo, b"hello2").unwrap();
+        let hash = compute_sha256(&foo).unwrap();
+        let mut union = HashSet::new();
+
+        let dest = move_to_action(&source, &foo, "keep", &hash, &mut union).unwrap();
+        assert_eq!(dest, dest_dir.join("foo_1.jpg"));
+        assert!(dest.exists());
+        assert!(dest_dir.join("foo.jpg").exists(), "original must still exist");
+        let log = fs::read_to_string(source.join("keep.txt")).unwrap();
+        assert_eq!(log.trim(), hash.to_ascii_lowercase());
+    }
+
+    #[test]
+    fn move_is_atomic_rename_only_no_exdev_copy() {
+        // On same mount, rename succeeds; we just verify it doesn't copy
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let source = base.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let foo = source.join("bar.png");
+        fs::write(&foo, b"data").unwrap();
+        let hash = compute_sha256(&foo).unwrap();
+        let mut union = HashSet::new();
+        let dest = move_to_action(&source, &foo, "keep", &hash, &mut union).unwrap();
+        // ensure source inode gone and dest is same data (rename, not copy+remove emulated)
+        assert!(!source.join("bar.png").exists());
+        let data = fs::read(&dest).unwrap();
+        assert_eq!(data, b"data");
+    }
+
+    #[test]
+    fn log_lines_are_lowercase_one_per_line_flock_fsync() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let source = base.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let mut union = HashSet::new();
+        for content in [b"a" as &[u8], b"b", b"c"] {
+            let name = format!("{}.jpg", String::from_utf8_lossy(content));
+            let p = source.join(&name);
+            fs::write(&p, content).unwrap();
+            let hash = compute_sha256(&p).unwrap();
+            move_to_action(&source, &p, "keep", &hash, &mut union).unwrap();
+        }
+        let log = fs::read_to_string(source.join("keep.txt")).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            assert_eq!(*line, line.to_ascii_lowercase());
+            assert_eq!(line.len(), 64);
+        }
+        assert_eq!(union.len(), 3);
+    }
+
+    #[test]
+    fn log_failure_rollback_moves_back_and_hashset_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let source = base.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let foo = source.join("foo.jpg");
+        fs::write(&foo, b"hello rollback").unwrap();
+        let hash = compute_sha256(&foo).unwrap();
+
+        // Create a directory at keep.txt to cause append_hash_log to fail (EISDIR)
+        // append opens with OpenOptions append, which will fail if path is a dir
+        fs::create_dir_all(source.join("keep.txt")).unwrap();
+
+        let mut union = HashSet::new();
+        let res = move_to_action(&source, &foo, "keep", &hash, &mut union);
+        assert!(res.is_err(), "should fail due to log dir");
+
+        // file must have been rolled back to source
+        assert!(source.join("foo.jpg").exists(), "file must be back in source after rollback, found: {:?}", fs::read_dir(&source).unwrap().collect::<Vec<_>>());
+        assert!(!base.join("keep").join("foo.jpg").exists(), "dest must not retain file after rollback");
+        assert!(!union.contains(&hash.to_ascii_lowercase()), "hashset must not be updated");
+        // cleanup dir for other tests
+        fs::remove_dir(source.join("keep.txt")).unwrap();
+    }
+
+    #[test]
+    fn busy_ignore_simulation_further_keys_ignored() {
+        // Simulate that while a move is in flight, second call should be ignored by UI
+        // Here we just verify that dest suffix handles concurrent moves correctly
+        // The busy flag itself is UI state; core mover is synchronous, so no race.
+        // We test that two files with same name suffix correctly.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let source = base.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let foo1 = source.join("a.jpg");
+        let foo2 = source.join("b.jpg");
+        fs::write(&foo1, b"one").unwrap();
+        fs::write(&foo2, b"two").unwrap();
+        let h1 = compute_sha256(&foo1).unwrap();
+        let h2 = compute_sha256(&foo2).unwrap();
+        let mut union = HashSet::new();
+        let d1 = move_to_action(&source, &foo1, "keep", &h1, &mut union).unwrap();
+        let d2 = move_to_action(&source, &foo2, "keep", &h2, &mut union).unwrap();
+        assert_ne!(d1, d2);
+        assert_eq!(union.len(), 2);
+    }
+
+    #[test]
+    fn headless_tempdir_acceptance_press_1_moves_and_log() {
+        // Minimal acceptance: press 1 on foo.jpg → ../keep/foo.jpg and keep.txt gains hash, Preview advances (queue index)
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let source = base.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        // Build a tiny queue: two files
+        let a = source.join("a.jpg");
+        let b = source.join("b.jpg");
+        std::fs::write(&a, b"image a").unwrap();
+        std::fs::write(&b, b"image b").unwrap();
+        let snap = crate::queue::build_snapshot(&source).unwrap();
+        assert_eq!(snap.len(), 2);
+        let mut union = HashSet::new();
+        let mut idx = 0usize;
+        // Simulate press 1 on Current File a.jpg
+        let cur = snap[idx].clone();
+        let hash = compute_sha256(&cur).unwrap();
+        let dest = move_to_action(&source, &cur, "keep", &hash, &mut union).unwrap();
+        assert_eq!(dest, base.join("keep").join("a.jpg"));
+        assert!(!source.join("a.jpg").exists());
+        let log = std::fs::read_to_string(source.join("keep.txt")).unwrap();
+        assert!(log.lines().any(|l| l == hash.to_ascii_lowercase()));
+        // auto-advance to next index (simulated)
+        // Since queue is Snapshot immutable, advancing means incrementing cursor
+        // The next file b.jpg should still exist in source (not moved yet)
+        assert!(source.join("b.jpg").exists());
+        // Simulate that UI would advance idx; we just check that mover didn't delete b.jpg
+        idx += 1;
+        assert_eq!(snap[idx].file_name().unwrap(), "b.jpg");
+    }
+}

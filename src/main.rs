@@ -6,8 +6,11 @@ use gtk4::{
     Label, Orientation, Paned, Stack,
 };
 use organizer_lib::config::{load_or_create, Action};
+use organizer_lib::dedup::{compute_sha256, load_union};
+use organizer_lib::mover::{move_to_action, MoverError};
 use organizer_lib::queue::build_snapshot;
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -101,6 +104,15 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
     let live_actions: Rc<RefCell<Vec<Action>>> = Rc::new(RefCell::new(config.actions.clone()));
     let disk_actions: Rc<RefCell<Vec<Action>>> = Rc::new(RefCell::new(config.actions.clone()));
 
+    // Load union HashSet and warn count (ADR 0003/0004) : inside SourceFolder *.txt
+    let (union_initial, warning_count) = load_union(&source_folder);
+    if warning_count > 0 {
+        tracing::warn!("{} corrupted log lines skipped at startup in {}", warning_count, source_folder.display());
+    }
+    let union_set: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(union_initial));
+    let hash_cache: Rc<RefCell<HashMap<PathBuf, String>>> = Rc::new(RefCell::new(HashMap::new()));
+    let busy: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Organizer")
@@ -160,6 +172,14 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
     file_overlay.add_overlay(&preview_center);
     preview_center.append(&icon);
     preview_center.append(&file_label);
+
+    // Spinner overlay on Preview (busy indicator)
+    let spinner = gtk4::Spinner::new();
+    spinner.set_halign(gtk4::Align::Center);
+    spinner.set_valign(gtk4::Align::Center);
+    spinner.set_size_request(48, 48);
+    spinner.set_visible(false);
+    file_overlay.add_overlay(&spinner);
 
     let ph_box = GtkBox::new(Orientation::Vertical, 12);
     ph_box.set_halign(gtk4::Align::Center);
@@ -281,6 +301,15 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         }
     };
 
+    // Toast warning about corrupted logs if any (after window shown)
+    if warning_count > 0 {
+        let toast_clone = show_toast.clone();
+        let wc = warning_count;
+        glib::idle_add_local_once(move || {
+            toast_clone(format!("{} corrupted log lines skipped (see warnings)", wc));
+        });
+    }
+
     let update_ui = {
         let idx_c = idx.clone();
         let snap_c = snapshot_rc.clone();
@@ -292,6 +321,8 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let empty_label_c = empty_label.clone();
         let hint_c = hint.clone();
         let source_c = source_folder.clone();
+        let busy_c = busy.clone();
+        let actions_row_c = actions_row.clone();
         move || {
             let len = snap_c.len();
             if len == 0 {
@@ -308,29 +339,205 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 return;
             }
             let i = *idx_c.borrow();
-            let path = &snap_c[i];
+            // clamp i to len - 1 (if we advanced beyond, show last + empty hint)
+            let effective = i.min(len - 1);
+            let path = &snap_c[effective];
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("—");
+            // If i >= len, we have triaged past end: show empty
+            if i >= len {
+                stack_c.set_visible_child_name("empty");
+                empty_label_c.set_text(&format!(
+                    "All triaged — {} files sorted\n{}",
+                    len,
+                    source_c.display()
+                ));
+                index_label_c.set_text(&format!("{len} / {len} — done"));
+                btn_prev_c.set_sensitive(len > 0 && !*busy_c.borrow());
+                btn_next_c.set_sensitive(false);
+                hint_c.set_text("");
+                return;
+            }
             stack_c.set_visible_child_name("file");
             file_label_c.set_text(name);
             index_label_c.set_text(&format!("{} / {} — {}", i + 1, len, name));
-            btn_prev_c.set_sensitive(i > 0);
-            btn_next_c.set_sensitive(i + 1 < len);
-            hint_c.set_text("Press 1-9 or Ctrl+1-9 to triage (mock toast until move ticket)");
+            let is_busy = *busy_c.borrow();
+            btn_prev_c.set_sensitive(i > 0 && !is_busy);
+            btn_next_c.set_sensitive(i + 1 < len && !is_busy);
+            // disable action buttons while busy
+            let mut child = actions_row_c.first_child();
+            while let Some(c) = child {
+                if let Some(btn) = c.downcast_ref::<Button>() {
+                    btn.set_sensitive(!is_busy);
+                }
+                child = c.next_sibling();
+            }
+            if is_busy {
+                hint_c.set_text("Working…");
+            } else {
+                hint_c.set_text("Press 1-9 or Ctrl+1-9 to triage");
+            }
         }
     };
 
-    // Rebuild Action Bar buttons from live_actions
+    // Helper to pre-hash next file in background (synchronous for v1; caches in hash_cache)
+    // For #16 we compute synchronously on main to avoid Send issues; future work can offload via spawn_blocking with Arc<Mutex>
+    let prehash_next = {
+        let snap_c = snapshot_rc.clone();
+        let idx_c = idx.clone();
+        let cache_c = hash_cache.clone();
+        Rc::new(move || {
+            let i = *idx_c.borrow();
+            let len = snap_c.len();
+            let mut to_hash: Vec<PathBuf> = Vec::new();
+            if i < len {
+                let cur = snap_c[i].clone();
+                if !cache_c.borrow().contains_key(&cur) && cur.exists() {
+                    to_hash.push(cur);
+                }
+            }
+            if i + 1 < len {
+                let nxt = snap_c[i + 1].clone();
+                if !cache_c.borrow().contains_key(&nxt) && nxt.exists() {
+                    to_hash.push(nxt);
+                }
+            }
+            for p in to_hash {
+                if let Ok(h) = compute_sha256(&p) {
+                    cache_c.borrow_mut().insert(p, h.to_ascii_lowercase());
+                }
+            }
+        }) as Rc<dyn Fn()>
+    };
+
+    // Trigger move for a given Action (busy-ignore, spinner, hash via cache/sync, rollback, advance)
+    // v1: hash computed synchronously on main thread (small images); busy flag + spinner ensures one in-flight invariant.
+    let trigger_move: Rc<dyn Fn(Action)> = {
+        let idx_c = idx.clone();
+        let snap_c = snapshot_rc.clone();
+        let source_c = source_folder.clone();
+        let union_c = union_set.clone();
+        let cache_c = hash_cache.clone();
+        let busy_c = busy.clone();
+        let spinner_c = spinner.clone();
+        let actions_row_c = actions_row.clone();
+        let btn_prev_c = btn_prev.clone();
+        let btn_next_c = btn_next.clone();
+        let show_toast_c = show_toast.clone();
+        let update_ui_c = update_ui.clone();
+        let prehash_c = prehash_next.clone();
+        Rc::new(move |action: Action| {
+            if *busy_c.borrow() {
+                return;
+            }
+            let len = snap_c.len();
+            if len == 0 {
+                return;
+            }
+            let i = *idx_c.borrow();
+            if i >= len {
+                return;
+            }
+            let current = snap_c[i].clone();
+            if !current.exists() {
+                show_toast_c(format!("File already moved: {}", current.display()));
+                if i + 1 < len {
+                    *idx_c.borrow_mut() += 1;
+                    update_ui_c();
+                    prehash_c();
+                }
+                return;
+            }
+            // busy on
+            *busy_c.borrow_mut() = true;
+            spinner_c.set_visible(true);
+            spinner_c.set_spinning(true);
+            {
+                let mut child = actions_row_c.first_child();
+                while let Some(c) = child {
+                    if let Some(btn) = c.downcast_ref::<Button>() {
+                        btn.set_sensitive(false);
+                    }
+                    child = c.next_sibling();
+                }
+                btn_prev_c.set_sensitive(false);
+                btn_next_c.set_sensitive(false);
+            }
+            update_ui_c();
+
+            let folder_name = action.folder_name.clone();
+            let display_name = action.display_name.clone();
+            let file_name = current.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+
+            // Obtain hash: cache first else compute synchronously (spawn_blocking pool would be here for large files)
+            let hash_opt: Option<String> = cache_c.borrow().get(&current).cloned().or_else(|| compute_sha256(&current).ok().map(|h| h.to_ascii_lowercase()));
+            // Remove from cache if present (we consumed it)
+            cache_c.borrow_mut().remove(&current);
+
+            let hash = match hash_opt {
+                Some(h) => h,
+                None => {
+                    let msg = format!("Failed to hash {}", file_name);
+                    tracing::warn!("{}", msg);
+                    show_toast_c(msg);
+                    spinner_c.set_spinning(false);
+                    spinner_c.set_visible(false);
+                    *busy_c.borrow_mut() = false;
+                    update_ui_c();
+                    return;
+                }
+            };
+            let mut union = union_c.borrow_mut();
+            match move_to_action(&source_c, &current, &folder_name, &hash, &mut union) {
+                Ok(dest) => {
+                    drop(union);
+                    show_toast_c(format!("Moved {} → {}/{} ", file_name, display_name, dest.file_name().and_then(|n| n.to_str()).unwrap_or("")));
+                    let len2 = snap_c.len();
+                    let mut v = idx_c.borrow_mut();
+                    if *v + 1 < len2 {
+                        *v += 1;
+                    } else if *v + 1 == len2 {
+                        *v += 1;
+                    }
+                    drop(v);
+                    // busy off before update to re-enable correctly
+                    spinner_c.set_spinning(false);
+                    spinner_c.set_visible(false);
+                    *busy_c.borrow_mut() = false;
+                    update_ui_c();
+                    prehash_c();
+                }
+                Err(e) => {
+                    drop(union);
+                    let msg = match e {
+                        MoverError::Exdev(_) => "Cross-device move not supported — move reverted".to_string(),
+                        MoverError::Io(ioe) => {
+                            if ioe.kind() == std::io::ErrorKind::StorageFull || ioe.to_string().contains("No space") {
+                                "Disk full / I/O error — move reverted".to_string()
+                            } else {
+                                format!("Disk full / I/O error — move reverted: {}", ioe)
+                            }
+                        }
+                    };
+                    tracing::warn!("move failed for {}: {}", file_name, msg);
+                    show_toast_c(msg);
+                    spinner_c.set_spinning(false);
+                    spinner_c.set_visible(false);
+                    *busy_c.borrow_mut() = false;
+                    update_ui_c();
+                }
+            }
+        })
+    };
+
+    // Rebuild Action Bar buttons from live_actions (real mover)
     let rebuild_action_bar: Rc<dyn Fn()> = {
         let actions_row_c = actions_row.clone();
         let live_c = live_actions.clone();
-        let snapshot_c = snapshot_rc.clone();
-        let idx_c = idx.clone();
-        let show_toast_c = show_toast.clone();
+        let trigger_c = trigger_move.clone();
         Rc::new(move || {
-            // clear
             while let Some(child) = actions_row_c.first_child() {
                 actions_row_c.remove(&child);
             }
@@ -352,20 +559,10 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 inner.append(&badge);
                 btn.set_child(Some(&inner));
                 btn.set_tooltip_text(Some(&format!("{} — {} or Ctrl+{}", act.display_name, act.shortcut, act.shortcut)));
-                // click triggers mock toast
-                let show_c = show_toast_c.clone();
-                let name_c = act.display_name.clone();
-                let sc_c = act.shortcut.clone();
-                let snap_c = snapshot_c.clone();
-                let idx_cc = idx_c.clone();
+                let act_clone = act.clone();
+                let trig = trigger_c.clone();
                 btn.connect_clicked(move |_| {
-                    let i = *idx_cc.borrow();
-                    let fname = if i < snap_c.len() {
-                        snap_c[i].file_name().and_then(|n| n.to_str()).unwrap_or("").to_string()
-                    } else {
-                        "".to_string()
-                    };
-                    show_c(format!("{} [{}] for {} — mock (no move yet)", name_c, sc_c, fname));
+                    trig(act_clone.clone());
                 });
                 actions_row_c.append(&btn);
             }
@@ -410,26 +607,34 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
     {
         let idx_c = idx.clone();
         let upd = update_ui.clone();
+        let prehash_c = prehash_next.clone();
+        let busy_c = busy.clone();
         btn_prev.connect_clicked(move |_| {
+            if *busy_c.borrow() { return; }
             let mut v = idx_c.borrow_mut();
             if *v > 0 {
                 *v -= 1;
             }
             drop(v);
             upd();
+            prehash_c();
         });
     }
     {
         let idx_c = idx.clone();
         let upd = update_ui.clone();
         let snap_c = snapshot_rc.clone();
+        let prehash_c = prehash_next.clone();
+        let busy_c = busy.clone();
         btn_next.connect_clicked(move |_| {
+            if *busy_c.borrow() { return; }
             let mut v = idx_c.borrow_mut();
             if *v + 1 < snap_c.len() {
                 *v += 1;
             }
             drop(v);
             upd();
+            prehash_c();
         });
     }
 
@@ -458,6 +663,8 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let disk_for_settings = disk_actions.clone();
         let rebuild_for_settings = rebuild_action_bar.clone();
         let source_for_settings = source_folder.clone();
+        let trigger_k = trigger_move.clone();
+        let busy_k = busy.clone();
         key_ctl.connect_key_pressed(move |_, key, _code, state| {
             let is_ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
             let is_shift = state.contains(gdk::ModifierType::SHIFT_MASK);
@@ -480,13 +687,23 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 return glib::Propagation::Stop;
             }
 
+            // Busy-ignore: ignore 1-9 while busy
+            if *busy_k.borrow() {
+                if matches!(key, gdk::Key::_1 | gdk::Key::_2 | gdk::Key::_3 | gdk::Key::_4 | gdk::Key::_5 | gdk::Key::_6 | gdk::Key::_7 | gdk::Key::_8 | gdk::Key::_9
+                    | gdk::Key::KP_1 | gdk::Key::KP_2 | gdk::Key::KP_3 | gdk::Key::KP_4 | gdk::Key::KP_5 | gdk::Key::KP_6 | gdk::Key::KP_7 | gdk::Key::KP_8 | gdk::Key::KP_9) {
+                    return glib::Propagation::Stop;
+                }
+            }
+
             match key {
                 gdk::Key::Right | gdk::Key::n | gdk::Key::N | gdk::Key::space => {
-                    // If entry focused and space without ctrl, allow typing? But space for nav should still work unless entry focused
                     if let Some(win) = window_weak.upgrade() {
                         if is_entry_focused(&win) && key == gdk::Key::space && !is_ctrl {
                             return glib::Propagation::Proceed;
                         }
+                    }
+                    if *busy_k.borrow() {
+                        return glib::Propagation::Stop;
                     }
                     btn_next_k.emit_clicked();
                     return glib::Propagation::Stop;
@@ -496,6 +713,9 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                         if is_entry_focused(&win) && !is_ctrl {
                             return glib::Propagation::Proceed;
                         }
+                    }
+                    if *busy_k.borrow() {
+                        return glib::Propagation::Stop;
                     }
                     btn_prev_k.emit_clicked();
                     return glib::Propagation::Stop;
@@ -527,23 +747,13 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 }
                 // Find action with this shortcut in live_actions
                 let actions = live_k.borrow();
-                if let Some(act) = actions.iter().find(|a| a.shortcut == d.to_string()) {
-                    let i = *idx.borrow();
-                    let fname = if i < snap_k.len() {
-                        snap_k[i].file_name().and_then(|n| n.to_str()).unwrap_or("").to_string()
-                    } else {
-                        "".to_string()
-                    };
-                    let msg = if is_ctrl {
-                        format!("Ctrl+{} → {} for {} — mock (no move yet)", d, act.display_name, fname)
-                    } else {
-                        format!("{} → {} for {} — mock (no move yet)", d, act.display_name, fname)
-                    };
-                    show_toast_k(msg);
+                if let Some(act) = actions.iter().find(|a| a.shortcut == d.to_string()).cloned() {
+                    drop(actions);
+                    // trigger real move
+                    let _ = &snap_k; // keep alive
+                    trigger_k(act);
                     return glib::Propagation::Stop;
                 } else {
-                    // no action for this shortcut, but still show toast for unassigned?
-                    // Spec: buttons are N, other digits maybe ignored
                     return glib::Propagation::Proceed;
                 }
             }
@@ -565,10 +775,11 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
             open_settings(&win_c, SettingsContext { source_folder: source_c.clone(), live_actions: live_c.clone(), disk_actions: disk_c.clone(), rebuild_action_bar: rebuild_c.clone(), config_version });
         });
         window.add_action(&action);
-        // Also register in app for menu? For now window action
     }
 
     update_ui();
+    // initial pre-hash current + next
+    prehash_next();
 
     let paned_weak = paned.downgrade();
     let win_weak = window.downgrade();

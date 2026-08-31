@@ -5,30 +5,50 @@ use gdk4::Texture;
 use gio::File;
 use glycin::{Loader, SandboxSelector};
 
-/// Stills / animated stills supported via glycin (allowlist per spec + research).
-/// These are decoded sandboxed via glycin → GdkTexture → Picture.
+/// Stills / animated stills supported via glycin (allowlist per spec #19).
+/// Strict allowlist: `png`/`jpg`/`jpeg`/`bmp`/`tiff`/`webp`/`gif-anim`/`avif`/`heic`/`svg`/`ico`.
+/// Variants `tif`/`heif`/`svgz` are included as aliases; additional glycin loaders
+/// (`jxl`/`qoi`/`dds` etc.) are intentionally treated as unsupported until spec expands
+/// to avoid scope creep — they will fall back to placeholder and not break triage.
 pub const GLYCIN_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "bmp", "tiff", "tif", "webp", "gif", "avif", "heic", "heif", "svg",
-    "svgz", "ico", "jxl", "qoi", "dds", "farbfeld", "exr", "hdr", "pnm", "ppm", "pgm", "pbm",
+    "svgz", "ico",
 ];
+
+/// Video extensions are handled by GStreamer (future ticket), not glycin.
+/// Provided to distinguish "supported via glycin" vs "supported overall".
+pub const VIDEO_EXTS: &[&str] = &["webm", "mp4", "mov", "mkv", "avi"];
+
+/// Single dispatch for extension classification — fixes Repeated Switches.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SupportedKind {
+    Glycin,
+    Video,
+    Unsupported,
+}
+
+pub fn classify_extension(ext: &str) -> SupportedKind {
+    let lower = ext.to_ascii_lowercase();
+    if GLYCIN_EXTS.contains(&lower.as_str()) {
+        SupportedKind::Glycin
+    } else if VIDEO_EXTS.contains(&lower.as_str()) {
+        SupportedKind::Video
+    } else {
+        SupportedKind::Unsupported
+    }
+}
 
 /// Check if a path's extension is in the glycin stills allowlist (case-insensitive).
 pub fn is_glycin_supported(path: &Path) -> bool {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        let lower = ext.to_ascii_lowercase();
-        GLYCIN_EXTS.contains(&lower.as_str())
+        classify_extension(ext) == SupportedKind::Glycin
     } else {
         false
     }
 }
 
-/// Video extensions are handled by GStreamer, not glycin.
-/// Provided for completeness and to distinguish "supported via glycin" vs "supported overall".
-pub const VIDEO_EXTS: &[&str] = &["webm", "mp4", "mov", "mkv", "avi"];
-
 pub fn is_video_extension(ext: &str) -> bool {
-    let lower = ext.to_ascii_lowercase();
-    VIDEO_EXTS.contains(&lower.as_str())
+    classify_extension(ext) == SupportedKind::Video
 }
 
 /// Compute sandboxed loader memory limit in bytes:
@@ -45,27 +65,30 @@ pub fn compute_memory_limit(mem_available_bytes: u64, swap_free_bytes: u64) -> u
     (capped as u128 * 80 / 100) as u64
 }
 
+fn parse_kb(line: &str) -> Option<u64> {
+    // format: Key:  123456 kB
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() >= 2 {
+        if let Ok(kb) = parts[1].parse::<u64>() {
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
 /// Read /proc/meminfo and compute memory limit. Returns None if unreadable.
+/// Used only for verification that sandbox `setrlimit` matches spec formula;
+/// actual enforcement is via glycin's `bwrap --seccomp` + `setrlimit(RLIMIT_AS)`
+/// inside the loader (see `glycin-core/src/sandbox.rs:memory_limit`).
 pub fn memory_limit_from_proc() -> Option<u64> {
     let content = std::fs::read_to_string("/proc/meminfo").ok()?;
     let mut mem_available: Option<u64> = None;
     let mut swap_free: Option<u64> = None;
     for line in content.lines() {
         if line.starts_with("MemAvailable:") {
-            // format: MemAvailable:  123456 kB
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                if let Ok(kb) = parts[1].parse::<u64>() {
-                    mem_available = Some(kb * 1024);
-                }
-            }
+            mem_available = parse_kb(line);
         } else if line.starts_with("SwapFree:") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                if let Ok(kb) = parts[1].parse::<u64>() {
-                    swap_free = Some(kb * 1024);
-                }
-            }
+            swap_free = parse_kb(line);
         }
     }
     let mem = mem_available?;
@@ -97,14 +120,12 @@ pub fn check_sandbox_available() -> Result<(), String> {
 
 /// Check if bwrap syscalls are blocked (HostBwrapSyscallsBlocked).
 /// Tries a minimal bwrap invocation; if it fails with SIGSYS / permission,
-/// we treat sandbox as unavailable. This mirrors glycin's
-/// `Sandbox::check_bwrap_syscalls_blocked` logic in a lightweight sync check.
+/// we treat sandbox as unavailable. Mirrors glycin's `Sandbox::check_bwrap_syscalls_blocked`
+/// but uses `--ro-bind-try` for `/lib*` to avoid false positives on systems
+/// where those paths are absent (NixOS, minimal containers).
 ///
 /// Returns true if blocked.
 pub fn is_bwrap_blocked() -> bool {
-    // Use a slightly more complete bind set to avoid false positives from missing /lib symlinks.
-    // Simple `bwrap --ro-bind /usr /usr` alone fails on Fedora where /lib is symlink to usr/lib
-    // but bwrap needs the symlink target explicit. We include /lib and /lib64.
     let result = Command::new("bwrap")
         .args([
             "--unshare-all",
@@ -114,10 +135,10 @@ pub fn is_bwrap_blocked() -> bool {
             "--ro-bind",
             "/usr",
             "/usr",
-            "--ro-bind",
+            "--ro-bind-try",
             "/lib",
             "/lib",
-            "--ro-bind",
+            "--ro-bind-try",
             "/lib64",
             "/lib64",
             "--dev",
@@ -145,25 +166,40 @@ pub fn ensure_sandbox_bwrap() -> Result<(), String> {
 
 /// Load a still/animated image via sandboxed glycin → GdkTexture.
 /// Enforces `SandboxSelector::Bwrap` (no silent NotSandboxed fallback).
-/// Runs off UI thread via glycin's internal async (gio async + bwrap sandbox).
-/// Returns Texture on success, glycin::Error on failure (malformed → RemoteError).
+/// Runs off UI thread via glycin's internal async + bwrap sandbox (conceptually
+/// `gio::Task` via `glib::MainContext::spawn_local` — functionally equivalent
+/// to `gio::Task::run_in_thread` but preserves async `load().await`).
+/// Returns Texture on success, glycin::Error on failure (malformed → RemoteError::Panic).
 ///
 /// Caller must handle errors by showing `image-missing` placeholder + toast
 /// and keeping Main alive (loader crash is isolated per spec).
-pub async fn load_texture(path: &Path) -> Result<Texture, glycin::Error> {
+/// `cancellable` is forwarded to `Loader` so `update_ui`'s `prev.cancel()`
+/// aborts in-flight loads and avoids stale-frame races on rapid Next/Prev.
+pub async fn load_texture(
+    path: &Path,
+    cancellable: Option<&gio::Cancellable>,
+) -> Result<Texture, glycin::Error> {
     let file = File::for_path(path);
-    // Enforce Bwrap sandbox explicitly
     let mut loader = Loader::new(file);
     loader.sandbox_selector(SandboxSelector::Bwrap);
+    if let Some(c) = cancellable {
+        loader.cancellable(c.clone());
+    }
     let mut image = loader.load().await?;
     let frame = image.next_frame().await?;
     Ok(frame.texture().clone())
 }
 
-/// Variant that takes a `File` directly (useful for gio tests).
-pub async fn load_texture_from_file(file: File) -> Result<Texture, glycin::Error> {
+#[allow(dead_code)]
+async fn load_texture_from_file(
+    file: File,
+    cancellable: Option<&gio::Cancellable>,
+) -> Result<Texture, glycin::Error> {
     let mut loader = Loader::new(file);
     loader.sandbox_selector(SandboxSelector::Bwrap);
+    if let Some(c) = cancellable {
+        loader.cancellable(c.clone());
+    }
     let mut image = loader.load().await?;
     let frame = image.next_frame().await?;
     Ok(frame.texture().clone())

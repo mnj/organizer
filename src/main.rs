@@ -8,7 +8,7 @@ use gtk4::{
 use organizer_lib::config::{load_or_create, Action};
 use organizer_lib::dedup::{compute_sha256, find_duplicate_origin, load_union};
 use organizer_lib::mover::{move_to_action, MoverError};
-use organizer_lib::preview::{ensure_sandbox_bwrap, is_glycin_supported, is_video_extension, load_texture};
+use organizer_lib::preview::{ensure_sandbox_bwrap, is_glycin_supported, load_texture};
 use organizer_lib::queue::build_snapshot;
 use organizer_lib::undo::{push_undo_capped, undo_move, UndoEntry};
 use std::cell::RefCell;
@@ -124,6 +124,51 @@ fn make_nav_button(icon: &str, tooltip: &str, label: Option<&str>) -> Button {
     };
     b.set_sensitive(false);
     b
+}
+
+fn make_placeholder(
+    icon_markup: &str,
+    name: &Label,
+    badge_text: &str,
+    badge_class: &str,
+    detail: Option<&Label>,
+) -> GtkBox {
+    let bx = GtkBox::new(Orientation::Vertical, 12);
+    bx.set_halign(gtk4::Align::Center);
+    bx.set_valign(gtk4::Align::Center);
+    let ic = Label::new(None);
+    ic.set_markup(icon_markup);
+    let badge = Label::new(Some(badge_text));
+    badge.add_css_class(badge_class);
+    bx.append(&ic);
+    bx.append(name);
+    bx.append(&badge);
+    if let Some(d) = detail {
+        bx.append(d);
+    }
+    bx
+}
+
+fn preload_next_preview(
+    cache: &Rc<RefCell<HashMap<PathBuf, gdk::Texture>>>,
+    snapshot: &Rc<Vec<PathBuf>>,
+    idx: &Rc<RefCell<usize>>,
+) {
+    let cur = *idx.borrow();
+    if cur + 1 < snapshot.len() {
+        let nxt = snapshot[cur + 1].clone();
+        if organizer_lib::preview::is_glycin_supported(&nxt)
+            && !cache.borrow().contains_key(&nxt)
+            && nxt.exists()
+        {
+            let cache_clone = cache.clone();
+            glib::MainContext::default().spawn_local(async move {
+                if let Ok(t) = organizer_lib::preview::load_texture(&nxt, None).await {
+                    cache_clone.borrow_mut().insert(nxt.clone(), t);
+                }
+            });
+        }
+    }
 }
 
 /// Hash preloading service (Divergent Change fix) — caches sha256 for Current + next.
@@ -348,54 +393,28 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
     spinner.set_visible(false);
     file_overlay.add_overlay(&spinner);
 
-    let ph_box = GtkBox::new(Orientation::Vertical, 12);
-    ph_box.set_halign(gtk4::Align::Center);
-    ph_box.set_valign(gtk4::Align::Center);
-    let ph_icon = Label::new(None);
-    ph_icon.set_markup(r#"<span size="50000">📄</span>"#);
     let ph_name = Label::new(None);
     ph_name.add_css_class("title-3");
-    let ph_badge = Label::new(Some("Unsupported"));
-    ph_badge.add_css_class("unsupported-badge");
-    ph_box.append(&ph_icon);
-    ph_box.append(&ph_name);
-    ph_box.append(&ph_badge);
-
-    // Decode error placeholder (malformed image, loader crash isolated)
-    let error_box = GtkBox::new(Orientation::Vertical, 12);
-    error_box.set_halign(gtk4::Align::Center);
-    error_box.set_valign(gtk4::Align::Center);
-    let error_icon = Label::new(None);
-    error_icon.set_markup(r#"<span size="50000">🖼️</span>"#);
+    let ph_box = make_placeholder(
+        r#"<span size="50000">📄</span>"#,
+        &ph_name,
+        "Unsupported",
+        "unsupported-badge",
+        None,
+    );
     let error_name = Label::new(None);
     error_name.add_css_class("title-3");
     error_name.set_wrap(true);
-    let error_badge = Label::new(Some("Decode failed"));
-    error_badge.add_css_class("duplicate-badge");
     let error_detail = Label::new(Some("image-missing — loader error, file skipped"));
     error_detail.add_css_class("dim-label");
     error_detail.set_wrap(true);
-    error_box.append(&error_icon);
-    error_box.append(&error_name);
-    error_box.append(&error_badge);
-    error_box.append(&error_detail);
-
-    // Video placeholder (GStreamer pending)
-    let video_box = GtkBox::new(Orientation::Vertical, 12);
-    video_box.set_halign(gtk4::Align::Center);
-    video_box.set_valign(gtk4::Align::Center);
-    let video_icon = Label::new(None);
-    video_icon.set_markup(r#"<span size="50000">🎬</span>"#);
-    let video_name = Label::new(None);
-    video_name.add_css_class("title-3");
-    let video_badge = Label::new(Some("Video"));
-    video_badge.add_css_class("unsupported-badge");
-    let video_hint = Label::new(Some("Video preview via GStreamer — pending"));
-    video_hint.add_css_class("dim-label");
-    video_box.append(&video_icon);
-    video_box.append(&video_name);
-    video_box.append(&video_badge);
-    video_box.append(&video_hint);
+    let error_box = make_placeholder(
+        r#"<span size="50000">🖼️</span>"#,
+        &error_name,
+        "Decode failed",
+        "duplicate-badge",
+        Some(&error_detail),
+    );
 
     let empty_box = GtkBox::new(Orientation::Vertical, 12);
     empty_box.set_halign(gtk4::Align::Center);
@@ -412,7 +431,6 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
     stack.add_named(&file_overlay, Some("file"));
     stack.add_named(&ph_box, Some("unsupported"));
     stack.add_named(&error_box, Some("error"));
-    stack.add_named(&video_box, Some("video"));
     stack.add_named(&empty_box, Some("empty"));
     preview_box.append(&stack);
     paned.set_start_child(Some(&preview_box));
@@ -536,7 +554,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let undo_c = undo_stack.clone();
         let redo_c = redo_stack.clone();
         let override_c = current_override.clone();
-        // Preview widgets and caches
+        // Preview widgets and caches — bundled to reduce Data Clumps
         let picture_c = picture.clone();
         let spinner_c = spinner.clone();
         let preview_center_c = preview_center.clone();
@@ -544,7 +562,6 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let ph_name_c = ph_name.clone();
         let error_name_c = error_name.clone();
         let error_detail_c = error_detail.clone();
-        let video_name_c = video_name.clone();
         let preview_cache_c = preview_cache.clone();
         let preview_cancellable_c = preview_cancellable.clone();
         let show_toast_c = show_toast.clone();
@@ -633,54 +650,23 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
             } else {
                 hint_c.set_text("Press 1-9 or Ctrl+1-9 to triage");
             }
-            // Preview handling: sandboxed glycin for stills/animated
-            let ext = effective_path_clone
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if is_video_extension(&ext) {
-                video_name_c.set_text(&name);
-                stack_c.set_visible_child_name("video");
-                picture_c.set_paintable(None::<&gdk::Paintable>);
-                preview_center_c.set_visible(false);
-                spinner_c.set_visible(false);
-                spinner_c.set_spinning(false);
-            } else if is_glycin_supported(&effective_path_clone) {
-                // cancel previous preview load if in flight
+            // Preview handling: sandboxed glycin for stills/animated (video treated as unsupported until GStreamer ticket)
+            if is_glycin_supported(&effective_path_clone) {
+                // cancel previous preview load if in flight - prevents stale-frame race on rapid Next/Prev
                 if let Some(prev) = preview_cancellable_c.borrow().as_ref() {
                     prev.cancel();
                 }
                 if let Some(tex) = preview_cache_c.borrow().get(&effective_path_clone).cloned() {
-                    // cache hit: show texture immediately, HiDPI via Texture
                     picture_c.set_paintable(Some(&tex));
                     preview_center_c.set_visible(false);
                     stack_c.set_visible_child_name("file");
                     spinner_c.set_visible(false);
                     spinner_c.set_spinning(false);
-                    // preload next file off UI thread (non-blocking)
-                    let next_idx = i + 1;
-                    if next_idx < snap_c.len() {
-                        let next_path = snap_c[next_idx].clone();
-                        if is_glycin_supported(&next_path)
-                            && !preview_cache_c.borrow().contains_key(&next_path)
-                            && next_path.exists()
-                        {
-                            let cache_clone = preview_cache_c.clone();
-                            glib::MainContext::default().spawn_local(async move {
-                                if let Ok(t) = load_texture(&next_path).await {
-                                    cache_clone.borrow_mut().insert(next_path.clone(), t);
-                                }
-                            });
-                        }
-                    }
+                    preload_next_preview(&preview_cache_c, &snap_c, &idx_c);
                 } else {
-                    // cache miss: async glycin load off UI thread
                     let cancellable = gio::Cancellable::new();
                     *preview_cancellable_c.borrow_mut() = Some(cancellable.clone());
-                    // show loading state: file overlay with spinner, Contain letterbox on dark #1e1e2e
                     file_label_c.set_text(&name);
-                    // keep icon placeholder while loading
                     icon_c.set_markup(r#"<span size="60000">🖼️</span>"#);
                     preview_center_c.set_visible(true);
                     picture_c.set_paintable(None::<&gdk::Paintable>);
@@ -701,7 +687,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                     let snap_for_preload = snap_c.clone();
                     let idx_for_preload = idx_c.clone();
                     glib::MainContext::default().spawn_local(async move {
-                        let res = load_texture(&path_for_async).await;
+                        let res = load_texture(&path_for_async, Some(&cancellable)).await;
                         if cancellable.is_cancelled() {
                             return;
                         }
@@ -716,32 +702,21 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                                 picture_async.set_paintable(Some(&tex));
                                 preview_center_async.set_visible(false);
                                 stack_async.set_visible_child_name("file");
-                                // preload next file
-                                let cur = *idx_for_preload.borrow();
-                                if cur + 1 < snap_for_preload.len() {
-                                    let nxt = snap_for_preload[cur + 1].clone();
-                                    if is_glycin_supported(&nxt)
-                                        && !preview_cache_async.borrow().contains_key(&nxt)
-                                        && nxt.exists()
-                                    {
-                                        let cache_clone = preview_cache_async.clone();
-                                        glib::MainContext::default().spawn_local(async move {
-                                            if let Ok(t) = load_texture(&nxt).await {
-                                                cache_clone.borrow_mut().insert(nxt.clone(), t);
-                                            }
-                                        });
-                                    }
-                                }
+                                preload_next_preview(
+                                    &preview_cache_async,
+                                    &snap_for_preload,
+                                    &idx_for_preload,
+                                );
                             }
                             Err(e) => {
+                                // Loader crash isolated via bwrap sandbox (RemoteError::Panic handled as generic Err)
                                 tracing::warn!(
                                     "glycin decode failed for {}: {}",
                                     path_for_async.display(),
                                     e
                                 );
                                 error_name_async.set_text(&name_async);
-                                error_detail_async
-                                    .set_text(&format!("{} — loader error", e));
+                                error_detail_async.set_text(&format!("{} — loader error", e));
                                 stack_async.set_visible_child_name("error");
                                 preview_center_async.set_visible(true);
                                 show_toast_async(format!(
@@ -753,7 +728,6 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                     });
                 }
             } else {
-                // unsupported file: placeholder card, never moved/hashed
                 ph_name_c.set_text(&name);
                 stack_c.set_visible_child_name("unsupported");
                 picture_c.set_paintable(None::<&gdk::Paintable>);

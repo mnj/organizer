@@ -3,8 +3,8 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use crate::dedup::is_valid_hash;
-use crate::mover::{move_to_action, MoverError};
+use crate::dedup::{is_valid_hash, FileHash};
+use crate::mover::move_to_action;
 
 /// Undo entry stores enough to reverse one move.
 /// In-memory only, LIFO, capped at 50 (ADR 0005).
@@ -27,8 +27,10 @@ impl UndoEntry {
         folder_name: &str,
         display_name: &str,
     ) -> Self {
+        // Validate via FileHash to enforce domain type (Primitive Obsession fix)
+        let validated = FileHash::new(hash).map(|h| h.to_string()).unwrap_or_else(|_| hash.to_ascii_lowercase());
         Self {
-            hash: hash.to_ascii_lowercase(),
+            hash: validated,
             src_name: src_name.to_string(),
             dest_path,
             was_duplicate,
@@ -38,8 +40,20 @@ impl UndoEntry {
     }
 }
 
-/// Push with LIFO cap 50 (ADR: up to 50 entries or queue length).
-/// We cap at 50 unconditionally; queue length is at most snapshot len which is >= stack len.
+/// Push with LIFO cap 50 or queue length, whichever is smaller (ADR 0005).
+/// `queue_len` is Snapshot length; cap = min(50, queue_len). If queue_len is 0, no push.
+pub fn push_undo_capped(stack: &mut Vec<UndoEntry>, entry: UndoEntry, queue_len: usize) {
+    let cap = std::cmp::min(50, queue_len);
+    if cap == 0 {
+        return;
+    }
+    if stack.len() >= cap {
+        stack.remove(0);
+    }
+    stack.push(entry);
+}
+
+/// Back-compat wrapper capped at 50 (used by tests and when queue length unknown).
 pub fn push_undo(stack: &mut Vec<UndoEntry>, entry: UndoEntry) {
     const MAX: usize = 50;
     if stack.len() >= MAX {
@@ -108,9 +122,58 @@ fn split_filename(name: &str) -> (&str, Option<&str>) {
     (name, None)
 }
 
+/// Helper: write lines with newline, flush + fsync (caller holds exclusive lock if unix).
+fn write_lines(file: &mut std::fs::File, lines: &[String]) -> std::io::Result<()> {
+    for line in lines {
+        file.write_all(line.as_bytes())?;
+        file.write_all(b"\n")?;
+    }
+    file.flush()?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Check if any `*.txt` inside `source_folder` contains `lower` (case-insensitive trimmed equality).
+/// Uses shared lock per file.
+fn contains_hash_in_logs(source_folder: &Path, lower: &str) -> bool {
+    let Ok(dir) = std::fs::read_dir(source_folder) else {
+        return false;
+    };
+    for e in dir.flatten() {
+        let p = e.path();
+        if !p.is_file() {
+            continue;
+        }
+        if !matches!(p.extension().and_then(|x| x.to_str()), Some(ext) if ext.eq_ignore_ascii_case("txt")) {
+            continue;
+        }
+        if let Ok(f) = OpenOptions::new().read(true).open(&p) {
+            #[cfg(unix)]
+            {
+                let _ = fs2::FileExt::lock_shared(&f);
+            }
+            let reader = BufReader::new(&f);
+            for line in reader.lines().flatten() {
+                if line.trim().to_ascii_lowercase() == lower {
+                    #[cfg(unix)]
+                    {
+                        let _ = fs2::FileExt::unlock(&f);
+                    }
+                    return true;
+                }
+            }
+            #[cfg(unix)]
+            {
+                let _ = fs2::FileExt::unlock(&f);
+            }
+        }
+    }
+    false
+}
+
 /// Remove last occurrence of `hash` (case-insensitive) from `SourceFolder/<folder_name>.txt`.
-/// Returns true if a line was removed. Uses flock exclusive + fsync + fsync parent dir.
-/// If file does not exist, returns Ok(false).
+/// Returns true if a line was removed. Holds exclusive `flock` across read+rewrite for atomicity,
+/// then `fsync` file and parent dir. If file does not exist, returns Ok(false).
 pub fn remove_last_hash_occurrence(
     source_folder: &Path,
     folder_name: &str,
@@ -127,22 +190,22 @@ pub fn remove_last_hash_occurrence(
     if !log_path.exists() {
         return Ok(false);
     }
-    // Read all lines with shared lock
-    let file = OpenOptions::new().read(true).open(&log_path)?;
+    // Open read+write and hold exclusive lock across read and rewrite (no unlock window)
+    let mut file = OpenOptions::new().read(true).write(true).open(&log_path)?;
     #[cfg(unix)]
     {
-        let _ = fs2::FileExt::lock_shared(&file);
+        use fs2::FileExt;
+        file.lock_exclusive()?;
     }
+    // Read all lines while holding exclusive lock
     let mut lines: Vec<String> = Vec::new();
     {
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(0))?;
         let reader = BufReader::new(&file);
         for line in reader.lines().flatten() {
             lines.push(line);
         }
-    }
-    #[cfg(unix)]
-    {
-        let _ = fs2::FileExt::unlock(&file);
     }
     // Find last index where trimmed lower == lower
     let mut last_idx: Option<usize> = None;
@@ -153,35 +216,27 @@ pub fn remove_last_hash_occurrence(
     }
     let idx = match last_idx {
         Some(i) => i,
-        None => return Ok(false),
+        None => {
+            #[cfg(unix)]
+            {
+                use fs2::FileExt;
+                let _ = file.unlock();
+            }
+            return Ok(false);
+        }
     };
     lines.remove(idx);
-    // Rewrite file with exclusive lock, truncate, fsync
-    let mut out = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .create(true)
-        .open(&log_path)?;
-    #[cfg(unix)]
+    // Truncate and rewrite while still holding exclusive lock
     {
-        use fs2::FileExt;
-        out.lock_exclusive()?;
-        for line in &lines {
-            out.write_all(line.as_bytes())?;
-            out.write_all(b"\n")?;
+        use std::io::Seek;
+        file.set_len(0)?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        write_lines(&mut file, &lines)?;
+        #[cfg(unix)]
+        {
+            use fs2::FileExt;
+            file.unlock()?;
         }
-        out.flush()?;
-        out.sync_all()?;
-        out.unlock()?;
-    }
-    #[cfg(not(unix))]
-    {
-        for line in &lines {
-            out.write_all(line.as_bytes())?;
-            out.write_all(b"\n")?;
-        }
-        out.flush()?;
-        out.sync_all()?;
     }
     if let Ok(dir_file) = OpenOptions::new().read(true).open(source_folder) {
         let _ = dir_file.sync_all();
@@ -201,62 +256,15 @@ pub fn undo_move(
     let restored = undo_rename(source_folder, &entry.dest_path, &entry.src_name)?;
     if !entry.was_duplicate && !entry.folder_name.is_empty() {
         let _removed = remove_last_hash_occurrence(source_folder, &entry.folder_name, &entry.hash)?;
-        // Update union: remove only if hash no longer appears in any remaining txt
-        // Scan all *.txt inside source_folder to see if lower still present
         let lower = entry.hash.to_ascii_lowercase();
-        let still_present = {
-            let mut found = false;
-            if let Ok(dir) = std::fs::read_dir(source_folder) {
-                for e in dir.flatten() {
-                    let p = e.path();
-                    if !p.is_file() {
-                        continue;
-                    }
-                    if !matches!(p.extension().and_then(|x| x.to_str()), Some(ext) if ext.eq_ignore_ascii_case("txt")) {
-                        continue;
-                    }
-                    if let Ok(f) = OpenOptions::new().read(true).open(&p) {
-                        #[cfg(unix)]
-                        {
-                            let _ = fs2::FileExt::lock_shared(&f);
-                        }
-                        let reader = BufReader::new(&f);
-                        for line in reader.lines().flatten() {
-                            if line.trim().to_ascii_lowercase() == lower {
-                                found = true;
-                                break;
-                            }
-                        }
-                        #[cfg(unix)]
-                        {
-                            let _ = fs2::FileExt::unlock(&f);
-                        }
-                        if found {
-                            break;
-                        }
-                    }
-                }
-            }
-            found
-        };
-        if !still_present {
+        if !contains_hash_in_logs(source_folder, &lower) {
             union_set.remove(&lower);
         }
     }
     Ok(restored)
 }
 
-/// Redo is same as original move via `move_to_action` (ADR: same move+log path).
-/// `current_file` is the restored file path in SourceFolder (may be _undo suffixed).
-pub fn redo_move(
-    source_folder: &Path,
-    current_file: &Path,
-    folder_name: &str,
-    hash: &str,
-    union_set: &mut HashSet<String>,
-) -> Result<PathBuf, MoverError> {
-    move_to_action(source_folder, current_file, folder_name, hash, union_set)
-}
+
 
 #[cfg(test)]
 mod tests {
@@ -446,8 +454,8 @@ mod tests {
         let restored = undo_move(&source, &entry, &mut union).unwrap();
         assert!(restored.exists());
         assert_eq!(union.len(), 0);
-        // redo: move restored file back
-        let dest2 = redo_move(&source, &restored, "keep", &hash, &mut union).unwrap();
+        // redo: move restored file back (same as original move)
+        let dest2 = move_to_action(&source, &restored, "keep", &hash, &mut union).unwrap();
         assert!(dest2.exists());
         assert!(!restored.exists());
         assert_eq!(union.len(), 1);
@@ -517,7 +525,7 @@ mod tests {
         let redo_a = redo_stack.pop().unwrap();
         let restored_a_path = source.join(&redo_a.src_name);
         // find actual restored file (may be suffix but here no clash)
-        let dest_a2 = redo_move(&source, &restored_a_path, &redo_a.folder_name, &redo_a.hash, &mut union).unwrap();
+        let dest_a2 = move_to_action(&source, &restored_a_path, &redo_a.folder_name, &redo_a.hash, &mut union).unwrap();
         push_undo(&mut undo_stack, UndoEntry::new(&redo_a.hash, &redo_a.src_name, dest_a2.clone(), false, &redo_a.folder_name, &redo_a.display_name));
         assert!(dest_a2.exists());
         assert_eq!(union.len(), 1);
@@ -525,7 +533,7 @@ mod tests {
         // redo b.jpg
         let redo_b = redo_stack.pop().unwrap();
         let restored_b_path = source.join(&redo_b.src_name);
-        let dest_b2 = redo_move(&source, &restored_b_path, &redo_b.folder_name, &redo_b.hash, &mut union).unwrap();
+        let dest_b2 = move_to_action(&source, &restored_b_path, &redo_b.folder_name, &redo_b.hash, &mut union).unwrap();
         push_undo(&mut undo_stack, UndoEntry::new(&redo_b.hash, &redo_b.src_name, dest_b2.clone(), false, &redo_b.folder_name, &redo_b.display_name));
         assert!(dest_b2.exists());
         assert_eq!(union.len(), 2);

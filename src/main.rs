@@ -9,7 +9,7 @@ use organizer_lib::config::{load_or_create, Action};
 use organizer_lib::dedup::{compute_sha256, find_duplicate_origin, load_union};
 use organizer_lib::mover::{move_to_action, MoverError};
 use organizer_lib::queue::build_snapshot;
-use organizer_lib::undo::{push_undo, redo_move, undo_move, UndoEntry};
+use organizer_lib::undo::{push_undo_capped, undo_move, UndoEntry};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -104,6 +104,25 @@ fn set_busy_state(
 
 fn guard_busy(busy: &Rc<RefCell<bool>>) -> bool {
     *busy.borrow()
+}
+
+fn advance_idx(idx: &Rc<RefCell<usize>>, len: usize) {
+    let mut v = idx.borrow_mut();
+    if *v + 1 < len {
+        *v += 1;
+    } else if *v + 1 == len {
+        *v += 1;
+    }
+}
+
+fn make_nav_button(icon: &str, tooltip: &str, label: Option<&str>) -> Button {
+    let b = if let Some(l) = label {
+        Button::builder().label(l).icon_name(icon).tooltip_text(tooltip).build()
+    } else {
+        Button::builder().icon_name(icon).tooltip_text(tooltip).build()
+    };
+    b.set_sensitive(false);
+    b
 }
 
 /// Hash preloading service (Divergent Change fix) — caches sha256 for Current + next.
@@ -341,18 +360,8 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
     dup_badge.add_css_class("duplicate-badge");
     dup_badge.set_visible(false);
     let sep = gtk4::Separator::new(Orientation::Vertical);
-    let btn_undo = Button::builder()
-        .label("Undo")
-        .icon_name("edit-undo-symbolic")
-        .tooltip_text("Undo (Ctrl+Z)")
-        .build();
-    btn_undo.set_sensitive(false);
-    let btn_redo = Button::builder()
-        .label("Redo")
-        .icon_name("edit-redo-symbolic")
-        .tooltip_text("Redo (Ctrl+Shift+Z / Ctrl+Y)")
-        .build();
-    btn_redo.set_sensitive(false);
+    let btn_undo = make_nav_button("edit-undo-symbolic", "Undo (Ctrl+Z)", Some("Undo"));
+    let btn_redo = make_nav_button("edit-redo-symbolic", "Redo (Ctrl+Shift+Z / Ctrl+Y)", Some("Redo"));
     let btn_settings = Button::builder()
         .icon_name("emblem-system-symbolic")
         .tooltip_text("Settings (Ctrl+,)")
@@ -401,6 +410,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
 
     let snapshot_rc = Rc::new(snapshot);
     let idx: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+    let current_override: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
 
     let show_toast = {
         let t = toast.clone();
@@ -441,6 +451,19 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let actions_row_c = actions_row.clone();
         let undo_c = undo_stack.clone();
         let redo_c = redo_stack.clone();
+        let override_c = current_override.clone();
+        let refresh_undo_redo = {
+            let btn_undo_c = btn_undo_c.clone();
+            let btn_redo_c = btn_redo_c.clone();
+            let undo_c = undo_c.clone();
+            let redo_c = redo_c.clone();
+            let busy_c = busy_c.clone();
+            move || {
+                let is_busy = *busy_c.borrow();
+                btn_undo_c.set_sensitive(!undo_c.borrow().is_empty() && !is_busy);
+                btn_redo_c.set_sensitive(!redo_c.borrow().is_empty() && !is_busy);
+            }
+        };
         move || {
             let len = snap_c.len();
             if len == 0 {
@@ -453,19 +476,28 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 index_label_c.set_text("—");
                 btn_prev_c.set_sensitive(false);
                 btn_next_c.set_sensitive(false);
-                btn_undo_c.set_sensitive(false);
-                btn_redo_c.set_sensitive(false);
+                refresh_undo_redo();
                 hint_c.set_text("");
                 return;
             }
             let i = *idx_c.borrow();
-            // clamp i to len - 1 (if we advanced beyond, show last + empty hint)
-            let effective = i.min(len - 1);
-            let path = &snap_c[effective];
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("—");
+            // If override is set (undo with _undo suffix), show that file instead of snapshot
+            let (effective_path, effective_name) = if let Some(ov) = override_c.borrow().clone() {
+                if ov.exists() {
+                    let n = ov.file_name().and_then(|x| x.to_str()).unwrap_or("—").to_string();
+                    (ov, n)
+                } else {
+                    let p = snap_c[i.min(len - 1)].clone();
+                    let n = p.file_name().and_then(|x| x.to_str()).unwrap_or("—").to_string();
+                    (p, n)
+                }
+            } else {
+                let p = snap_c[i.min(len - 1)].clone();
+                let n = p.file_name().and_then(|x| x.to_str()).unwrap_or("—").to_string();
+                (p, n)
+            };
+            let name = effective_name;
+            let _ = effective_path;
             // If i >= len, we have triaged past end: show empty
             if i >= len {
                 stack_c.set_visible_child_name("empty");
@@ -478,19 +510,17 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 let is_busy = *busy_c.borrow();
                 btn_prev_c.set_sensitive(len > 0 && !is_busy);
                 btn_next_c.set_sensitive(false);
-                btn_undo_c.set_sensitive(!undo_c.borrow().is_empty() && !is_busy);
-                btn_redo_c.set_sensitive(!redo_c.borrow().is_empty() && !is_busy);
+                refresh_undo_redo();
                 hint_c.set_text("");
                 return;
             }
             stack_c.set_visible_child_name("file");
-            file_label_c.set_text(name);
+            file_label_c.set_text(&name);
             index_label_c.set_text(&format!("{} / {} — {}", i + 1, len, name));
             let is_busy = *busy_c.borrow();
             btn_prev_c.set_sensitive(i > 0 && !is_busy);
             btn_next_c.set_sensitive(i + 1 < len && !is_busy);
-            btn_undo_c.set_sensitive(!undo_c.borrow().is_empty() && !is_busy);
-            btn_redo_c.set_sensitive(!redo_c.borrow().is_empty() && !is_busy);
+            refresh_undo_redo();
             // disable action buttons while busy
             let mut child = actions_row_c.first_child();
             while let Some(c) = child {
@@ -531,6 +561,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let live_actions_c = live_actions.clone();
         let undo_stack_c = undo_stack.clone();
         let redo_stack_c = redo_stack.clone();
+        let override_c = current_override.clone();
         Rc::new(move |action: Action| {
             if guard_busy(&busy_c) {
                 return;
@@ -577,6 +608,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 let prehash_c = prehash_c.clone();
                 let undo_stack_c = undo_stack_c.clone();
                 let redo_stack_c = redo_stack_c.clone();
+                let override_c = override_c.clone();
                 let folder_name = folder_name.clone();
                 let display_name = display_name.clone();
                 let file_name = file_name.clone();
@@ -597,12 +629,15 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                         Ok(dest) => {
                             let is_dup_dest = dest.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("duplicate");
                             let was_duplicate = is_dup_dest || is_duplicate;
-                            // push onto undo stack, clear redo
+                            // push onto undo stack capped to min(50, queue len), clear redo and override
                             {
+                                let cap = snap_c.len();
                                 let entry = UndoEntry::new(&hash_lower, &file_name, dest.clone(), was_duplicate, &folder_name, &display_name);
-                                push_undo(&mut undo_stack_c.borrow_mut(), entry);
+                                push_undo_capped(&mut undo_stack_c.borrow_mut(), entry, cap);
                                 redo_stack_c.borrow_mut().clear();
                             }
+                            // clear any suffix override on normal move
+                            *override_c.borrow_mut() = None;
                             drop(union);
                             if is_dup_dest || is_duplicate {
                                 let origin = duplicate_origin_display.unwrap_or_else(|| display_name.clone());
@@ -610,10 +645,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                             } else {
                                 show_toast_c(format!("Moved {} → {}/{} ", file_name, display_name, dest.file_name().and_then(|n| n.to_str()).unwrap_or("")));
                             }
-                            let len2 = snap_c.len();
-                            let mut v = idx_c.borrow_mut();
-                            if *v + 1 < len2 { *v += 1; } else if *v + 1 == len2 { *v += 1; }
-                            drop(v);
+                            advance_idx(&idx_c, snap_c.len());
                             set_busy_state(&busy_c, &spinner_c, &actions_row_c, &btn_prev_c, &btn_next_c, false);
                             update_ui_c();
                             prehash_c();
@@ -692,6 +724,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let update_ui_c = update_ui.clone();
         let prehash_c = prehash_next.clone();
         let busy_c = busy.clone();
+        let override_c = current_override.clone();
         Rc::new(move || {
             if guard_busy(&busy_c) {
                 return;
@@ -712,11 +745,8 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                     // push to redo with adjusted src_name (actual restored file name)
                     let restored_name = restored_path.file_name().and_then(|n| n.to_str()).unwrap_or(&entry.src_name).to_string();
                     let redo_entry = UndoEntry::new(&entry.hash, &restored_name, entry.dest_path.clone(), entry.was_duplicate, &entry.folder_name, &entry.display_name);
-                    // Actually redo needs src_name = restored_name, dest_path is original dest (not used), hash same
-                    // Store redo entry with restored_name so redo can find the file
                     redo_c.borrow_mut().push(redo_entry);
                     // Make file Current File again (adjust queue index)
-                    // Find index of src_name in snapshot (original position)
                     let search_name = entry.src_name.clone();
                     let mut found_idx: Option<usize> = None;
                     for (i, p) in snap_c.iter().enumerate() {
@@ -729,15 +759,18 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                     }
                     if let Some(fi) = found_idx {
                         *idx_c.borrow_mut() = fi;
+                    } else if let Some(fi2) = snap_c.iter().position(|p| p.file_name().and_then(|x| x.to_str()) == Some(restored_name.as_str())) {
+                        *idx_c.borrow_mut() = fi2;
+                    }
+                    // If suffix was used (restored_name != entry.src_name), keep override so Preview shows suffixed file
+                    if restored_name != entry.src_name {
+                        *override_c.borrow_mut() = Some(restored_path.clone());
                     } else {
-                        // If suffix was used, try to find restored_name? snapshot won't have it, keep at current or 0
-                        // Fallback: stay where we are, but ensure toast shows suffix name
-                        if let Some(fi2) = snap_c.iter().position(|p| p.file_name().and_then(|x| x.to_str()) == Some(restored_name.as_str())) {
-                            *idx_c.borrow_mut() = fi2;
-                        }
+                        *override_c.borrow_mut() = None;
                     }
                     show_toast_c(format!("Undid {}: {} → Source", entry.display_name, restored_name));
                     update_ui_c();
+                    // prehash the restored file and next
                     prehash_c();
                 }
                 Err(e) => {
@@ -763,6 +796,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let update_ui_c = update_ui.clone();
         let prehash_c = prehash_next.clone();
         let busy_c = busy.clone();
+        let override_c = current_override.clone();
         Rc::new(move || {
             if guard_busy(&busy_c) {
                 return;
@@ -785,27 +819,21 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 return;
             }
             let mut union = union_c.borrow_mut();
-            match redo_move(&source_c, &current_file, &entry.folder_name, &entry.hash, &mut union) {
+            match move_to_action(&source_c, &current_file, &entry.folder_name, &entry.hash, &mut union) {
                 Ok(dest) => {
                     drop(union);
-                    // push back onto undo stack with original src_name? But need src_name for next undo to be the file name
-                    // The new undo entry should have src_name = current_file file_name, dest_path = dest
+                    // push back onto undo stack; was_duplicate is determined by actual redo destination, not carried from prior
                     let redo_was_duplicate = dest.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("duplicate");
-                    let new_undo = UndoEntry::new(&entry.hash, &entry.src_name, dest.clone(), redo_was_duplicate || entry.was_duplicate, &entry.folder_name, &entry.display_name);
-                    push_undo(&mut undo_c.borrow_mut(), new_undo);
+                    let new_undo = UndoEntry::new(&entry.hash, &entry.src_name, dest.clone(), redo_was_duplicate, &entry.folder_name, &entry.display_name);
+                    push_undo_capped(&mut undo_c.borrow_mut(), new_undo, snap_c.len());
+                    *override_c.borrow_mut() = None;
                     show_toast_c(format!("Redid {}: {} → {}", entry.display_name, entry.src_name, dest.file_name().and_then(|n| n.to_str()).unwrap_or("")));
-                    // Advance idx past this file? Redo reapplies move, so we go to next (like normal move)
-                    let len2 = snap_c.len();
+                    // Advance past this file only if it was current (like normal move), else fallback
                     let cur_name = entry.src_name.clone();
-                    if let Some(pos) = snap_c.iter().position(|p| p.file_name().and_then(|x| x.to_str()) == Some(cur_name.as_str())) {
-                        if pos == *idx_c.borrow() {
-                            let mut v = idx_c.borrow_mut();
-                            if *v + 1 < len2 { *v += 1; } else if *v + 1 == len2 { *v += 1; }
-                        }
-                    } else {
-                        // fallback advance
-                        let mut v = idx_c.borrow_mut();
-                        if *v + 1 < len2 { *v += 1; } else if *v + 1 == len2 { *v += 1; }
+                    if snap_c.iter().position(|p| p.file_name().and_then(|x| x.to_str()) == Some(cur_name.as_str())) == Some(*idx_c.borrow()) {
+                        advance_idx(&idx_c, snap_c.len());
+                    } else if snap_c.iter().position(|p| p.file_name().and_then(|x| x.to_str()) == Some(cur_name.as_str())).is_none() {
+                        advance_idx(&idx_c, snap_c.len());
                     }
                     update_ui_c();
                     prehash_c();
@@ -904,8 +932,10 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let upd = update_ui.clone();
         let prehash_c = prehash_next.clone();
         let busy_c = busy.clone();
+        let override_c = current_override.clone();
         btn_prev.connect_clicked(move |_| {
             if guard_busy(&busy_c) { return; }
+            *override_c.borrow_mut() = None;
             let mut v = idx_c.borrow_mut();
             if *v > 0 { *v -= 1; }
             drop(v);
@@ -919,8 +949,10 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let snap_c = snapshot_rc.clone();
         let prehash_c = prehash_next.clone();
         let busy_c = busy.clone();
+        let override_c = current_override.clone();
         btn_next.connect_clicked(move |_| {
             if guard_busy(&busy_c) { return; }
+            *override_c.borrow_mut() = None;
             let mut v = idx_c.borrow_mut();
             if *v + 1 < snap_c.len() { *v += 1; }
             drop(v);

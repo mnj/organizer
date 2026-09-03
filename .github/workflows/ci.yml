@@ -109,7 +109,7 @@ jobs:
       - name: Build glycin-loaders from source (no distro package)
         run: |
           git clone --depth 1 https://gitlab.gnome.org/GNOME/glycin.git /tmp/glycin
-          meson setup /tmp/glycin/builddir -Dglycin-loaders=true -Dprefix=/usr
+          meson setup /tmp/glycin/builddir /tmp/glycin -Dglycin-loaders=true -Dprefix=/usr
           meson compile -C /tmp/glycin/builddir
           meson install -C /tmp/glycin/builddir
 
@@ -150,7 +150,7 @@ jobs:
       - name: Build glycin-loaders from source (jammy has no package)
         run: |
           git clone --depth 1 https://gitlab.gnome.org/GNOME/glycin.git /tmp/glycin
-          meson setup /tmp/glycin/builddir -Dglycin-loaders=true -Dprefix=/usr
+          meson setup /tmp/glycin/builddir /tmp/glycin -Dglycin-loaders=true -Dprefix=/usr
           meson compile -C /tmp/glycin/builddir
           sudo meson install -C /tmp/glycin/builddir
 

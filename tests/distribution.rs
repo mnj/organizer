@@ -120,6 +120,9 @@ fn container_build_needs_only_a_container_runtime() {
             // source-build fallback.
             "apt install -y cargo-c",
             "libssl-dev",
+            // meson needs an explicit source dir (builddir alone would
+            // take the repo root as source and fail).
+            "builddir /tmp/glycin",
         ],
     );
 }

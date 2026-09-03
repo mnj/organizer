@@ -49,7 +49,7 @@ fi
       cargo install cargo-c --locked
     fi
     git clone --depth 1 https://gitlab.gnome.org/GNOME/glycin.git /tmp/glycin
-    meson setup /tmp/glycin/builddir -Dglycin-loaders=true -Dprefix=/usr
+    meson setup /tmp/glycin/builddir /tmp/glycin -Dglycin-loaders=true -Dprefix=/usr
     meson compile -C /tmp/glycin/builddir
     meson install -C /tmp/glycin/builddir
     curl -L -o /usr/local/bin/linuxdeploy https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage

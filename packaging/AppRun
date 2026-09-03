@@ -120,7 +120,7 @@ if [ "${1:-}" = "--self-test-sandbox" ]; then
   else
     cat "$LOADER_CONF_SRC"/*.conf 2>&1 | head -n 40
   fi
-  if [ -f "$HERE/usr/lib/gstreamer-1.0/libgstgtk4.so" ]; then
+  if [ -f "$HERE/usr/lib/gstreamer-1.0/libgstgtk4.so" ] || [ -f "$HERE/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstgtk4.so" ]; then
     echo "gtk4paintablesink: bundled libgstgtk4.so present"
   else
     echo "gtk4paintablesink: libgstgtk4.so missing"

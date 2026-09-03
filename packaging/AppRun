@@ -1,0 +1,45 @@
+#!/bin/sh
+# AppRun hook for the Organizer AppImage (spec #20: video Preview via
+# GStreamer + glycin stills from #19).
+#
+# The AppImage squashfs is mounted at a random FUSE mountpoint, so every
+# loader/plugin path must be derived from $HERE (the AppDir root) at launch.
+# This hook makes bundled decoders discoverable with no host GStreamer,
+# glycin-loaders, bubblewrap or libseccomp required:
+#
+# - GStreamer video (webm/mp4/mov/mkv/avi): GST_PLUGIN_SYSTEM_PATH points at
+#   the bundled $APPDIR/usr/lib/gstreamer-1.0, which must contain
+#   libgstgtk4.so (the gtk4paintablesink behind the Preview Picture) plus the
+#   base/good/libav plugin set. Bundled with:
+#     cargo cinstall gst-plugin-gtk4 \
+#       --features waylandegl,x11egl,dmabuf --library-type=cdylib \
+#       --prefix=/usr --destdir="$APPDIR"
+#     linuxdeploy --appdir "$APPDIR" --plugin gtk --plugin gstreamer \
+#       --output appimage
+#   Verify inside the built AppImage:
+#     ./Organizer-*.AppImage gst-inspect-1.0 gtk4paintablesink
+# - Glycin stills (shared with #19): GLYCIN_DATA_DIR pins loader discovery to
+#   the bundled $APPDIR/usr/share/glycin-loaders/2+/conf.d, and PATH/LD_LIBRARY_PATH
+#   expose the bundled bwrap + libseccomp.so.2.
+#
+# NOTE: an AppImage does NOT escape a kernel user-namespace lockdown; if bwrap
+# is blocked on the host, the app still refuses sandboxed preview per policy.
+
+HERE="$(dirname "$(readlink -f "$0")")"
+
+# Native libs bundled under $APPDIR/usr (libseccomp, libcap, codec deps).
+export LD_LIBRARY_PATH="$HERE/usr/lib:$HERE/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# Bundled bwrap wins over any host bubblewrap (glycin spawns `bwrap` via PATH).
+export PATH="$HERE/usr/bin:${PATH:-/usr/bin:/bin}"
+
+# Glycin loader configs (still-image sandbox path, shared with #19).
+export XDG_DATA_DIRS="$HERE/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+export GLYCIN_DATA_DIR="$HERE/usr/share"
+
+# GStreamer plugin discovery inside the AppDir (video path, incl. gtk4paintablesink).
+export GST_PLUGIN_SYSTEM_PATH="$HERE/usr/lib/gstreamer-1.0${GST_PLUGIN_SYSTEM_PATH:+:$GST_PLUGIN_SYSTEM_PATH}"
+export GST_PLUGIN_PATH="$HERE/usr/lib/gstreamer-1.0${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
+export GST_PLUGIN_SCANNER="$HERE/usr/libexec/gstreamer-1.0/gst-plugin-scanner"
+
+exec "$HERE/usr/bin/organizer" "$@"

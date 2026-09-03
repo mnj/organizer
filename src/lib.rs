@@ -5,3 +5,4 @@ pub mod preview;
 pub mod queue;
 pub mod settings;
 pub mod undo;
+pub mod video;

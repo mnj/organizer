@@ -1,5 +1,6 @@
 use clap::Parser;
 use gdk4::prelude::*;
+use gstreamer as gst;
 use gtk4::prelude::*;
 use gtk4::{
     gdk, gio, glib, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, Entry,
@@ -11,6 +12,7 @@ use organizer_lib::mover::{move_to_action, MoverError};
 use organizer_lib::preview::{ensure_sandbox_bwrap, is_glycin_supported, load_texture};
 use organizer_lib::queue::build_snapshot;
 use organizer_lib::undo::{push_undo_capped, undo_move, UndoEntry};
+use organizer_lib::video;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -536,6 +538,130 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         });
     }
 
+    // Video Preview state (spec #20): the currently playing playbin plus its
+    // bus watch guard. Dropping the tuple stops playback and removes the
+    // watch, so file switches never leave a pipeline behind.
+    let video_state: Rc<RefCell<Option<(gst::Element, gst::bus::BusWatchGuard)>>> =
+        Rc::new(RefCell::new(None));
+
+    let stop_video: Rc<dyn Fn()> = {
+        let video_state_c = video_state.clone();
+        Rc::new(move || {
+            if let Some((pipeline, _guard)) = video_state_c.borrow_mut().take() {
+                video::stop(&pipeline);
+            }
+        })
+    };
+
+    // Start video playback for the Current File in the same Preview Picture
+    // used for glycin stills. Muted + video-only + auto-play loop (EOS seeks
+    // to zero); bus Error shows the shared decode-failure placeholder + toast
+    // and the Main stays alive.
+    let play_video: Rc<dyn Fn(PathBuf, String)> = {
+        let picture_c = picture.clone();
+        let stack_c = stack.clone();
+        let spinner_c = spinner.clone();
+        let preview_center_c = preview_center.clone();
+        let error_name_c = error_name.clone();
+        let error_detail_c = error_detail.clone();
+        let show_toast_c = show_toast.clone();
+        let video_state_c = video_state.clone();
+        let stop_video_c = stop_video.clone();
+        Rc::new(move |path: PathBuf, name: String| {
+            stop_video_c();
+            // Unified failure path: same placeholder + toast as glycin decode failure.
+            let fail = |msg: String| {
+                tracing::warn!("video preview failed for {name}: {msg}");
+                error_name_c.set_text(&name);
+                error_detail_c.set_text(&msg);
+                stack_c.set_visible_child_name("error");
+                spinner_c.set_visible(false);
+                spinner_c.set_spinning(false);
+                show_toast_c(msg);
+            };
+            // Stop-then-fail: tear down the half-built pipeline before showing
+            // the placeholder so no late bus message can overwrite it.
+            let fail_stopped = |pipeline: &gst::Element, msg: String| {
+                video::stop(pipeline);
+                fail(msg);
+            };
+            if let Err(e) = video::ensure_init() {
+                fail(format!("Video unavailable for {name}: {e}"));
+                return;
+            }
+            let uri = match video::to_file_uri(&path) {
+                Ok(u) => u,
+                Err(e) => {
+                    fail(format!("Video failed for {name}: {e}"));
+                    return;
+                }
+            };
+            let (pipeline, sink) = match video::build_playbin(&uri) {
+                Ok(t) => t,
+                Err(e) => {
+                    fail(format!("Video failed for {name}: {e}"));
+                    return;
+                }
+            };
+            let paintable = match video::sink_paintable(&sink) {
+                Ok(p) => p,
+                Err(e) => {
+                    fail_stopped(&pipeline, format!("Video failed for {name}: {e}"));
+                    return;
+                }
+            };
+            // Same Picture as stills: swap its Paintable to the sink's.
+            // Contain + dark letterbox come from the existing Picture/CSS.
+            picture_c.set_paintable(Some(&paintable));
+            preview_center_c.set_visible(false);
+            stack_c.set_visible_child_name("file");
+            spinner_c.set_visible(false);
+            spinner_c.set_spinning(false);
+            // Watch the bus before PLAYING so early decode errors are caught.
+            let weak_err = pipeline.downgrade();
+            let weak_eos = pipeline.downgrade();
+            let state_c = video_state_c.clone();
+            let stack_e = stack_c.clone();
+            let error_name_e = error_name_c.clone();
+            let error_detail_e = error_detail_c.clone();
+            let show_toast_e = show_toast_c.clone();
+            let name_e = name.clone();
+            let name_e2 = name.clone();
+            let watch = video::watch_bus(
+                &pipeline,
+                move |msg| {
+                    if let Some(p) = weak_err.upgrade() {
+                        video::stop(&p);
+                    }
+                    *state_c.borrow_mut() = None;
+                    tracing::warn!("video bus error for {name_e}: {msg}");
+                    error_name_e.set_text(&name_e);
+                    error_detail_e.set_text(&msg);
+                    stack_e.set_visible_child_name("error");
+                    show_toast_e(format!("Video failed for {name_e}: {msg}"));
+                },
+                move || {
+                    if let Some(p) = weak_eos.upgrade() {
+                        video::restart(&p);
+                    }
+                },
+            );
+            let guard = match watch {
+                Ok(g) => g,
+                Err(e) => {
+                    fail_stopped(&pipeline, format!("Video failed for {name}: {e}"));
+                    return;
+                }
+            };
+            if let Err(e) = video::play(&pipeline) {
+                drop(guard);
+                fail_stopped(&pipeline, format!("Video failed for {name_e2}: {e}"));
+                return;
+            }
+            *video_state_c.borrow_mut() = Some((pipeline, guard));
+        })
+    };
+
     let update_ui = {
         let idx_c = idx.clone();
         let snap_c = snapshot_rc.clone();
@@ -565,6 +691,8 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let preview_cache_c = preview_cache.clone();
         let preview_cancellable_c = preview_cancellable.clone();
         let show_toast_c = show_toast.clone();
+        let stop_video_c = stop_video.clone();
+        let play_video_c = play_video.clone();
         let refresh_undo_redo = {
             let btn_undo_c = btn_undo_c.clone();
             let btn_redo_c = btn_redo_c.clone();
@@ -613,6 +741,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
             let effective_path_clone = effective_path.clone();
             // If i >= len, we have triaged past end: show empty
             if i >= len {
+                stop_video_c();
                 stack_c.set_visible_child_name("empty");
                 empty_label_c.set_text(&format!(
                     "All triaged — {} files sorted\n{}",
@@ -650,8 +779,11 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
             } else {
                 hint_c.set_text("Press 1-9 or Ctrl+1-9 to triage");
             }
-            // Preview handling: sandboxed glycin for stills/animated (video treated as unsupported until GStreamer ticket)
+            // Preview handling: sandboxed glycin for stills/animated (spec #19),
+            // GStreamer playbin + gtk4paintablesink into the same Picture for
+            // video (spec #20).
             if is_glycin_supported(&effective_path_clone) {
+                stop_video_c();
                 // cancel previous preview load if in flight - prevents stale-frame race on rapid Next/Prev
                 if let Some(prev) = preview_cancellable_c.borrow().as_ref() {
                     prev.cancel();
@@ -727,7 +859,11 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                         }
                     });
                 }
+            } else if video::is_video_supported(&effective_path_clone) {
+                // Video via GStreamer into the same Picture (muted, looped).
+                play_video_c(effective_path_clone.clone(), name.clone());
             } else {
+                stop_video_c();
                 ph_name_c.set_text(&name);
                 stack_c.set_visible_child_name("unsupported");
                 picture_c.set_paintable(None::<&gdk::Paintable>);
@@ -763,6 +899,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let undo_stack_c = undo_stack.clone();
         let redo_stack_c = redo_stack.clone();
         let override_c = current_override.clone();
+        let stop_video_c = stop_video.clone();
         Rc::new(move |action: Action| {
             if guard_busy(&busy_c) {
                 return;
@@ -785,6 +922,10 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 }
                 return;
             }
+            // Stop playback before hashing/moving: the file is renamed away
+            // while PLAYING would otherwise post a late bus Error that
+            // overwrites the success toast/placeholder.
+            stop_video_c();
             set_busy_state(&busy_c, &spinner_c, &actions_row_c, &btn_prev_c, &btn_next_c, true);
             update_ui_c();
 

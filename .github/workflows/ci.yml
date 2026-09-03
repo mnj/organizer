@@ -140,15 +140,22 @@ jobs:
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
             liblcms2-dev libfontconfig1-dev libseccomp-dev bubblewrap \
-            fuse libfuse2 pkg-config meson ninja-build \
-            cargo-c desktop-file-utils appstream librsvg2-dev xvfb
+            fuse libfuse2 pkg-config meson ninja-build python3-pip \
+            desktop-file-utils appstream librsvg2-dev xvfb
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
+      # No cargo-c package on jammy — build it (cached by rust-cache).
+      - name: Install cargo-c
+        run: cargo install cargo-c --locked
+
       - name: Build glycin-loaders from source (jammy has no package)
+        # Jammy ships meson 0.61 but glycin requires >=1.2 — upgrade via pip.
         run: |
+          pip3 install -U meson
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           git clone --depth 1 https://gitlab.gnome.org/GNOME/glycin.git /tmp/glycin
           meson setup /tmp/glycin/builddir /tmp/glycin -Dglycin-loaders=true -Dprefix=/usr
           meson compile -C /tmp/glycin/builddir

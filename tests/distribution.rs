@@ -116,10 +116,11 @@ fn container_build_needs_only_a_container_runtime() {
             "APPIMAGE_EXTRACT_AND_RUN=1",
             "build-appimage.sh",
             "Organizer-x86_64.AppImage",
-            // cargo-c comes from apt (no compile); libssl-dev covers the
-            // source-build fallback.
-            "apt install -y cargo-c",
-            "libssl-dev",
+            // cargo-c is not packaged on jammy: try apt, then build; pip
+            // meson because jammy ships 0.61 but glycin needs >=1.2.
+            "cargo cinstall --version",
+            "apt install -y cargo-c || cargo install cargo-c --locked",
+            "pip3 install -U meson",
             // meson needs an explicit source dir (builddir alone would
             // take the repo root as source and fail).
             "builddir /tmp/glycin",

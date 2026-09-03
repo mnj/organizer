@@ -39,14 +39,16 @@ fi
       gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
       liblcms2-dev libfontconfig1-dev libseccomp-dev bubblewrap \
       libssl-dev pkg-config build-essential curl ca-certificates git \
-      meson ninja-build desktop-file-utils appstream librsvg2-dev
+      meson ninja-build python3-pip desktop-file-utils appstream librsvg2-dev
+    # Jammy ships meson 0.61 but glycin requires >=1.2 — upgrade via pip.
+    pip3 install -U meson
+    export PATH="$HOME/.local/bin:$PATH"
     curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --profile minimal
     export PATH="$HOME/.cargo/bin:$PATH"
-    # Prefer the distro cargo-c package (no compile); fall back to building
-    # it (needs libssl-dev above) if the package is unavailable.
-    if ! apt install -y cargo-c; then
-      cargo install cargo-c --locked
+    # cargo-c is not packaged on jammy: try apt (newer distros), then build.
+    if ! cargo cinstall --version >/dev/null 2>&1; then
+      apt install -y cargo-c || cargo install cargo-c --locked
     fi
     git clone --depth 1 https://gitlab.gnome.org/GNOME/glycin.git /tmp/glycin
     meson setup /tmp/glycin/builddir /tmp/glycin -Dglycin-loaders=true -Dprefix=/usr

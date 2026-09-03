@@ -116,10 +116,10 @@ if ls "$APPDIR"/usr/lib*/libgtk-4.so* >/dev/null 2>&1; then
 else
   fail "missing bundled libgtk-4 (usr/lib/gtk-4.0 payload)"
 fi
-[ -d "$APPDIR/usr/lib/gstreamer-1.0" ] \
+[ -d "$APPDIR/usr/lib/gstreamer-1.0" ] || [ -d "$APPDIR/usr/lib/x86_64-linux-gnu/gstreamer-1.0" ] \
   && pass "bundled gstreamer-1.0 plugins present" \
-  || fail "missing $APPDIR/usr/lib/gstreamer-1.0"
-if [ -f "$APPDIR/usr/lib/gstreamer-1.0/libgstgtk4.so" ]; then
+  || fail "missing bundled gstreamer-1.0 plugins"
+if [ -f "$APPDIR/usr/lib/gstreamer-1.0/libgstgtk4.so" ] || [ -f "$APPDIR/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstgtk4.so" ]; then
   pass "bundled libgstgtk4.so (gtk4paintablesink) present"
 else
   fail "missing libgstgtk4.so (gtk4paintablesink)"

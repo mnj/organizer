@@ -37,6 +37,7 @@ fi
     apt install -y libgtk-4-dev libadwaita-1-dev \
       libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
       gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
+      gstreamer1.0-tools \
       liblcms2-dev libfontconfig1-dev libseccomp-dev bubblewrap \
       libssl-dev pkg-config build-essential curl ca-certificates git \
       cmake gettext gperf meson ninja-build python3-pip sassc \

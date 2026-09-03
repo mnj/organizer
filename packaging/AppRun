@@ -63,7 +63,15 @@ export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
 # registry rebuilds also stay inside the AppDir.
 export GST_PLUGIN_SYSTEM_PATH="$HERE/usr/lib/gstreamer-1.0:$HERE/usr/lib/x86_64-linux-gnu/gstreamer-1.0${GST_PLUGIN_SYSTEM_PATH:+:$GST_PLUGIN_SYSTEM_PATH}"
 export GST_PLUGIN_PATH="$HERE/usr/lib/gstreamer-1.0${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
-export GST_PLUGIN_SCANNER="$HERE/usr/libexec/gstreamer-1.0/gst-plugin-scanner"
+# Scanner location varies by distro layout (usr/libexec vs
+# usr/lib/gstreamer1.0) — pick whichever the AppDir actually contains.
+if [ -x "$HERE/usr/libexec/gstreamer-1.0/gst-plugin-scanner" ]; then
+  export GST_PLUGIN_SCANNER="$HERE/usr/libexec/gstreamer-1.0/gst-plugin-scanner"
+elif [ -x "$HERE/usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner" ]; then
+  export GST_PLUGIN_SCANNER="$HERE/usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner"
+else
+  export GST_PLUGIN_SCANNER="$HERE/usr/libexec/gstreamer-1.0/gst-plugin-scanner"
+fi
 
 # Glycin Exec relocation fix: bundled conf.d files carry absolute
 # Exec=/usr/libexec/glycin-loaders/2+/<loader>, but bwrap does

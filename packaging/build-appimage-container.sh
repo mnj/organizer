@@ -47,7 +47,7 @@ fi
       libgraphene-1.0-dev libdrm-dev libgbm-dev libegl-dev libgles-dev \
       libvulkan-dev libx11-dev libxrandr-dev libxi-dev libxinerama-dev \
       libxcursor-dev libxdamage-dev libxfixes-dev libxcomposite-dev libxext-dev \
-      libappstream-dev desktop-file-utils appstream librsvg2-dev
+      libappstream-dev desktop-file-utils appstream librsvg2-dev patchelf
     # Jammy ships meson 0.61 but glycin requires >=1.2 — upgrade via pip.
     pip3 install -U meson tomli
     export PATH="$HOME/.local/bin:$PATH"

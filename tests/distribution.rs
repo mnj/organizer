@@ -103,6 +103,24 @@ fn build_appimage_script_fails_fast_on_missing_bundle_inputs() {
 }
 
 #[test]
+fn container_build_needs_only_a_container_runtime() {
+    // Hosts without cargo-c/linuxdeploy (or not on ubuntu:22.04) build the
+    // AppImage in a container instead of installing the toolchain.
+    let script = read_repo("packaging/build-appimage-container.sh");
+    assert_contains_all(
+        &script,
+        "build-appimage-container.sh",
+        &[
+            "podman",
+            "ubuntu:22.04",
+            "APPIMAGE_EXTRACT_AND_RUN=1",
+            "build-appimage.sh",
+            "Organizer-x86_64.AppImage",
+        ],
+    );
+}
+
+#[test]
 fn desktop_file_is_valid_entry() {
     let desktop = read_repo("packaging/organizer.desktop");
     assert_contains_all(

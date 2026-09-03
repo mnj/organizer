@@ -75,6 +75,14 @@ uncompressed).
 ./Organizer-x86_64.AppImage /tmp/src     # runs with no host gtk/gstreamer/glycin
 ```
 
+Only a container runtime is needed on the host — this is the easiest path
+when the toolchain (`cargo-c`, `linuxdeploy`, ...) is missing or you are not
+on ubuntu:22.04 (e.g. Fedora):
+
+```sh
+./packaging/build-appimage-container.sh  # podman/docker, ubuntu:22.04 inside
+```
+
 Bundled inside the AppDir: `gtk4`/`libadwaita`, GStreamer plugins +
 `libgstgtk4.so` (`gtk4paintablesink`), `glycin-loaders` 2+ binaries + conf.d,
 `bwrap` + `libseccomp.so.2`, schemas/icon caches. Host-assumed (not bundled):

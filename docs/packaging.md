@@ -73,7 +73,8 @@ Size: stripped raw binary ~10–14 MB; startup ~80 ms.
 
 Built on **`ubuntu:22.04`** (glibc 2.35) via `linuxdeploy --plugin gtk
 --plugin gstreamer` + `cargo cinstall gst-plugin-gtk4 --features
-waylandegl,x11egl,dmabuf --library-type=cdylib --prefix=/usr` +
+waylandegl,x11egl --library-type=cdylib --prefix=/usr` (upstream also lists
+`dmabuf`, dropped: it needs system gstreamer>=1.24, jammy ships 1.20) +
 `appimagetool -u gh-releases-zsync` (~55–95 MB compressed, ~120–200 MB
 uncompressed).
 

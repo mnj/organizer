@@ -50,8 +50,10 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" \
 cp target/release/organizer "$APPDIR/usr/bin/organizer"
 
 # 3) gtk4paintablesink plugin (video Preview) as a GStreamer cdylib.
-#    waylandegl,x11egl keep GL zero-copy on both compositors; dmabuf enables
-#    DMABuf import on GTK 4.14+.
+#    waylandegl,x11egl keep GL zero-copy on both compositors.
+#    NOTE: the dmabuf feature is intentionally dropped — it pulls
+#    gst-video/v1_24 (system gstreamer>=1.24) but jammy ships 1.20.
+#    waylandegl/x11egl carry no version-gated gstreamer requirement.
 # NOTE: `cargo cinstall <name>` does not fetch from crates.io — it builds
 #    the current package (cwd). Download the matching 0.15.x release (pairs
 #    with gstreamer 0.25 in Cargo.toml) and install via --manifest-path.
@@ -68,7 +70,7 @@ curl -fSL --retry 5 --retry-all-errors -A "organizer-appimage-build/1.0" \
 tar xzf /tmp/gst-plugin-gtk4/plugin.tar.gz -C /tmp/gst-plugin-gtk4
 cargo cinstall \
   --manifest-path "/tmp/gst-plugin-gtk4/gst-plugin-gtk4-$GST_GTK4_VER/Cargo.toml" \
-  --features waylandegl,x11egl,dmabuf \
+  --features waylandegl,x11egl \
   --library-type=cdylib \
   --prefix=/usr \
   --destdir="$PWD/$APPDIR"

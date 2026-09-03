@@ -232,7 +232,8 @@ jobs:
           curl -L -o linuxdeploy https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           curl -L -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x linuxdeploy appimagetool
-          ./linuxdeploy --version || true
+          sudo mv linuxdeploy appimagetool /usr/local/bin/
+          linuxdeploy --version || true
 
       - name: Build AppImage
         run: |

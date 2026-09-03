@@ -39,6 +39,35 @@ APPDIR="${1:-Organizer.AppDir}"
 OUTPUT="${2:-Organizer-x86_64.AppImage}"
 REPO_ROOT="$(dirname "$(readlink -f "$0")")/.."
 
+# Toolchain guards: linuxdeploy/appimagetool must be on PATH
+# (container script and CI install them; see docs/packaging.md).
+for tool in linuxdeploy appimagetool; do
+  command -v "$tool" >/dev/null 2>&1 \
+    || { echo "ERROR: $tool not found on PATH." >&2; exit 1; }
+done
+
+# linuxdeploy --plugin <name> resolves to a linuxdeploy-plugin-<name>.sh
+# script next to the binary (or on PATH) — not bundled with linuxdeploy
+# itself. Fetch the gtk/gstreamer plugins if absent.
+fetch_plugin() {
+  name="$1"
+  url="$2"
+  if command -v "linuxdeploy-plugin-$name.sh" >/dev/null 2>&1; then
+    return 0
+  fi
+  dest_dir="$(dirname "$(command -v linuxdeploy)")"
+  if [ -w "$dest_dir" ]; then
+    curl -fSL --retry 3 -A "organizer-appimage-build/1.0" \
+      -o "$dest_dir/linuxdeploy-plugin-$name.sh" "$url"
+    chmod +x "$dest_dir/linuxdeploy-plugin-$name.sh"
+  else
+    echo "ERROR: linuxdeploy-plugin-$name.sh not found and $dest_dir not writable." >&2
+    exit 1
+  fi
+}
+fetch_plugin gtk "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh"
+fetch_plugin gstreamer "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gstreamer/master/linuxdeploy-plugin-gstreamer.sh"
+
 # 1) Raw release binary — the same artifact shipped as tarball.
 cargo build --release --locked
 strip target/release/organizer || true

@@ -70,6 +70,7 @@ fn build_appimage_script_covers_toolchain_and_zsync() {
             "cargo build --release --locked",
             "cinstall",
             "manifest-path",
+            "linuxdeploy-plugin",
             "gst-plugin-gtk4",
             "linuxdeploy",
             "appimagetool",

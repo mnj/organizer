@@ -39,6 +39,10 @@ APPDIR="${1:-Organizer.AppDir}"
 OUTPUT="${2:-Organizer-x86_64.AppImage}"
 REPO_ROOT="$(dirname "$(readlink -f "$0")")/.."
 
+# Cargo target dir (the container script points this at container-local
+# storage so bind-mounted host target/ never gets foreign-owned files).
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+
 # Toolchain guards: linuxdeploy/appimagetool must be on PATH
 # (container script and CI install them; see docs/packaging.md).
 for tool in linuxdeploy appimagetool; do
@@ -70,27 +74,29 @@ fetch_plugin gstreamer "https://raw.githubusercontent.com/linuxdeploy/linuxdeplo
 
 # 1) Raw release binary — the same artifact shipped as tarball.
 cargo build --release --locked
-strip target/release/organizer || true
+strip "$TARGET_DIR/release/organizer" || true
 
 # 2) Stage AppDir skeleton.
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" \
   "$APPDIR/usr/share/icons/hicolor/256x256/apps"
 
-cp target/release/organizer "$APPDIR/usr/bin/organizer"
+cp "$TARGET_DIR/release/organizer" "$APPDIR/usr/bin/organizer"
 
 # 3) gtk4paintablesink plugin (video Preview) as a GStreamer cdylib.
-#    waylandegl,x11egl keep GL zero-copy on both compositors.
-#    NOTE: the dmabuf feature is intentionally dropped — it pulls
-#    gst-video/v1_24 (system gstreamer>=1.24) but jammy ships 1.20.
-#    waylandegl/x11egl carry no version-gated gstreamer requirement.
-# NOTE: `cargo cinstall <name>` does not fetch from crates.io — it builds
-#    the current package (cwd). Download the matching 0.15.x release (pairs
-#    with gstreamer 0.25 in Cargo.toml) and install via --manifest-path.
+#    wayland/x11egl keep GL paths available on both compositors.
+#    NOTE: `cargo cinstall <name>` does not fetch from crates.io — it builds
+#    the current package (cwd). Download a release and install via
+#    --manifest-path. Version 0.12.x is deliberate: 0.13+ needs system
+#    gstreamer>=1.22/1.24 at runtime (0.15 uses 1.24-only
+#    gst_video_info_dma_drm_to_video_info unconditionally), but jammy ships
+#    1.20. The plugin is a registry-loaded cdylib, so its older gstreamer-rs
+#    (0.22) is ABI-compatible at runtime; element name (gtk4paintablesink)
+#    and the paintable property are unchanged.
 #    (crates.io API needs a User-Agent, else 403 with an empty body.)
 GST_GTK4_VER="$(curl -fsSL -A "organizer-appimage-build/1.0" \
   https://crates.io/api/v1/crates/gst-plugin-gtk4 \
-  | python3 -c 'import json,sys; print(sorted((v["num"] for v in json.load(sys.stdin)["versions"] if v["num"].startswith("0.15.") and not v["yanked"]))[-1])')"
-[ -n "$GST_GTK4_VER" ] || { echo "ERROR: could not resolve gst-plugin-gtk4 0.15.x from crates.io." >&2; exit 1; }
+  | python3 -c 'import json,sys; print(sorted((v["num"] for v in json.load(sys.stdin)["versions"] if v["num"].startswith("0.12.") and not v["yanked"]))[-1])')"
+[ -n "$GST_GTK4_VER" ] || { echo "ERROR: could not resolve gst-plugin-gtk4 0.12.x from crates.io." >&2; exit 1; }
 echo "gst-plugin-gtk4 version: $GST_GTK4_VER"
 rm -rf /tmp/gst-plugin-gtk4 && mkdir -p /tmp/gst-plugin-gtk4
 curl -fSL --retry 5 --retry-all-errors -A "organizer-appimage-build/1.0" \
@@ -99,7 +105,7 @@ curl -fSL --retry 5 --retry-all-errors -A "organizer-appimage-build/1.0" \
 tar xzf /tmp/gst-plugin-gtk4/plugin.tar.gz -C /tmp/gst-plugin-gtk4
 cargo cinstall \
   --manifest-path "/tmp/gst-plugin-gtk4/gst-plugin-gtk4-$GST_GTK4_VER/Cargo.toml" \
-  --features waylandegl,x11egl \
+  --features wayland,x11egl \
   --library-type=cdylib \
   --prefix=/usr \
   --destdir="$PWD/$APPDIR"
@@ -175,7 +181,15 @@ ARCH=x86_64 appimagetool "$APPDIR" \
 
 ls -lh "$OUTPUT" "$OUTPUT.zsync" 2>&1 | head -n 10
 
-# 10) Verify the bundled sink is discoverable from the AppDir path alone.
-GST_PLUGIN_SYSTEM_PATH="$APPDIR/usr/lib/gstreamer-1.0" \
-GST_PLUGIN_SCANNER="$APPDIR/usr/libexec/gstreamer-1.0/gst-plugin-scanner" \
-  gst-inspect-1.0 gtk4paintablesink 2>&1 | head -n 20
+# 10) Verify the bundled sink is discoverable from the AppDir paths alone
+# (same multiarch + scanner resolution as packaging/AppRun; host GL/X11
+# libs are assumed present per linuxdeploy excludelist, so this runs on
+# the build host, not in a bare container).
+GST_PLUGIN_SYSTEM_PATH="$APPDIR/usr/lib/gstreamer-1.0:$APPDIR/usr/lib/x86_64-linux-gnu/gstreamer-1.0"
+if [ -x "$APPDIR/usr/libexec/gstreamer-1.0/gst-plugin-scanner" ]; then
+  GST_PLUGIN_SCANNER="$APPDIR/usr/libexec/gstreamer-1.0/gst-plugin-scanner"
+elif [ -x "$APPDIR/usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner" ]; then
+  GST_PLUGIN_SCANNER="$APPDIR/usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner"
+fi
+export GST_PLUGIN_SYSTEM_PATH GST_PLUGIN_SCANNER
+gst-inspect-1.0 gtk4paintablesink 2>&1 | head -n 20

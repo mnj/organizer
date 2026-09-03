@@ -72,11 +72,12 @@ Size: stripped raw binary ~10–14 MB; startup ~80 ms.
 ## AppImage
 
 Built on **`ubuntu:22.04`** (glibc 2.35) via `linuxdeploy --plugin gtk
---plugin gstreamer` + `cargo cinstall gst-plugin-gtk4 --features
-waylandegl,x11egl --library-type=cdylib --prefix=/usr` (upstream also lists
-`dmabuf`, dropped: it needs system gstreamer>=1.24, jammy ships 1.20) +
-`appimagetool -u gh-releases-zsync` (~55–95 MB compressed, ~120–200 MB
-uncompressed).
+--plugin gstreamer` + `cargo cinstall gst-plugin-gtk4 0.12.x --features
+wayland,x11egl --library-type=cdylib --prefix=/usr` (0.12.x is deliberate:
+0.13+ needs system gstreamer>=1.22 at runtime, jammy ships 1.20; element
+name and paintable property are unchanged) +
+`appimagetool -u gh-releases-zsync` (measured 106 MB compressed with the
+source-built GNOME stack; `packaging/smoke.sh` warns outside 55–95 MB).
 
 ```sh
 ./packaging/build-appimage.sh            # -> Organizer-x86_64.AppImage + .zsync

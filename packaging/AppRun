@@ -11,11 +11,11 @@
 #   the bundled $APPDIR/usr/lib/gstreamer-1.0, which must contain
 #   libgstgtk4.so (the gtk4paintablesink behind the Preview Picture) plus the
 #   base/good/libav plugin set. Bundled with:
-#     cargo cinstall gst-plugin-gtk4 \
-#       --features waylandegl,x11egl --library-type=cdylib \
+#     cargo cinstall gst-plugin-gtk4 0.12.x \
+#       --features wayland,x11egl --library-type=cdylib \
 #       --prefix=/usr --destdir="$APPDIR"
-#     (upstream also lists dmabuf, dropped here: needs gstreamer>=1.24,
-#     jammy ships 1.20 — see packaging/build-appimage.sh)
+#     (0.12.x: newer lines need system gstreamer>=1.22, jammy ships 1.20 —
+#     see packaging/build-appimage.sh)
 #     linuxdeploy --appdir "$APPDIR" --plugin gtk --plugin gstreamer \
 #       --output appimage
 #   Verify inside the built AppImage:

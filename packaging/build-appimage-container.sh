@@ -31,6 +31,7 @@ fi
   -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
   -e APPIMAGE_EXTRACT_AND_RUN=1 \
   -e DEBIAN_FRONTEND=noninteractive \
+  -e CARGO_TARGET_DIR=/tmp/cargo-target \
   ubuntu:22.04 bash -ec '
     set -eu
     apt update
@@ -126,7 +127,9 @@ fi
     curl -L -o /usr/local/bin/appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
     chmod +x /usr/local/bin/linuxdeploy /usr/local/bin/appimagetool
     ./packaging/build-appimage.sh "$APPDIR" "$OUTPUT"
-    chown -R "$HOST_UID:$HOST_GID" target "$OUTPUT" "$OUTPUT.zsync" || true
+    # Only repo-root outputs need ownership repair (cargo target lives in
+    # container-local /tmp, so host target/ stays pristine).
+    chown "$HOST_UID:$HOST_GID" "$OUTPUT" "$OUTPUT.zsync" || true
   '
 
 ls -lh "$REPO_ROOT/$OUTPUT" "$REPO_ROOT/$OUTPUT.zsync"

@@ -418,9 +418,7 @@ mod tests {
         .expect("packaging/bundle-video.sh must exist (spec #20 bundling recipe)");
         for marker in [
             "gst-plugin-gtk4",
-            "waylandegl",
             "x11egl",
-            "dmabuf",
             "cdylib",
             "linuxdeploy",
             "gst-inspect-1.0",

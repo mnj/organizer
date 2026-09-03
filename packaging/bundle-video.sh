@@ -2,12 +2,11 @@
 # Bundle the GStreamer video path into the Organizer AppDir (spec #20).
 #
 # What this wires (see packaging/AppRun for the runtime side):
-#   cargo cinstall gst-plugin-gtk4 --features waylandegl,x11egl
+#   cargo cinstall gst-plugin-gtk4 --features wayland,x11egl
 #     --library-type=cdylib  →  $APPDIR/usr/lib/gstreamer-1.0/libgstgtk4.so
 #     (the gtk4paintablesink behind the Preview Picture)
-#   NOTE: upstream documents waylandegl,x11egl,dmabuf, but the dmabuf feature
-#     needs system gstreamer>=1.24 (jammy ships 1.20), so the jammy AppImage
-#     build in packaging/build-appimage.sh drops dmabuf (GL path remains).
+#   NOTE: version 0.12.x is deliberate (0.13+ needs system gstreamer>=1.22
+#   at runtime; jammy ships 1.20) — see packaging/build-appimage.sh.
 #   linuxdeploy --plugin gtk --plugin gstreamer  →  base/good/libav plugin set
 #     (h264/h265/vp8/vp9/av1) + gst-plugin-scanner under $APPDIR,
 #     discovered at launch via GST_PLUGIN_SYSTEM_PATH (no host GStreamer).
@@ -26,10 +25,10 @@ APPDIR="${1:-Organizer.AppDir}"
 mkdir -p "$APPDIR"
 
 # 1) Build + install the GTK4 paintable sink as a GStreamer cdylib plugin.
-#    waylandegl,x11egl keep GL paths available on both compositors
-#    (dmabuf dropped on jammy: needs gstreamer>=1.24, see build-appimage.sh).
+#    wayland,x11egl keep GL paths available on both compositors
+#    (0.12.x line for jammy gstreamer 1.20 — see build-appimage.sh).
 cargo cinstall gst-plugin-gtk4 \
-    --features waylandegl,x11egl \
+    --features wayland,x11egl \
     --library-type=cdylib \
     --prefix=/usr \
     --destdir="$APPDIR"

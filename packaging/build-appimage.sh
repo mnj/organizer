@@ -52,7 +52,17 @@ cp target/release/organizer "$APPDIR/usr/bin/organizer"
 # 3) gtk4paintablesink plugin (video Preview) as a GStreamer cdylib.
 #    waylandegl,x11egl keep GL zero-copy on both compositors; dmabuf enables
 #    DMABuf import on GTK 4.14+.
-cargo cinstall gst-plugin-gtk4 \
+#    NOTE: `cargo cinstall <name>` does not fetch from crates.io — it builds
+#    the current package (cwd). Download the matching 0.15.x release (pairs
+#    with gstreamer 0.25 in Cargo.toml) and install via --manifest-path.
+GST_GTK4_VER="$(curl -s https://crates.io/api/v1/crates/gst-plugin-gtk4 \
+  | python3 -c 'import json,sys; print(sorted((v["num"] for v in json.load(sys.stdin)["versions"] if v["num"].startswith("0.15.") and not v["yanked"]))[-1])')"
+rm -rf /tmp/gst-plugin-gtk4 && mkdir -p /tmp/gst-plugin-gtk4
+curl -L -o /tmp/gst-plugin-gtk4/plugin.tar.gz \
+  "https://crates.io/api/v1/crates/gst-plugin-gtk4/$GST_GTK4_VER/download"
+tar xzf /tmp/gst-plugin-gtk4/plugin.tar.gz -C /tmp/gst-plugin-gtk4
+cargo cinstall \
+  --manifest-path "/tmp/gst-plugin-gtk4/gst-plugin-gtk4-$GST_GTK4_VER/Cargo.toml" \
   --features waylandegl,x11egl,dmabuf \
   --library-type=cdylib \
   --prefix=/usr \

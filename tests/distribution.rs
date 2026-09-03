@@ -78,6 +78,10 @@ fn build_appimage_script_covers_toolchain_and_zsync() {
             "bwrap",
             "gst-inspect-1.0",
             "gtk4paintablesink",
+            // Review lock: fail fast on a missing toolchain with a
+            // copy-pasteable install hint instead of a bare cargo error.
+            "cargo cinstall --version",
+            "cargo install cargo-c --locked",
         ],
     );
 }

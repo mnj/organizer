@@ -22,6 +22,19 @@
 #   cargo-c (cargo cinstall), meson/ninja (glycin-loaders source build).
 set -eu
 
+# Fail fast on missing toolchain: cargo-c provides `cargo cinstall`, which
+# stages gst-plugin-gtk4 into the AppDir (step 3). Install with
+# `cargo install cargo-c --locked` (or `apt install cargo-c` on Debian/Ubuntu).
+if ! cargo cinstall --version >/dev/null 2>&1; then
+  echo "ERROR: 'cargo cinstall' not found — install cargo-c first:" >&2
+  echo "ERROR:   cargo install cargo-c --locked" >&2
+  exit 1
+fi
+command -v linuxdeploy >/dev/null 2>&1 \
+  || { echo "ERROR: linuxdeploy not found (see docs/packaging.md)." >&2; exit 1; }
+command -v appimagetool >/dev/null 2>&1 \
+  || { echo "ERROR: appimagetool not found (see docs/packaging.md)." >&2; exit 1; }
+
 APPDIR="${1:-Organizer.AppDir}"
 OUTPUT="${2:-Organizer-x86_64.AppImage}"
 REPO_ROOT="$(dirname "$(readlink -f "$0")")/.."

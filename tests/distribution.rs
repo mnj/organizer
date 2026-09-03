@@ -122,8 +122,11 @@ fn container_build_needs_only_a_container_runtime() {
             "apt install -y cargo-c || cargo install cargo-c --locked",
             "pip3 install -U meson",
             // meson needs an explicit source dir (builddir alone would
-            // take the repo root as source and fail).
+            // take the repo root as source and fail); loaders trimmed to
+            // what jammy can build (cairo>=1.17 from source for svg).
             "builddir /tmp/glycin",
+            "glycin-image-rs,glycin-svg",
+            "cairo-1.18",
         ],
     );
 }

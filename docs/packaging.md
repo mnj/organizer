@@ -16,8 +16,11 @@ sudo apt update && sudo apt install -y libgtk-4-dev libadwaita-1-dev \
   liblcms2-dev libfontconfig1-dev libseccomp-dev bubblewrap \
   pkg-config build-essential curl
 # plus glycin-loaders 2+: Ubuntu 24.04 universe (`glycin-loaders`), or build
-# from source on ubuntu:22.04 (see CI): meson setup /tmp/glycin/builddir /tmp/glycin
-# -Dglycin-loaders=true -Dprefix=/usr && meson compile -C /tmp/glycin/builddir
+# from source on ubuntu:22.04 — pip meson>=1.2, source cairo>=1.17, then
+# meson setup /tmp/glycin/builddir /tmp/glycin -Dglycin-loaders=true
+# -Dloaders=glycin-image-rs,glycin-svg -Dlibglycin=false -Dlibglycin-gtk4=false
+# -Dglycin-thumbnailer=false -Dintrospection=false -Dprefix=/usr -Dtests=false
+# (heif/jxl loaders need libheif/libjxl and stay out of the jammy AppImage).
 
 # Fedora 41
 sudo dnf install -y gtk4-devel libadwaita-devel \

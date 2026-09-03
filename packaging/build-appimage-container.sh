@@ -39,10 +39,18 @@ fi
       gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
       liblcms2-dev libfontconfig1-dev libseccomp-dev bubblewrap \
       libssl-dev pkg-config build-essential curl ca-certificates git \
-      meson ninja-build python3-pip desktop-file-utils appstream librsvg2-dev
+      cmake gettext meson ninja-build python3-pip \
+      desktop-file-utils appstream librsvg2-dev
     # Jammy ships meson 0.61 but glycin requires >=1.2 — upgrade via pip.
-    pip3 install -U meson
+    pip3 install -U meson tomli
     export PATH="$HOME/.local/bin:$PATH"
+    # Jammy ships cairo 1.16 but glycin-svg requires >=1.17 — build it.
+    # (Proven in podman; heif/jxl loaders stay out — needs libheif/libjxl.)
+    curl -sL -o /tmp/cairo.tar.xz https://cairographics.org/releases/cairo-1.18.4.tar.xz
+    tar xf /tmp/cairo.tar.xz -C /tmp
+    meson setup /tmp/cairo-1.18.4/builddir /tmp/cairo-1.18.4 -Dprefix=/usr -Dtests=disabled
+    meson compile -C /tmp/cairo-1.18.4/builddir
+    meson install -C /tmp/cairo-1.18.4/builddir
     curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --profile minimal
     export PATH="$HOME/.cargo/bin:$PATH"
@@ -51,7 +59,14 @@ fi
       apt install -y cargo-c || cargo install cargo-c --locked
     fi
     git clone --depth 1 https://gitlab.gnome.org/GNOME/glycin.git /tmp/glycin
-    meson setup /tmp/glycin/builddir /tmp/glycin -Dglycin-loaders=true -Dprefix=/usr
+    # Loaders trimmed to what jammy can build: image-rs covers
+    # png/jpg/webp/gif/bmp/tiff/ico (+qoi/dds/exr/pnm), svg via librsvg.
+    # libglycin/gtk4 bindings, thumbnailer and tests are not needed to
+    # decode (gtk4>=4.16 is newer than the 4.6 shipped by jammy).
+    meson setup /tmp/glycin/builddir /tmp/glycin -Dglycin-loaders=true \
+      -Dloaders=glycin-image-rs,glycin-svg \
+      -Dlibglycin=false -Dlibglycin-gtk4=false -Dglycin-thumbnailer=false \
+      -Dintrospection=false -Dprefix=/usr -Dtests=false
     meson compile -C /tmp/glycin/builddir
     meson install -C /tmp/glycin/builddir
     curl -L -o /usr/local/bin/linuxdeploy https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage

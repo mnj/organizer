@@ -140,7 +140,7 @@ jobs:
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
             liblcms2-dev libfontconfig1-dev libseccomp-dev bubblewrap \
-            fuse libfuse2 pkg-config meson ninja-build python3-pip \
+            fuse libfuse2 pkg-config meson ninja-build python3-pip cmake gettext \
             desktop-file-utils appstream librsvg2-dev xvfb
 
       - uses: dtolnay/rust-toolchain@stable
@@ -152,12 +152,22 @@ jobs:
         run: cargo install cargo-c --locked
 
       - name: Build glycin-loaders from source (jammy has no package)
-        # Jammy ships meson 0.61 but glycin requires >=1.2 — upgrade via pip.
+        # Jammy ships meson 0.61 (need >=1.2) and cairo 1.16 (svg needs
+        # >=1.17): pip meson + source cairo. Loaders trimmed to what jammy
+        # can build (image-rs + svg; heif/jxl need libheif/libjxl).
         run: |
-          pip3 install -U meson
+          pip3 install -U meson tomli
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          curl -sL -o /tmp/cairo.tar.xz https://cairographics.org/releases/cairo-1.18.4.tar.xz
+          tar xf /tmp/cairo.tar.xz -C /tmp
+          meson setup /tmp/cairo-1.18.4/builddir /tmp/cairo-1.18.4 -Dprefix=/usr -Dtests=disabled
+          sudo meson compile -C /tmp/cairo-1.18.4/builddir
+          sudo meson install -C /tmp/cairo-1.18.4/builddir
           git clone --depth 1 https://gitlab.gnome.org/GNOME/glycin.git /tmp/glycin
-          meson setup /tmp/glycin/builddir /tmp/glycin -Dglycin-loaders=true -Dprefix=/usr
+          meson setup /tmp/glycin/builddir /tmp/glycin -Dglycin-loaders=true \
+            -Dloaders=glycin-image-rs,glycin-svg \
+            -Dlibglycin=false -Dlibglycin-gtk4=false -Dglycin-thumbnailer=false \
+            -Dintrospection=false -Dprefix=/usr -Dtests=false
           meson compile -C /tmp/glycin/builddir
           sudo meson install -C /tmp/glycin/builddir
 

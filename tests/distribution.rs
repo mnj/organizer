@@ -116,6 +116,10 @@ fn container_build_needs_only_a_container_runtime() {
             "APPIMAGE_EXTRACT_AND_RUN=1",
             "build-appimage.sh",
             "Organizer-x86_64.AppImage",
+            // cargo-c comes from apt (no compile); libssl-dev covers the
+            // source-build fallback.
+            "apt install -y cargo-c",
+            "libssl-dev",
         ],
     );
 }

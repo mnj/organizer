@@ -38,12 +38,16 @@ fi
       libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
       gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
       liblcms2-dev libfontconfig1-dev libseccomp-dev bubblewrap \
-      pkg-config build-essential curl ca-certificates git \
+      libssl-dev pkg-config build-essential curl ca-certificates git \
       meson ninja-build desktop-file-utils appstream librsvg2-dev
     curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --profile minimal
     export PATH="$HOME/.cargo/bin:$PATH"
-    cargo install cargo-c --locked
+    # Prefer the distro cargo-c package (no compile); fall back to building
+    # it (needs libssl-dev above) if the package is unavailable.
+    if ! apt install -y cargo-c; then
+      cargo install cargo-c --locked
+    fi
     git clone --depth 1 https://gitlab.gnome.org/GNOME/glycin.git /tmp/glycin
     meson setup /tmp/glycin/builddir -Dglycin-loaders=true -Dprefix=/usr
     meson compile -C /tmp/glycin/builddir

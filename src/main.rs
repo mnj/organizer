@@ -20,10 +20,77 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 #[derive(Parser, Debug)]
-#[command(name = "organizer", about = "File-triaging desktop app")]
+#[command(name = "organizer", version, about = "File-triaging desktop app")]
 struct Args {
     #[arg(value_name = "SOURCE_FOLDER")]
     source_folder: Option<PathBuf>,
+
+    /// Headless bundling probe for CI smoke (no window): prints
+    /// GLYCIN_DATA_DIR/XDG_DATA_DIRS/GST_PLUGIN_SYSTEM_PATH, bwrap version,
+    /// sandbox status and gtk4paintablesink availability, then exits.
+    /// Used by packaging/smoke.sh and .github/workflows/ci.yml inside the
+    /// dep-stripped ubuntu:22.04 container.
+    #[arg(long = "self-test-sandbox", hide = true)]
+    self_test_sandbox: bool,
+}
+
+/// Headless probe behind `--self-test-sandbox` (spec #21 CI smoke).
+/// Runs before any GTK init so it works with no display.
+fn run_self_test_sandbox() -> i32 {
+    println!("organizer {}", env!("CARGO_PKG_VERSION"));
+    for key in [
+        "GLYCIN_DATA_DIR",
+        "XDG_DATA_DIRS",
+        "GST_PLUGIN_SYSTEM_PATH",
+        "GST_PLUGIN_SCANNER",
+        "PATH",
+    ] {
+        println!(
+            "{}={}",
+            key,
+            std::env::var(key).unwrap_or_else(|_| "(unset)".into())
+        );
+    }
+    match std::process::Command::new("bwrap").arg("--version").output() {
+        Ok(out) if out.status.success() => {
+            print!("bwrap {}", String::from_utf8_lossy(&out.stdout));
+        }
+        _ => println!("bwrap missing"),
+    }
+    match organizer_lib::preview::ensure_sandbox_bwrap() {
+        Ok(()) => println!("sandbox: Bwrap ok"),
+        Err(e) => println!("sandbox: unavailable ({e})"),
+    }
+    match organizer_lib::video::ensure_init() {
+        Ok(()) => {
+            if gstreamer::ElementFactory::find(organizer_lib::video::PAINTABLE_SINK).is_some() {
+                println!("gtk4paintablesink: available");
+            } else {
+                println!("gtk4paintablesink: missing (bundle libgstgtk4.so)");
+            }
+        }
+        Err(e) => println!("gstreamer: unavailable ({e})"),
+    }
+    // Loader conf visibility (what glycin would scan).
+    let data_dir =
+        std::env::var("GLYCIN_DATA_DIR").unwrap_or_else(|_| "/usr/share".into());
+    let mut found = false;
+    for base in [data_dir, std::env::var("XDG_DATA_DIRS").unwrap_or_default()] {
+        for part in base.split(':') {
+            let conf = std::path::Path::new(part)
+                .join("glycin-loaders")
+                .join("2+")
+                .join("conf.d");
+            if conf.is_dir() {
+                println!("glycin conf.d: {}", conf.display());
+                found = true;
+            }
+        }
+    }
+    if !found {
+        println!("glycin conf.d: not found");
+    }
+    0
 }
 
 fn css() -> CssProvider {
@@ -1541,6 +1608,9 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
 
 fn main() -> glib::ExitCode {
     let args = Args::parse();
+    if args.self_test_sandbox {
+        std::process::exit(run_self_test_sandbox());
+    }
     let app = Application::builder()
         .application_id("com.example.organizer")
         .build();

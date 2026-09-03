@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Organizer
+GenericName=Image triage
+Comment=File-triaging desktop app — triage one image at a time with shortcuts
+Exec=organizer
+Icon=organizer
+Type=Application
+Categories=Graphics;Photography;
+Terminal=false
+StartupNotify=true
+MimeType=image/png;image/jpeg;image/webp;image/gif;image/bmp;image/tiff;image/avif;image/heif;image/svg+xml;video/webm;video/mp4;video/x-matroska;video/quicktime;video/x-msvideo;
+X-AppImage-Name=Organizer

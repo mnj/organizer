@@ -1,6 +1,6 @@
 #!/bin/sh
-# AppRun hook for the Organizer AppImage (spec #20: video Preview via
-# GStreamer + glycin stills from #19).
+# AppRun hook for the Organizer AppImage (spec #21: AppImage + raw
+# distribution; video Preview from #20, glycin stills from #19).
 #
 # The AppImage squashfs is mounted at a random FUSE mountpoint, so every
 # loader/plugin path must be derived from $HERE (the AppDir root) at launch.
@@ -42,14 +42,79 @@ export PATH="$HERE/usr/bin:${PATH:-/usr/bin:/bin}"
 export XDG_DATA_DIRS="$HERE/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 export GLYCIN_DATA_DIR="$HERE/usr/share"
 
+# GTK schema/icon discovery inside the AppDir (linuxdeploy-plugin-gtk env).
+# Without these the AppImage fails with "Settings schema
+# 'org.gnome.desktop.interface' is not installed" or missing icons.
+export GSETTINGS_SCHEMA_DIR="$HERE/usr/share/glib-2.0/schemas"
+export GTK_PATH="$HERE/usr/lib/gtk-4.0"
+export GDK_PIXBUF_MODULE_FILE="$HERE/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+
+# Fontconfig cache must stay writable (bwrap provisions
+# XDG_CACHE_HOME/glycin/<exec>/fontconfig for Fontconfig=true loaders).
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+
 # GStreamer plugin discovery inside the AppDir (video path, incl. gtk4paintablesink).
 # Spec: "GST_PLUGIN_SYSTEM_PATH inside AppDir ... via AppRun hook
 # (LD_LIBRARY_PATH+GST_PLUGIN_PATH)" and acceptance
 # "GST_PLUGIN_SYSTEM_PATH=$APPDIR/usr/lib/gstreamer-1.0 ... no host
 # gstreamer required". GST_PLUGIN_SCANNER is the matching scanner binary so
 # registry rebuilds also stay inside the AppDir.
-export GST_PLUGIN_SYSTEM_PATH="$HERE/usr/lib/gstreamer-1.0${GST_PLUGIN_SYSTEM_PATH:+:$GST_PLUGIN_SYSTEM_PATH}"
+export GST_PLUGIN_SYSTEM_PATH="$HERE/usr/lib/gstreamer-1.0:$HERE/usr/lib/x86_64-linux-gnu/gstreamer-1.0${GST_PLUGIN_SYSTEM_PATH:+:$GST_PLUGIN_SYSTEM_PATH}"
 export GST_PLUGIN_PATH="$HERE/usr/lib/gstreamer-1.0${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
 export GST_PLUGIN_SCANNER="$HERE/usr/libexec/gstreamer-1.0/gst-plugin-scanner"
+
+# Glycin Exec relocation fix: bundled conf.d files carry absolute
+# Exec=/usr/libexec/glycin-loaders/2+/<loader>, but bwrap does
+# `--ro-bind /usr /usr` so that path would resolve to the HOST /usr, not the
+# AppDir. Rewrite Exec to the $HERE absolute path in a temp conf.d tree under
+# XDG_RUNTIME_DIR so bwrap's `--ro-bind <exec>` branch fires (non-/usr Exec
+# is explicitly bind-mounted). Runs before the first Loader::new().load() so
+# glycin's lazy Config::cached() probe sees the relocated Exec.
+GLYCIN_COMPAT="2+"
+LOADER_CONF_SRC="$HERE/usr/share/glycin-loaders/$GLYCIN_COMPAT/conf.d"
+if [ -d "$LOADER_CONF_SRC" ]; then
+  RUNTIME_BASE="${XDG_RUNTIME_DIR:-/tmp}"
+  if [ ! -d "$RUNTIME_BASE" ] || [ ! -w "$RUNTIME_BASE" ]; then RUNTIME_BASE="/tmp"; fi
+  LOADER_CONF_DST="$RUNTIME_BASE/glycin-loaders/$GLYCIN_COMPAT/conf.d"
+  mkdir -p "$LOADER_CONF_DST"
+  for f in "$LOADER_CONF_SRC"/*.conf; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f")"
+    LOADER_BIN="$(sed -n 's/^Exec=.*\/\(glycin-[^/]*\)\s*$/\1/p' "$f" | head -n1)"
+    [ -z "$LOADER_BIN" ] && LOADER_BIN="$(basename "$base" .conf)"
+    awk -v here="$HERE" -v bin="$LOADER_BIN" -v compat="$GLYCIN_COMPAT" '
+      BEGIN{done=0}
+      /^Exec=/ { print "Exec=" here "/usr/libexec/glycin-loaders/" compat "/" bin; done=1; next }
+      { print }
+      END{ if(!done) print "Exec=" here "/usr/libexec/glycin-loaders/" compat "/" bin }
+    ' "$f" > "$LOADER_CONF_DST/$base"
+  done
+  export XDG_DATA_DIRS="$RUNTIME_BASE:$XDG_DATA_DIRS"
+  export GLYCIN_DATA_DIR="$RUNTIME_BASE"
+fi
+
+# Headless bundling probe used by CI smoke (dep-stripped ubuntu:22.04):
+# prints env + bundled bwrap/loader/plugin layout without opening a window.
+# Falls through to exec below, but `organizer --self-test-sandbox` exits
+# headlessly before any GTK init, so no window opens for the probe.
+if [ "${1:-}" = "--self-test-sandbox" ]; then
+  echo "HERE=$HERE"
+  echo "GLYCIN_DATA_DIR=$GLYCIN_DATA_DIR"
+  echo "XDG_DATA_DIRS=$XDG_DATA_DIRS"
+  echo "GST_PLUGIN_SYSTEM_PATH=$GST_PLUGIN_SYSTEM_PATH"
+  echo "GST_PLUGIN_SCANNER=$GST_PLUGIN_SCANNER"
+  bwrap --version 2>&1 || echo "bwrap missing from PATH=$PATH"
+  ls -l "$HERE/usr/libexec/glycin-loaders/$GLYCIN_COMPAT"/ 2>&1 | head -n 20
+  if [ -n "${LOADER_CONF_DST:-}" ] && [ -d "$LOADER_CONF_DST" ]; then
+    cat "$LOADER_CONF_DST"/*.conf 2>&1 | head -n 40
+  else
+    cat "$LOADER_CONF_SRC"/*.conf 2>&1 | head -n 40
+  fi
+  if [ -f "$HERE/usr/lib/gstreamer-1.0/libgstgtk4.so" ]; then
+    echo "gtk4paintablesink: bundled libgstgtk4.so present"
+  else
+    echo "gtk4paintablesink: libgstgtk4.so missing"
+  fi
+fi
 
 exec "$HERE/usr/bin/organizer" "$@"

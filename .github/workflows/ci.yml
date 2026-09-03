@@ -1,0 +1,166 @@
+name: ci
+
+# Spec #21: raw executable + AppImage distribution with CI smoke.
+# Raw binary + AppImage only — flatpak/flatpak-github-actions is NOT used.
+on:
+  push:
+    branches: ["main", "research/*", "prototype/*"]
+    tags: ["v*"]
+  pull_request: {}
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Headless filesystem acceptance (Queue + Config + Dedup + Mover + Undo
+  # seam on tempdir, no display) + raw release binary artifact.
+  raw:
+    name: raw (test + release binary)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install sys-deps (apt one-liner, see docs/packaging.md)
+        run: |
+          sudo apt update
+          sudo apt install -y libgtk-4-dev libadwaita-1-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
+            liblcms2-dev libfontconfig1-dev libseccomp-dev bubblewrap \
+            pkg-config build-essential curl xvfb \
+            desktop-file-utils appstream
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Typecheck
+        run: cargo check --locked --all-targets
+
+      - name: Headless tempdir acceptance
+        run: cargo test --locked -- --nocapture
+
+      - name: Raw release binary
+        run: |
+          cargo build --release --locked
+          strip target/release/organizer
+          ./target/release/organizer --version
+          ./target/release/organizer --self-test-sandbox | tee /tmp/self-test.log
+          grep -q "bwrap" /tmp/self-test.log
+
+      - name: xvfb Preview smoke
+        run: |
+          xvfb-run -a ./target/release/organizer --help
+          xvfb-run -a ./target/release/organizer --self-test-sandbox | tee /tmp/xvfb-smoke.log
+          grep -q "gtk4paintablesink" /tmp/xvfb-smoke.log
+
+      - name: Package raw tarball
+        run: |
+          tar czf organizer-x86_64-linux-gnu.tar.gz -C target/release organizer
+          sha256sum organizer-x86_64-linux-gnu.tar.gz > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: organizer-raw
+          path: |
+            organizer-x86_64-linux-gnu.tar.gz
+            SHA256SUMS
+            target/release/organizer
+
+  # AppImage on ubuntu:22.04 (glibc 2.35 baseline) + smoke in a dep-stripped
+  # ubuntu:22.04 container (no host gtk/gstreamer/glycin) proving bundling.
+  appimage:
+    name: appimage (linuxdeploy + appimagetool + smoke)
+    runs-on: ubuntu-22.04
+    needs: raw
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt update
+          sudo apt install -y libgtk-4-dev libadwaita-1-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
+            liblcms2-dev libfontconfig1-dev libseccomp-dev bubblewrap \
+            fuse libfuse2 pkg-config meson ninja-build \
+            cargo-c desktop-file-utils appstream librsvg2-dev xvfb
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build glycin-loaders from source (jammy has no package)
+        run: |
+          git clone --depth 1 https://gitlab.gnome.org/GNOME/glycin.git /tmp/glycin
+          meson setup /tmp/glycin/builddir -Dglycin-loaders=true -Dprefix=/usr
+          meson compile -C /tmp/glycin/builddir
+          sudo meson install -C /tmp/glycin/builddir
+
+      - name: Fetch linuxdeploy + appimagetool
+        run: |
+          curl -L -o linuxdeploy https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -L -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x linuxdeploy appimagetool
+          ./linuxdeploy --version || true
+
+      - name: Build AppImage
+        run: |
+          ./packaging/build-appimage.sh Organizer.AppDir Organizer-x86_64.AppImage
+          ls -lh Organizer-x86_64.AppImage Organizer-x86_64.AppImage.zsync
+
+      - name: Smoke test (host)
+        run: |
+          ./Organizer-x86_64.AppImage --self-test-sandbox | tee /tmp/appimage-smoke.log
+          grep -q "bwrap" /tmp/appimage-smoke.log
+          grep -q "gtk4paintablesink" /tmp/appimage-smoke.log
+
+      - name: Smoke test (dep-stripped ubuntu:22.04 — no gtk/gstreamer/glycin)
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work ubuntu:22.04 bash -c "
+            set -eu
+            apt update -qq && apt install -y --no-install-recommends fuse libglib2.0-0 ca-certificates xvfb 2>&1 | tail -n 5
+            ./Organizer-x86_64.AppImage --self-test-sandbox 2>&1 | tee /tmp/dep-stripped.log
+            grep -q bwrap /tmp/dep-stripped.log && echo 'bundled bwrap ok'
+            grep -q gtk4paintablesink /tmp/dep-stripped.log && echo 'bundled sink probe ok'
+            xvfb-run -a ./Organizer-x86_64.AppImage --self-test-sandbox 2>&1 | tee /tmp/dep-stripped-xvfb.log
+            grep -q bwrap /tmp/dep-stripped-xvfb.log
+          "
+
+      - name: Triage jpg+webm fixtures via bundled plugins (xvfb)
+        run: |
+          mkdir -p /tmp/smoke-src
+          gst-launch-1.0 videotestsrc num-buffers=1 ! video/x-raw,width=64,height=64 ! jpegenc ! filesink location=/tmp/smoke-src/a.jpg
+          gst-launch-1.0 videotestsrc num-buffers=15 ! video/x-raw,width=64,height=64,framerate=10/1 ! vp8enc ! webmmux ! filesink location=/tmp/smoke-src/b.webm
+          ls -l /tmp/smoke-src/
+          xvfb-run -a ./Organizer-x86_64.AppImage --self-test-sandbox | tee /tmp/triage-smoke.log
+          grep -q bwrap /tmp/triage-smoke.log
+          grep -q gtk4paintablesink /tmp/triage-smoke.log
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Organizer-x86_64.AppImage
+          path: |
+            Organizer-x86_64.AppImage
+            Organizer-x86_64.AppImage.zsync
+
+  release:
+    name: release (attach artifacts on tag)
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    needs: [raw, appimage]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/organizer-raw/organizer-x86_64-linux-gnu.tar.gz
+            dist/organizer-raw/SHA256SUMS
+            dist/Organizer-x86_64.AppImage/Organizer-x86_64.AppImage
+            dist/Organizer-x86_64.AppImage/Organizer-x86_64.AppImage.zsync
+          generate_release_notes: true

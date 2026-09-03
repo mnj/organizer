@@ -1,1 +1,7 @@
 /target/
+Organizer.AppDir/
+squashfs-root/
+*.AppImage
+*.AppImage.zsync
+organizer-*.tar.gz
+SHA256SUMS

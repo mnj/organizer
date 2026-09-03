@@ -10,14 +10,16 @@
 #      xvfb-run so the GTK Preview path initializes without a real display.
 #
 # Usage:
-#   ./packaging/smoke.sh [APPDIR_OR_APPIMAGE]
+#   ./packaging/smoke.sh [LAYOUT_TARGET]
 #   No arg: checks the raw target/release/organizer + host layout.
-#   APPDIR dir: checks $ARG/usr/libexec/glycin-loaders, $ARG/usr/bin/bwrap,
-#     $ARG/usr/lib/gstreamer-1.0, gtk4paintablesink via GST_PLUGIN_SYSTEM_PATH.
-#   *.AppImage: mounts (--appimage-mount) or extracts and checks the same.
+#   LAYOUT_TARGET=APPDIR dir: checks $ARG/usr/libexec/glycin-loaders,
+#     $ARG/usr/bin/bwrap, $ARG/usr/lib/gstreamer-1.0, gtk4paintablesink via
+#     GST_PLUGIN_SYSTEM_PATH.
+#   LAYOUT_TARGET=*.AppImage: extracts (--appimage-extract, no FUSE needed)
+#     and checks the same, plus the .zsync sidecar and size range.
 set -eu
 
-TARGET="${1:-}"
+LAYOUT_TARGET="${1:-}"
 
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1" >&2; exit 1; }
@@ -28,7 +30,7 @@ cargo test --locked || fail "cargo test failed"
 
 # Resolve the layout root to check.
 APPDIR=""
-if [ -z "$TARGET" ]; then
+if [ -z "$LAYOUT_TARGET" ]; then
   echo "== raw binary checks =="
   [ -x target/release/organizer ] || [ -x target/debug/organizer ] \
     || fail "no organizer binary (run cargo build first)"
@@ -47,14 +49,14 @@ if [ -z "$TARGET" ]; then
       && pass "host gtk4paintablesink discoverable" \
       || echo "WARN: host gtk4paintablesink missing (AppImage bundles libgstgtk4.so)"
   fi
-  BIN="${BIN:-target/release/organizer}"
-  [ -x "$BIN" ] || BIN="target/debug/organizer"
+  ORGANIZER_BIN="${BIN:-target/release/organizer}"
+  [ -x "$ORGANIZER_BIN" ] || ORGANIZER_BIN="target/debug/organizer"
   if command -v xvfb-run >/dev/null 2>&1; then
-    echo "== xvfb Preview smoke ($BIN --help) =="
-    xvfb-run -a "$BIN" --help >/dev/null 2>&1 \
+    echo "== xvfb Preview smoke ($ORGANIZER_BIN --help) =="
+    xvfb-run -a "$ORGANIZER_BIN" --help >/dev/null 2>&1 \
       && pass "xvfb Preview smoke (--help under Xvfb)" \
       || fail "xvfb smoke failed"
-    xvfb-run -a "$BIN" --self-test-sandbox 2>&1 | tee /tmp/organizer-smoke.log
+    xvfb-run -a "$ORGANIZER_BIN" --self-test-sandbox 2>&1 | tee /tmp/organizer-smoke.log
     grep -q "bwrap" /tmp/organizer-smoke.log \
       && pass "xvfb --self-test-sandbox reports bwrap" \
       || fail "--self-test-sandbox did not report bwrap"
@@ -64,19 +66,33 @@ if [ -z "$TARGET" ]; then
   exit 0
 fi
 
-case "$TARGET" in
+case "$LAYOUT_TARGET" in
   *.AppImage)
-    echo "== AppImage checks ($TARGET) =="
-    [ -f "$TARGET" ] || fail "AppImage not found: $TARGET"
-    [ -f "$TARGET.zsync" ] \
+    echo "== AppImage checks ($LAYOUT_TARGET) =="
+    [ -f "$LAYOUT_TARGET" ] || fail "AppImage not found: $LAYOUT_TARGET"
+    [ -f "$LAYOUT_TARGET.zsync" ] \
       && pass "zsync sidecar present (AppImageUpdate deltas)" \
       || echo "WARN: no .zsync sidecar (run appimagetool -u gh-releases-zsync)"
+    # Spec size estimate: ~55–95 MB compressed, ~120–200 MB uncompressed.
+    # WARN (not fail): codec coverage choices move the needle legitimately.
+    APPIMAGE_MB=$(($(stat -c%s "$LAYOUT_TARGET") / 1024 / 1024))
+    if [ "$APPIMAGE_MB" -ge 55 ] && [ "$APPIMAGE_MB" -le 95 ]; then
+      pass "AppImage size ${APPIMAGE_MB} MB within 55–95 MB estimate"
+    else
+      echo "WARN: AppImage size ${APPIMAGE_MB} MB outside 55–95 MB estimate"
+    fi
     # FUSE-mount is unavailable on most CI runners, so extract instead.
-    "$TARGET" --appimage-extract >/dev/null 2>&1 || fail "AppImage extract failed"
+    "$LAYOUT_TARGET" --appimage-extract >/dev/null 2>&1 || fail "AppImage extract failed"
     APPDIR="$PWD/squashfs-root"
+    UNCOMPRESSED_MB=$(($(du -sb "$APPDIR" | cut -f1) / 1024 / 1024))
+    if [ "$UNCOMPRESSED_MB" -ge 120 ] && [ "$UNCOMPRESSED_MB" -le 200 ]; then
+      pass "AppDir size ${UNCOMPRESSED_MB} MB within 120–200 MB estimate"
+    else
+      echo "WARN: AppDir size ${UNCOMPRESSED_MB} MB outside 120–200 MB estimate"
+    fi
     ;;
   *)
-    APPDIR="$TARGET"
+    APPDIR="$LAYOUT_TARGET"
     ;;
 esac
 

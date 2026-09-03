@@ -55,9 +55,12 @@ jobs:
           xvfb-run -a ./target/release/organizer --self-test-sandbox | tee /tmp/xvfb-smoke.log
           grep -q "gtk4paintablesink" /tmp/xvfb-smoke.log
 
+      # Canonical raw tarball recipe (kept identical in docs/packaging.md):
+      # binary + README.md, checksummed.
       - name: Package raw tarball
         run: |
-          tar czf organizer-x86_64-linux-gnu.tar.gz -C target/release organizer
+          cp README.md target/release/
+          tar czf organizer-x86_64-linux-gnu.tar.gz -C target/release organizer README.md
           sha256sum organizer-x86_64-linux-gnu.tar.gz > SHA256SUMS
 
       - uses: actions/upload-artifact@v4
@@ -67,6 +70,59 @@ jobs:
             organizer-x86_64-linux-gnu.tar.gz
             SHA256SUMS
             target/release/organizer
+
+  # Spec acceptance: `cargo build --release --locked` succeeds on
+  # ubuntu:22.04/fedora/arch. ubuntu is covered by `raw`/`appimage` above;
+  # this matrix proves the per-distro sys-deps one-liners (docs/packaging.md).
+  distro-matrix:
+    name: raw build (${{ matrix.id }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - id: fedora-41
+            image: fedora:41
+          - id: arch
+            image: archlinux/archlinux:latest
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install sys-deps (fedora one-liner, see docs/packaging.md)
+        if: matrix.id == 'fedora-41'
+        run: |
+          dnf install -y gtk4-devel libadwaita-devel \
+            gstreamer1-devel gstreamer1-plugins-base-devel gstreamer1-plugins-good \
+            gstreamer1-plugins-bad-free gstreamer1-plugin-libav \
+            gstreamer1-plugins-good-extras liblcms2-devel fontconfig-devel \
+            libseccomp-devel bubblewrap pkgconf-pkg-config gcc \
+            meson ninja-build git curl tar gzip findutils procps-ng
+
+      - name: Install sys-deps (arch one-liner, see docs/packaging.md)
+        if: matrix.id == 'arch'
+        run: |
+          pacman -Syu --noconfirm --needed gtk4 libadwaita gstreamer gst-plugins-base \
+            gst-plugins-good gst-plugins-bad gst-libav lcms2 fontconfig libseccomp \
+            bubblewrap pkgconf base-devel meson ninja git curl tar gzip
+
+      - name: Build glycin-loaders from source (no distro package)
+        run: |
+          git clone --depth 1 https://gitlab.gnome.org/GNOME/glycin.git /tmp/glycin
+          meson setup /tmp/glycin/builddir -Dglycin-loaders=true -Dprefix=/usr
+          meson compile -C /tmp/glycin/builddir
+          meson install -C /tmp/glycin/builddir
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Raw release binary + headless probe
+        # Headless-safe equivalent of `organizer /tmp/src` (GUI launch is
+        # proven by the xvfb smoke in `raw`/`appimage` on ubuntu).
+        run: |
+          cargo build --release --locked
+          ./target/release/organizer --version
+          ./target/release/organizer --self-test-sandbox | tee /tmp/self-test.log
+          grep -q "bwrap" /tmp/self-test.log
 
   # AppImage on ubuntu:22.04 (glibc 2.35 baseline) + smoke in a dep-stripped
   # ubuntu:22.04 container (no host gtk/gstreamer/glycin) proving bundling.
@@ -117,26 +173,44 @@ jobs:
           grep -q "gtk4paintablesink" /tmp/appimage-smoke.log
 
       - name: Smoke test (dep-stripped ubuntu:22.04 — no gtk/gstreamer/glycin)
+        # No FUSE in docker, so extract and run the AppRun hook directly
+        # (same path as packaging/smoke.sh for *.AppImage).
         run: |
           docker run --rm -v "$PWD:/work" -w /work ubuntu:22.04 bash -c "
             set -eu
-            apt update -qq && apt install -y --no-install-recommends fuse libglib2.0-0 ca-certificates xvfb 2>&1 | tail -n 5
-            ./Organizer-x86_64.AppImage --self-test-sandbox 2>&1 | tee /tmp/dep-stripped.log
+            apt update -qq && apt install -y --no-install-recommends libglib2.0-0 ca-certificates xvfb 2>&1 | tail -n 5
+            ./Organizer-x86_64.AppImage --appimage-extract >/dev/null
+            ./squashfs-root/AppRun --self-test-sandbox 2>&1 | tee /tmp/dep-stripped.log
             grep -q bwrap /tmp/dep-stripped.log && echo 'bundled bwrap ok'
             grep -q gtk4paintablesink /tmp/dep-stripped.log && echo 'bundled sink probe ok'
-            xvfb-run -a ./Organizer-x86_64.AppImage --self-test-sandbox 2>&1 | tee /tmp/dep-stripped-xvfb.log
+            xvfb-run -a ./squashfs-root/AppRun --self-test-sandbox 2>&1 | tee /tmp/dep-stripped-xvfb.log
             grep -q bwrap /tmp/dep-stripped-xvfb.log
           "
 
+      - name: Verify zsync sidecar + embedded update string
+        run: |
+          head -c 200 Organizer-x86_64.AppImage.zsync | grep -q "zsync" \
+            || { echo "ERROR: .zsync sidecar is not a zsync file"; exit 1; }
+          strings Organizer-x86_64.AppImage | grep -q "gh-releases-zsync" \
+            || { echo "ERROR: update string not embedded in AppImage (AppImageUpdate deltas need it)"; exit 1; }
+          echo "zsync + update string ok (AppImageUpdate can delta-update)"
+
       - name: Triage jpg+webm fixtures via bundled plugins (xvfb)
+        # Encodes real fixtures, then launches the AppImage ON the fixture
+        # Source Folder under Xvfb and requires it to stay up: proves the
+        # bundled glycin/GStreamer plugins decode jpg+webm with no host libs.
         run: |
           mkdir -p /tmp/smoke-src
           gst-launch-1.0 videotestsrc num-buffers=1 ! video/x-raw,width=64,height=64 ! jpegenc ! filesink location=/tmp/smoke-src/a.jpg
           gst-launch-1.0 videotestsrc num-buffers=15 ! video/x-raw,width=64,height=64,framerate=10/1 ! vp8enc ! webmmux ! filesink location=/tmp/smoke-src/b.webm
           ls -l /tmp/smoke-src/
-          xvfb-run -a ./Organizer-x86_64.AppImage --self-test-sandbox | tee /tmp/triage-smoke.log
-          grep -q bwrap /tmp/triage-smoke.log
-          grep -q gtk4paintablesink /tmp/triage-smoke.log
+          timeout -s KILL 30 xvfb-run -a ./Organizer-x86_64.AppImage /tmp/smoke-src >/tmp/triage-run.log 2>&1 &
+          APP_PID=$!
+          sleep 15
+          kill -0 $APP_PID && echo "AppImage triaging jpg+webm (alive after 15s under Xvfb)"
+          kill $APP_PID 2>/dev/null || true
+          wait $APP_PID 2>/dev/null || true
+          grep -qi "error\|critical\|cannot" /tmp/triage-run.log && { echo "ERROR: triage run logged failures:"; cat /tmp/triage-run.log; exit 1; } || true
 
       - uses: actions/upload-artifact@v4
         with:

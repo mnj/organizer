@@ -83,6 +83,22 @@ fn build_appimage_script_covers_toolchain_and_zsync() {
 }
 
 #[test]
+fn build_appimage_script_fails_fast_on_missing_bundle_inputs() {
+    // Review lock: an AppImage without loaders/bwrap fails its own
+    // acceptance, so the script must fail fast instead of warning through.
+    let script = read_repo("packaging/build-appimage.sh");
+    assert_contains_all(
+        &script,
+        "build-appimage.sh (fail-fast)",
+        &["ERROR: no glycin-loaders found", "exit 1"],
+    );
+    assert!(
+        !script.contains("--plugin gtk \\\n  --output appimage"),
+        "build-appimage.sh must not fall back to --plugin gtk without gstreamer"
+    );
+}
+
+#[test]
 fn desktop_file_is_valid_entry() {
     let desktop = read_repo("packaging/organizer.desktop");
     assert_contains_all(
@@ -136,6 +152,14 @@ fn ci_workflow_builds_both_artifacts_and_smokes() {
             "Organizer",
             ".AppImage",
             "organizer",
+            // Review locks: FUSE-free smoke, checksummed canonical tarball,
+            // zsync delta-update verification, fedora/arch matrix.
+            "appimage-extract",
+            "SHA256SUMS",
+            "gh-releases-zsync",
+            "distro-matrix",
+            "fedora",
+            "arch",
         ],
     );
     assert!(

@@ -46,8 +46,10 @@ cargo cinstall gst-plugin-gtk4 \
   --destdir="$PWD/$APPDIR"
 
 # 4) glycin-loaders 2+ into the AppDir (sandboxed stills).
-#    Prefers an installed meson build dir (/tmp/glycin-builddir, see CI);
-#    otherwise copies host loaders if present.
+#    Prefers an installed meson build dir (/tmp/glycin/builddir, see CI);
+#    otherwise copies host loaders if present. Fails fast: an AppImage
+#    without loaders would fail its own acceptance (sandbox-missing dialog
+#    on loader-less hosts), so never ship one silently.
 if [ -d /tmp/glycin/builddir ]; then
   DESTDIR="$PWD/$APPDIR" meson install -C /tmp/glycin/builddir
 elif [ -d /usr/libexec/glycin-loaders ]; then
@@ -57,13 +59,21 @@ elif [ -d /usr/libexec/glycin-loaders ]; then
     cp -r /usr/share/glycin-loaders "$APPDIR/usr/share/"
   fi
 else
-  echo "WARN: no glycin-loaders found (no /tmp/glycin/builddir, no /usr/libexec/glycin-loaders);" >&2
-  echo "WARN: AppImage will show the sandbox-missing dialog on hosts without loaders." >&2
+  echo "ERROR: no glycin-loaders found (no /tmp/glycin/builddir, no /usr/libexec/glycin-loaders)." >&2
+  echo "ERROR: refusing to build an AppImage that fails its own acceptance — build loaders first (see docs/packaging.md)." >&2
+  exit 1
 fi
+[ -d "$APPDIR/usr/libexec/glycin-loaders/2+" ] \
+  || { echo "ERROR: glycin-loaders staged but 2+ compat path missing in $APPDIR." >&2; exit 1; }
 
 # 5) bwrap + libseccomp so sandboxed preview works with no host bubblewrap.
+#    Fails fast for the same reason as loaders above (acceptance requires
+#    `bwrap --version` inside the AppDir).
 if command -v bwrap >/dev/null 2>&1; then
   cp -f "$(command -v bwrap)" "$APPDIR/usr/bin/bwrap"
+else
+  echo "ERROR: bwrap not found on build host — install bubblewrap (see docs/packaging.md)." >&2
+  exit 1
 fi
 
 # 6) Desktop file + icon (linuxdeploy requirement).

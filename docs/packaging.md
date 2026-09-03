@@ -49,11 +49,13 @@ runs on newer hosts. If `bubblewrap` is missing or unprivileged user
 namespaces are locked down, Organizer refuses sandboxed decode with a dialog
 (use the AppImage instead, which bundles `bwrap`).
 
-Release tarball (maintainers, manual — zero extra tooling):
+Release tarball (maintainers, manual — zero extra tooling; canonical recipe,
+kept identical in `.github/workflows/ci.yml`):
 
 ```sh
 cargo build --release --locked
 strip target/release/organizer
+cp README.md target/release/
 tar czf organizer-x86_64-linux-gnu.tar.gz -C target/release organizer README.md
 sha256sum organizer-*.tar.gz > SHA256SUMS
 ```
@@ -100,6 +102,12 @@ cargo test --locked                      # headless tempdir acceptance (no displ
                                          # gstreamer-1.0, gtk4paintablesink)
 xvfb-run -a ./target/release/organizer --self-test-sandbox
 ```
+
+`--self-test-sandbox` is a hidden headless probe (per research
+`appimage-raw-packaging.md` §7: CI greps `SandboxMechanism`, `XDG_DATA_DIRS`,
+`GST_PLUGIN_SYSTEM_PATH` without launching the GUI). Expected AppImage sizes
+(spec estimate): ~55–95 MB compressed squashfs, ~120–200 MB uncompressed —
+`packaging/smoke.sh` warns when an artifact falls outside that range.
 
 CI (`.github/workflows/ci.yml`) runs all of the above on push/tag and
 uploads `Organizer-x86_64.AppImage` (+ `.zsync`) and the raw

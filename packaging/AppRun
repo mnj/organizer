@@ -28,16 +28,26 @@
 HERE="$(dirname "$(readlink -f "$0")")"
 
 # Native libs bundled under $APPDIR/usr (libseccomp, libcap, codec deps).
+# Spec: AppRun hook (LD_LIBRARY_PATH ...).
 export LD_LIBRARY_PATH="$HERE/usr/lib:$HERE/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # Bundled bwrap wins over any host bubblewrap (glycin spawns `bwrap` via PATH).
+# Research sandboxed-decoding §2.3/§4.2: AppRun must prepend $APPDIR/usr/bin
+# to PATH before the first Loader::new().load().
 export PATH="$HERE/usr/bin:${PATH:-/usr/bin:/bin}"
 
-# Glycin loader configs (still-image sandbox path, shared with #19).
+# Glycin loader configs (still-image sandbox path).
+# Spec: "(and GLYCIN_DATA_DIR shared with 06)" — pins discovery to the
+# bundled $APPDIR/usr/share/glycin-loaders/2+/conf.d, ignoring host loaders.
 export XDG_DATA_DIRS="$HERE/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 export GLYCIN_DATA_DIR="$HERE/usr/share"
 
 # GStreamer plugin discovery inside the AppDir (video path, incl. gtk4paintablesink).
+# Spec: "GST_PLUGIN_SYSTEM_PATH inside AppDir ... via AppRun hook
+# (LD_LIBRARY_PATH+GST_PLUGIN_PATH)" and acceptance
+# "GST_PLUGIN_SYSTEM_PATH=$APPDIR/usr/lib/gstreamer-1.0 ... no host
+# gstreamer required". GST_PLUGIN_SCANNER is the matching scanner binary so
+# registry rebuilds also stay inside the AppDir.
 export GST_PLUGIN_SYSTEM_PATH="$HERE/usr/lib/gstreamer-1.0${GST_PLUGIN_SYSTEM_PATH:+:$GST_PLUGIN_SYSTEM_PATH}"
 export GST_PLUGIN_PATH="$HERE/usr/lib/gstreamer-1.0${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
 export GST_PLUGIN_SCANNER="$HERE/usr/libexec/gstreamer-1.0/gst-plugin-scanner"

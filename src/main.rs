@@ -78,6 +78,37 @@ fn is_entry_focused(window: &ApplicationWindow) -> bool {
 
 use organizer_lib::settings::{open_settings, SettingsContext};
 
+/// Shared decode-failure widgets for the Preview: error placeholder + toast.
+/// One `show` method so glycin stills, video startup, and video bus errors
+/// cannot drift apart (same placeholder + toast, Main stays alive).
+#[derive(Clone)]
+struct PreviewErrorUi<F: Fn(String) + Clone> {
+    stack: Stack,
+    spinner: gtk4::Spinner,
+    error_name: Label,
+    error_detail: Label,
+    toast: F,
+}
+
+impl<F: Fn(String) + Clone> PreviewErrorUi<F> {
+    fn show(&self, name: &str, msg: String) {
+        tracing::warn!("preview failed for {name}: {msg}");
+        self.error_name.set_text(name);
+        self.error_detail.set_text(&msg);
+        self.stack.set_visible_child_name("error");
+        self.spinner.set_visible(false);
+        self.spinner.set_spinning(false);
+        (self.toast)(msg);
+    }
+}
+
+/// Current File context for video playback (path + display name travel together).
+#[derive(Clone)]
+struct VideoTarget {
+    path: PathBuf,
+    name: String,
+}
+
 /// Centralized busy-state helper (Duplicated Code / Repeated Switches fix).
 /// Single place to toggle spinner and Action Bar sensitivity.
 fn set_busy_state(
@@ -538,75 +569,74 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         });
     }
 
-    // Video Preview state (spec #20): the currently playing playbin plus its
-    // bus watch guard. Dropping the tuple stops playback and removes the
-    // watch, so file switches never leave a pipeline behind.
-    let video_state: Rc<RefCell<Option<(gst::Element, gst::bus::BusWatchGuard)>>> =
+    // Video Preview state (spec #20): the currently playing video, if any.
+    // Clearing the slot stops playback and removes the bus watch, so file
+    // switches never leave a pipeline behind.
+    let video_state: Rc<RefCell<Option<video::PlayingVideo>>> =
         Rc::new(RefCell::new(None));
 
     let stop_video: Rc<dyn Fn()> = {
         let video_state_c = video_state.clone();
         Rc::new(move || {
-            if let Some((pipeline, _guard)) = video_state_c.borrow_mut().take() {
-                video::stop(&pipeline);
+            if let Some(playing) = video_state_c.borrow_mut().take() {
+                playing.stop();
             }
         })
+    };
+
+    let error_ui = PreviewErrorUi {
+        stack: stack.clone(),
+        spinner: spinner.clone(),
+        error_name: error_name.clone(),
+        error_detail: error_detail.clone(),
+        toast: show_toast.clone(),
     };
 
     // Start video playback for the Current File in the same Preview Picture
     // used for glycin stills. Muted + video-only + auto-play loop (EOS seeks
     // to zero); bus Error shows the shared decode-failure placeholder + toast
     // and the Main stays alive.
-    let play_video: Rc<dyn Fn(PathBuf, String)> = {
+    let play_video: Rc<dyn Fn(VideoTarget)> = {
         let picture_c = picture.clone();
         let stack_c = stack.clone();
         let spinner_c = spinner.clone();
         let preview_center_c = preview_center.clone();
-        let error_name_c = error_name.clone();
-        let error_detail_c = error_detail.clone();
-        let show_toast_c = show_toast.clone();
+        let error_ui_c = error_ui.clone();
         let video_state_c = video_state.clone();
         let stop_video_c = stop_video.clone();
-        Rc::new(move |path: PathBuf, name: String| {
+        Rc::new(move |target: VideoTarget| {
             stop_video_c();
-            // Unified failure path: same placeholder + toast as glycin decode failure.
-            let fail = |msg: String| {
-                tracing::warn!("video preview failed for {name}: {msg}");
-                error_name_c.set_text(&name);
-                error_detail_c.set_text(&msg);
-                stack_c.set_visible_child_name("error");
-                spinner_c.set_visible(false);
-                spinner_c.set_spinning(false);
-                show_toast_c(msg);
-            };
-            // Stop-then-fail: tear down the half-built pipeline before showing
-            // the placeholder so no late bus message can overwrite it.
-            let fail_stopped = |pipeline: &gst::Element, msg: String| {
-                video::stop(pipeline);
-                fail(msg);
+            let VideoTarget { path, name } = target;
+            // Single failure helper: an optional half-built pipeline is torn
+            // down first so no late bus message can overwrite the placeholder.
+            let fail = |pipeline: Option<&gst::Element>, msg: String| {
+                if let Some(p) = pipeline {
+                    video::stop(p);
+                }
+                error_ui_c.show(&name, msg);
             };
             if let Err(e) = video::ensure_init() {
-                fail(format!("Video unavailable for {name}: {e}"));
+                fail(None, format!("Video unavailable for {name}: {e}"));
                 return;
             }
             let uri = match video::to_file_uri(&path) {
                 Ok(u) => u,
                 Err(e) => {
-                    fail(format!("Video failed for {name}: {e}"));
+                    fail(None, format!("Video failed for {name}: {e}"));
                     return;
                 }
             };
             let (pipeline, sink) = match video::build_playbin(&uri) {
                 Ok(t) => t,
                 Err(e) => {
-                    fail(format!("Video failed for {name}: {e}"));
+                    fail(None, format!("Video failed for {name}: {e}"));
                     return;
                 }
             };
             let paintable = match video::sink_paintable(&sink) {
                 Ok(p) => p,
                 Err(e) => {
-                    fail_stopped(&pipeline, format!("Video failed for {name}: {e}"));
+                    fail(Some(&pipeline), format!("Video failed for {name}: {e}"));
                     return;
                 }
             };
@@ -618,47 +648,51 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
             spinner_c.set_visible(false);
             spinner_c.set_spinning(false);
             // Watch the bus before PLAYING so early decode errors are caught.
-            let weak_err = pipeline.downgrade();
-            let weak_eos = pipeline.downgrade();
-            let state_c = video_state_c.clone();
-            let stack_e = stack_c.clone();
-            let error_name_e = error_name_c.clone();
-            let error_detail_e = error_detail_c.clone();
-            let show_toast_e = show_toast_c.clone();
-            let name_e = name.clone();
-            let name_e2 = name.clone();
+            let weak_err_c = pipeline.downgrade();
+            let weak_eos_c = pipeline.downgrade();
+            let video_state_c2 = video_state_c.clone();
+            let error_ui_c2 = error_ui_c.clone();
+            let error_ui_c3 = error_ui_c.clone();
+            let name_c = name.clone();
+            let name_c2 = name.clone();
+            let name_c3 = name.clone();
             let watch = video::watch_bus(
                 &pipeline,
                 move |msg| {
-                    if let Some(p) = weak_err.upgrade() {
+                    if let Some(p) = weak_err_c.upgrade() {
                         video::stop(&p);
                     }
-                    *state_c.borrow_mut() = None;
-                    tracing::warn!("video bus error for {name_e}: {msg}");
-                    error_name_e.set_text(&name_e);
-                    error_detail_e.set_text(&msg);
-                    stack_e.set_visible_child_name("error");
-                    show_toast_e(format!("Video failed for {name_e}: {msg}"));
+                    *video_state_c2.borrow_mut() = None;
+                    error_ui_c2.show(&name_c, format!("Video failed for {name_c}: {msg}"));
                 },
                 move || {
-                    if let Some(p) = weak_eos.upgrade() {
-                        video::restart(&p);
+                    // Loop failure is surfaced, never a silent stall: a
+                    // non-seekable container that refuses the restart shows
+                    // the shared placeholder + toast.
+                    if let Some(p) = weak_eos_c.upgrade() {
+                        if let Err(e) = video::restart(&p) {
+                            video::stop(&p);
+                            error_ui_c3.show(&name_c3, format!("Video loop failed for {name_c3}: {e}"));
+                        }
                     }
                 },
             );
             let guard = match watch {
                 Ok(g) => g,
                 Err(e) => {
-                    fail_stopped(&pipeline, format!("Video failed for {name}: {e}"));
+                    fail(Some(&pipeline), format!("Video failed for {name}: {e}"));
                     return;
                 }
             };
             if let Err(e) = video::play(&pipeline) {
                 drop(guard);
-                fail_stopped(&pipeline, format!("Video failed for {name_e2}: {e}"));
+                fail(
+                    Some(&pipeline),
+                    format!("Video failed for {name_c2}: {e}"),
+                );
                 return;
             }
-            *video_state_c.borrow_mut() = Some((pipeline, guard));
+            *video_state_c.borrow_mut() = Some(video::PlayingVideo::new(pipeline, guard));
         })
     };
 
@@ -861,7 +895,10 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 }
             } else if video::is_video_supported(&effective_path_clone) {
                 // Video via GStreamer into the same Picture (muted, looped).
-                play_video_c(effective_path_clone.clone(), name.clone());
+                play_video_c(VideoTarget {
+                    path: effective_path_clone.clone(),
+                    name: name.clone(),
+                });
             } else {
                 stop_video_c();
                 ph_name_c.set_text(&name);

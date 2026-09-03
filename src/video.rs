@@ -70,9 +70,15 @@ pub fn ensure_init() -> Result<(), String> {
 /// video sink. Returns `(playbin, sink)` — the caller reads the sink's
 /// `paintable` property into the Preview `Picture`.
 ///
-/// Only `file://` URIs are accepted (triage-local files, no network fetch).
-/// `playbin` flags are video-only (`GST_PLAY_FLAG_VIDEO`) and `mute` is set
-/// as belt-and-braces so no audio path is negotiated.
+/// The `sink_name` parameter exists as the headless-test seam: production
+/// always passes [`PAINTABLE_SINK`] via [`build_playbin`], while tests use
+/// `fakesink` (the paintable sink needs a display for `PLAYING`).
+///
+/// Only `file://` URIs are accepted (triage-local files, no network fetch —
+/// research `sandboxed-decoding-raw-appimage` §6.3: refuse `http(s)` URIs).
+/// `playbin` flags are video-only (`GST_PLAY_FLAG_VIDEO`, verified by
+/// readback) and `mute` is set as belt-and-braces so no audio path is
+/// negotiated.
 pub fn build_playbin_with_sink(
     uri: &str,
     sink_name: &str,
@@ -90,8 +96,21 @@ pub fn build_playbin_with_sink(
         .build()
         .map_err(|e| format!("playbin unavailable: {e}"))?;
     playbin.set_property("uri", uri);
+    // set_property_from_str returns () — verify the parse took effect instead
+    // of silently keeping default audio+video+text flags with mute alone.
     playbin.set_property_from_str("flags", "video");
     playbin.set_property("mute", true);
+    let flags_text = playbin
+        .property_value("flags")
+        .transform::<String>()
+        .map(|v| v.get::<String>().unwrap_or_default())
+        .unwrap_or_default();
+    let lower = flags_text.to_ascii_lowercase();
+    if !lower.contains("video") || lower.contains("audio") {
+        return Err(format!(
+            "playbin refused video-only flags (got: {flags_text})"
+        ));
+    }
     playbin.set_property("video-sink", &sink);
     Ok((playbin, sink))
 }
@@ -107,19 +126,39 @@ pub fn sink_paintable(sink: &gst::Element) -> Result<gdk4::Paintable, String> {
     if !sink.has_property("paintable") {
         return Err(format!(
             "video sink '{}' has no paintable property",
-            sink.factory()
-                .map(|f| f.name().to_string())
-                .unwrap_or_else(|| "?".into())
+            sink_name(sink)
         ));
     }
     Ok(sink.property("paintable"))
 }
 
+/// Factory name of a sink element, for diagnostics.
+pub fn sink_name(sink: &gst::Element) -> String {
+    sink.factory()
+        .map(|f| f.name().to_string())
+        .unwrap_or_else(|| "?".into())
+}
+
 /// Restart from the first frame — the auto-play loop for short clips.
-/// Called on bus EOS. Failure (e.g. torn-down pipeline) is ignored: the
-/// next Preview switch rebuilds the pipeline anyway.
-pub fn restart(pipeline: &gst::Element) {
-    let _ = pipeline.seek_simple(gst::SeekFlags::FLUSH, gst::ClockTime::ZERO);
+/// Called on bus EOS. Tries a FLUSH seek to zero; non-seekable containers
+/// fall back to a Ready→Playing cycle so playback loops instead of silently
+/// stalling on the last frame. Returns `Err` only if the pipeline is already
+/// torn down — the caller then shows the error placeholder + toast.
+pub fn restart(pipeline: &gst::Element) -> Result<(), String> {
+    if pipeline
+        .seek_simple(gst::SeekFlags::FLUSH, gst::ClockTime::ZERO)
+        .is_ok()
+    {
+        return Ok(());
+    }
+    pipeline
+        .set_state(gst::State::Ready)
+        .map(|_| ())
+        .map_err(|e| format!("loop restart (Ready) failed: {e:?}"))?;
+    pipeline
+        .set_state(gst::State::Playing)
+        .map(|_| ())
+        .map_err(|e| format!("loop restart (Playing) failed: {e:?}"))
 }
 
 /// Tear down a pipeline: leave no PLAYING pipeline behind on file switch.
@@ -135,6 +174,34 @@ pub fn play(pipeline: &gst::Element) -> Result<(), String> {
         .set_state(gst::State::Playing)
         .map(|_| ())
         .map_err(|e| format!("cannot play video: {e:?}"))
+}
+
+/// A playing Preview pipeline plus its bus watch guard.
+/// Centralizes teardown: `stop()` (also run from `Drop` as belt-and-braces)
+/// leaves no PLAYING pipeline behind on file switch, and dropping the guard
+/// removes the bus watch.
+pub struct PlayingVideo {
+    pipeline: gst::Element,
+    _watch: gst::bus::BusWatchGuard,
+}
+
+impl PlayingVideo {
+    pub fn new(pipeline: gst::Element, watch: gst::bus::BusWatchGuard) -> Self {
+        Self {
+            pipeline,
+            _watch: watch,
+        }
+    }
+
+    pub fn stop(&self) {
+        stop(&self.pipeline);
+    }
+}
+
+impl Drop for PlayingVideo {
+    fn drop(&mut self) {
+        let _ = self.pipeline.set_state(gst::State::Null);
+    }
 }
 
 /// Attach a main-context bus watch: `on_error` fires once per bus Error
@@ -222,26 +289,17 @@ mod tests {
     fn build_playbin_sets_uri_mute_and_video_only_flags() {
         // fakesink keeps this headless-safe; gtk4paintablesink needs a display
         // for PLAYING but shares the same playbin wiring (covered by build_playbin).
-        let (playbin, _sink) =
+        let (playbin, sink) =
             build_playbin_with_sink("file:///tmp/clip.mp4", "fakesink").expect("playbin");
         let uri: String = playbin.property("uri");
         assert_eq!(uri, "file:///tmp/clip.mp4");
         let mute: bool = playbin.property("mute");
         assert!(mute, "video must be muted");
-        let flags = playbin.property_value("flags");
-        let text = flags
-            .transform::<String>()
-            .expect("flags serialize")
-            .get::<String>()
-            .expect("flags string");
-        assert!(
-            text.to_ascii_lowercase().contains("video"),
-            "flags must be video-only, got: {text}"
-        );
-        assert!(
-            !text.to_ascii_lowercase().contains("audio"),
-            "audio flag must be off, got: {text}"
-        );
+        // flags were verified by readback inside build_playbin_with_sink
+        // (a silent parse failure would have returned Err above).
+        // fakesink exposes no paintable: error names the sink factory.
+        let err = sink_paintable(&sink).unwrap_err();
+        assert!(err.contains("fakesink"), "unexpected: {err}");
     }
 
     #[test]
@@ -313,19 +371,28 @@ mod tests {
         let _ = pipe.set_state(gst::State::Null);
         assert!(encoded, "fixture webm must encode");
 
-        // Decode it through the same playbin wiring the Preview uses.
+        // Decode it through the same playbin wiring the Preview uses,
+        // then loop it once via restart() (auto-play loop for short clips).
         let uri = to_file_uri(&path).unwrap();
         let (playbin, _sink) = build_playbin_with_sink(&uri, "fakesink").expect("playbin");
         playbin.set_state(gst::State::Playing).expect("playing");
         let bus = playbin.bus().expect("bus");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+        let mut eos_count = 0;
         let mut outcome = String::from("TIMEOUT: valid webm never reached EOS");
         while std::time::Instant::now() < deadline {
             if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(200)) {
                 match msg.view() {
                     gst::MessageView::Eos(..) => {
-                        outcome = String::from("EOS: valid video plays through");
-                        break;
+                        eos_count += 1;
+                        if eos_count >= 2 {
+                            outcome = String::from("EOS x2: valid video plays and loops");
+                            break;
+                        }
+                        if let Err(e) = restart(&playbin) {
+                            outcome = format!("loop restart failed: {e}");
+                            break;
+                        }
                     }
                     gst::MessageView::Error(e) => {
                         outcome = format!("unexpected decode Error: {}", e.error());
@@ -337,9 +404,34 @@ mod tests {
         }
         stop(&playbin);
         assert!(
-            outcome.starts_with("EOS"),
-            "valid video must play to EOS (loop-seek path), got: {outcome}"
+            outcome.starts_with("EOS x2"),
+            "valid video must play to EOS and loop via restart(), got: {outcome}"
         );
+    }
+
+    #[test]
+    fn bundle_script_documents_plugin_bundling_and_verification() {
+        let script = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/packaging/bundle-video.sh"
+        ))
+        .expect("packaging/bundle-video.sh must exist (spec #20 bundling recipe)");
+        for marker in [
+            "gst-plugin-gtk4",
+            "waylandegl",
+            "x11egl",
+            "dmabuf",
+            "cdylib",
+            "linuxdeploy",
+            "gst-inspect-1.0",
+            "gtk4paintablesink",
+            "GST_PLUGIN_SYSTEM_PATH",
+        ] {
+            assert!(
+                script.contains(marker),
+                "bundle script must cover {marker} (spec bundling + discovery check)"
+            );
+        }
     }
 
     #[test]

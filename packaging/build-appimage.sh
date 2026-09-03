@@ -62,7 +62,8 @@ GST_GTK4_VER="$(curl -fsSL -A "organizer-appimage-build/1.0" \
 [ -n "$GST_GTK4_VER" ] || { echo "ERROR: could not resolve gst-plugin-gtk4 0.15.x from crates.io." >&2; exit 1; }
 echo "gst-plugin-gtk4 version: $GST_GTK4_VER"
 rm -rf /tmp/gst-plugin-gtk4 && mkdir -p /tmp/gst-plugin-gtk4
-curl -L -o /tmp/gst-plugin-gtk4/plugin.tar.gz \
+curl -fSL --retry 5 --retry-all-errors -A "organizer-appimage-build/1.0" \
+  -o /tmp/gst-plugin-gtk4/plugin.tar.gz \
   "https://crates.io/api/v1/crates/gst-plugin-gtk4/$GST_GTK4_VER/download"
 tar xzf /tmp/gst-plugin-gtk4/plugin.tar.gz -C /tmp/gst-plugin-gtk4
 cargo cinstall \

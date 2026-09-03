@@ -16,10 +16,14 @@ sudo apt update && sudo apt install -y libgtk-4-dev libadwaita-1-dev \
   liblcms2-dev libfontconfig1-dev libseccomp-dev bubblewrap \
   pkg-config build-essential curl
 # plus glycin-loaders 2+: Ubuntu 24.04 universe (`glycin-loaders`), or build
-# from source on ubuntu:22.04 — pip meson>=1.2, source cairo>=1.17, then
-# meson setup /tmp/glycin/builddir /tmp/glycin -Dglycin-loaders=true
+# from source on ubuntu:22.04. Jammy predates the app stack, so the AppImage
+# recipe builds a chain into /usr first (proven in podman, in dependency
+# order): pip meson>=1.2, glib 2.82, fontconfig 2.16, harfbuzz 10.4,
+# cairo 1.18, pango 1.55, wayland 1.24 + protocols 1.45, gtk 4.16
+# (no tracker/cloudproviders/sysprof/gstreamer-media/cups/vulkan/docs),
+# libadwaita 1.6, then glycin with
 # -Dloaders=glycin-image-rs,glycin-svg -Dlibglycin=false -Dlibglycin-gtk4=false
-# -Dglycin-thumbnailer=false -Dintrospection=false -Dprefix=/usr -Dtests=false
+# -Dglycin-thumbnailer=false -Dintrospection=false -Dtests=false
 # (heif/jxl loaders need libheif/libjxl and stay out of the jammy AppImage).
 
 # Fedora 41

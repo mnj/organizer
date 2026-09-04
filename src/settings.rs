@@ -134,7 +134,7 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
 
     let group = adw::PreferencesGroup::new();
     group.set_title("Action mappings");
-    group.set_description(Some("Display name, folder sibling, shortcut 1-9 — max 9, min 1"));
+    group.set_description(Some("Display name, folder name, shortcut 1-9 — max 9, min 1"));
     page.add(&group);
 
     // Custom container for rows (inside group)
@@ -303,7 +303,7 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
                 slug_label.add_css_class("dim-label");
                 slug_label.set_width_chars(14);
                 slug_label.set_xalign(0.0);
-                slug_label.set_tooltip_text(Some(&format!("sibling ../{}/, slug a-z0-9_-", slug)));
+                    slug_label.set_tooltip_text(Some(&format!("subfolder {}/, slug a-z0-9_-", slug)));
 
                 let list = gtk4::StringList::new(&["1","2","3","4","5","6","7","8","9"]);
                 let dropdown = gtk4::DropDown::new(Some(list), None::<gtk4::Expression>);
@@ -374,7 +374,7 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
                         let txt = e.text().to_string();
                         let slug = slugify(&txt);
                         slug_c.set_text(&format!("→ ../{}/", if slug.is_empty() { "—".into() } else { slug.clone() }));
-                        slug_c.set_tooltip_text(Some(&format!("sibling ../{}/, slug a-z0-9_-", slug)));
+                        slug_c.set_tooltip_text(Some(&format!("subfolder {}/, slug a-z0-9_-", slug)));
                         if let Some(a) = ui_c.borrow_mut().get_mut(idx) {
                             a.folder_name = txt;
                         }

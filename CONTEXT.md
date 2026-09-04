@@ -25,11 +25,11 @@ A file with an extension outside Supported Format; shown as a placeholder card w
 _Avoid_: Invalid file, skipped file
 
 **Action**:
-A user-configured triage destination with a display name, folder name (sibling to Source Folder), and shortcut; moving Current File to it appends its sha256 to that Action’s log.
+A user-configured triage destination with a display name, folder name (subfolder of Source Folder), and shortcut; moving Current File to it appends its sha256 to that Action’s log.
 _Avoid_: Category, label
 
 **Duplicate**:
-A file whose sha256 already exists in any Action log; routed to the `duplicate/` sibling folder instead of the chosen Action.
+A file whose sha256 already exists in any Action log; routed to the `duplicate/` subfolder instead of the chosen Action.
 _Avoid_: Copy, clone
 
 **Preview**:

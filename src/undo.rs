@@ -12,8 +12,8 @@ use crate::mover::move_to_action;
 pub struct UndoEntry {
     pub hash: String,        // lower-case hex sha256
     pub src_name: String,    // e.g. "foo.jpg"
-    pub dest_path: PathBuf,  // absolute sibling destination that file was moved to
-    pub was_duplicate: bool, // true if routed to ../duplicate/
+    pub dest_path: PathBuf,  // absolute subfolder destination that file was moved to
+    pub was_duplicate: bool, // true if routed to duplicate/ subfolder
     pub folder_name: String, // Action folder_name for the log `SourceFolder/<folder>.txt` (empty if was_duplicate)
     pub display_name: String, // Action display_name for toast
 }
@@ -323,7 +323,7 @@ mod tests {
         let hb = compute_sha256(&b).unwrap();
         assert_eq!(ha, hb);
         let db = move_to_action(&source, &b, "keep", &hb, &mut union).unwrap();
-        assert_eq!(db, base.join("duplicate").join("b.jpg"));
+        assert_eq!(db, source.join("duplicate").join("b.jpg"));
         assert_eq!(union.len(), 1);
         let log_mid = fs::read_to_string(source.join("keep.txt")).unwrap();
         assert_eq!(log_mid.lines().count(), 1);
@@ -335,7 +335,7 @@ mod tests {
         assert_eq!(union.len(), 1);
         let log_after = fs::read_to_string(source.join("keep.txt")).unwrap();
         assert_eq!(log_after.lines().count(), 1);
-        assert!(!base.join("duplicate").join("b.jpg").exists());
+        assert!(!source.join("duplicate").join("b.jpg").exists());
         // no duplicate.txt
         assert!(!source.join("duplicate.txt").exists());
     }
@@ -377,7 +377,7 @@ mod tests {
         // Instead test suffix logic directly: create a file a.jpg in source, try undo that would restore a.jpg but clash
         // We already have a_undo_1, so next suffix should be _undo_2
         // Create a new dest: use a different keep file but restore as "a.jpg" again
-        let fake_dest = base.join("keep").join("a_fake.jpg");
+        let fake_dest = source.join("keep").join("a_fake.jpg");
         fs::write(&fake_dest, b"fake").unwrap();
         let entry2 = UndoEntry::new(&ha2, "a.jpg", fake_dest.clone(), false, "keep", "Keep");
         let restored2 = undo_move(&source, &entry2, &mut union).unwrap();

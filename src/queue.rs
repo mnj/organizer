@@ -34,7 +34,8 @@ pub fn build_snapshot(source_folder: &Path) -> std::io::Result<Vec<PathBuf>> {
     for entry in dir {
         let entry = entry?;
         let path = entry.path();
-        // Only regular files, flat only — no recursion, skip directories (including siblings)
+        // Only regular files, flat only — no recursion, skip directories
+        // (action/duplicate subfolders live inside the Source Folder)
         if !path.is_file() {
             continue;
         }

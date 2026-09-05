@@ -17,7 +17,7 @@ pub enum OutputFormat {
 pub struct SweepMatch {
     pub path: PathBuf,
     pub hash: String,
-    pub action: String,
+    pub category: String,
     pub triaged_at: i64,
 }
 
@@ -81,11 +81,11 @@ pub fn resolve_reference_db_path(db_arg: Option<&Path>) -> PathBuf {
     }
 }
 
-/// Normalize raw `--include` values: split commas, trim, lower-case, drop empties.
-/// Repeatable (`--include keep --include maybe`) and comma-separated
-/// (`--include keep,maybe`) both feed the same filter. Empty input yields an
-/// empty set; callers treat absent `--include` as `None` (all Actions).
-pub fn parse_include_args(raw: &[String]) -> HashSet<String> {
+/// Normalize raw `--categories` values: split commas, trim, lower-case, drop empties.
+/// Repeatable (`--categories keep --categories maybe`) and comma-separated
+/// (`--categories keep,maybe`) both feed the same filter. Empty input yields an
+/// empty set; callers treat absent `--categories` as `None` (all Categories).
+pub fn parse_category_args(raw: &[String]) -> HashSet<String> {
     let mut out = HashSet::new();
     for entry in raw {
         for part in entry.split(',') {
@@ -98,20 +98,20 @@ pub fn parse_include_args(raw: &[String]) -> HashSet<String> {
     out
 }
 
-/// Resolve normalized include tokens against known Actions to folder allow-list.
+/// Resolve normalized category tokens against known Categories to folder allow-list.
 /// Each token matching a folder or display name (case-insensitive) maps to its
 /// folder lower-cased; unknown tokens are kept as-is so they match nothing
 /// rather than silently widening the filter.
-pub fn resolve_include_filter(raw: &[String], actions: &[crate::config::Action]) -> HashSet<String> {
-    let tokens = parse_include_args(raw);
+pub fn resolve_category_filter(raw: &[String], categories: &[crate::config::Category]) -> HashSet<String> {
+    let tokens = parse_category_args(raw);
     let mut out = HashSet::new();
     for token in tokens {
         let mut mapped: Option<String> = None;
-        for a in actions {
-            if a.folder_name.to_ascii_lowercase() == token
-                || a.display_name.to_ascii_lowercase() == token
+        for c in categories {
+            if c.folder_name.to_ascii_lowercase() == token
+                || c.display_name.to_ascii_lowercase() == token
             {
-                mapped = Some(a.folder_name.to_ascii_lowercase());
+                mapped = Some(c.folder_name.to_ascii_lowercase());
                 break;
             }
         }
@@ -120,28 +120,28 @@ pub fn resolve_include_filter(raw: &[String], actions: &[crate::config::Action])
     out
 }
 
-/// Human-readable numbered list of database Actions for the interactive toggle
+/// Human-readable numbered list of database Categories for the interactive toggle
 /// prompt (#27). Sourced from the reference Organizer Database via
-/// `Store::actions()`, so CLI selection stays discoverable without editing the
+/// `Store::categories()`, so CLI selection stays discoverable without editing the
 /// database. Order follows stored position.
-pub fn format_toggle_list(actions: &[crate::config::Action]) -> String {
+pub fn format_toggle_list(categories: &[crate::config::Category]) -> String {
     let mut out = String::new();
-    for (i, a) in actions.iter().enumerate() {
-        out.push_str(&format!("  {} [x] {} ({})\n", i + 1, a.display_name, a.folder_name));
+    for (i, c) in categories.iter().enumerate() {
+        out.push_str(&format!("  {} [x] {} ({})\n", i + 1, c.display_name, c.folder_name));
     }
     out
 }
 
-/// Parse an interactive toggle line into an include allow-list.
-/// - Empty or `all` (case-insensitive) yields `None` (default: all Actions).
+/// Parse an interactive toggle line into a category allow-list.
+/// - Empty or `all` (case-insensitive) yields `None` (default: all Categories).
 /// - `none` yields `Some(empty)` (match nothing).
 /// - Otherwise comma/whitespace-separated numbers (1-based position) or
-///   folder/display names (case-insensitive) select those Actions; unknown
+///   folder/display names (case-insensitive) select those Categories; unknown
 ///   tokens are ignored so a typo narrows rather than widens.
 /// Returns folder lower-cased allow-list for `run_sweep_report_with_filter`.
 pub fn parse_toggle_selection(
     input: &str,
-    actions: &[crate::config::Action],
+    categories: &[crate::config::Category],
 ) -> Option<HashSet<String>> {
     let trimmed = input.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("all") {
@@ -160,16 +160,16 @@ pub fn parse_toggle_selection(
         }
         // Numeric position first.
         if let Ok(n) = lower.parse::<usize>() {
-            if n >= 1 && n <= actions.len() {
-                out.insert(actions[n - 1].folder_name.to_ascii_lowercase());
+            if n >= 1 && n <= categories.len() {
+                out.insert(categories[n - 1].folder_name.to_ascii_lowercase());
             }
             continue;
         }
-        for a in actions {
-            if a.folder_name.to_ascii_lowercase() == lower
-                || a.display_name.to_ascii_lowercase() == lower
+        for c in categories {
+            if c.folder_name.to_ascii_lowercase() == lower
+                || c.display_name.to_ascii_lowercase() == lower
             {
-                out.insert(a.folder_name.to_ascii_lowercase());
+                out.insert(c.folder_name.to_ascii_lowercase());
                 break;
             }
         }
@@ -177,42 +177,42 @@ pub fn parse_toggle_selection(
     Some(out)
 }
 
-/// Line-prompt fallback for the include filter: prints database Actions and
-/// reads one stdin line, feeding the same include filter as `--include`.
+/// Line-prompt fallback for the category filter: prints database Categories and
+/// reads one stdin line, feeding the same category filter as `--categories`.
 /// Returns `None` for all. The primary interactive screen is the ratatui
-/// fullscreen checklist (`sweep_tui::run_include_tui`); pure parsing lives in
+/// fullscreen checklist (`sweep_tui::run_categories_tui`); pure parsing lives in
 /// `parse_toggle_selection` so behavior is testable without stdin.
-pub fn prompt_include_filter(actions: &[crate::config::Action]) -> Option<HashSet<String>> {
+pub fn prompt_category_filter(categories: &[crate::config::Category]) -> Option<HashSet<String>> {
     use std::io::{self, Write};
 
-    eprintln!("Reference Actions (default all):");
-    eprint!("{}", format_toggle_list(actions));
-    eprintln!("Enter numbers/names to include (comma-separated), 'all', 'none', or empty for all:");
+    eprintln!("Reference Categories (default all):");
+    eprint!("{}", format_toggle_list(categories));
+    eprintln!("Enter numbers/names to match (comma-separated), 'all', 'none', or empty for all:");
     let _ = io::stderr().flush();
     let mut line = String::new();
     match io::stdin().read_line(&mut line) {
-        Ok(_) => parse_toggle_selection(&line, actions),
+        Ok(_) => parse_toggle_selection(&line, categories),
         Err(_) => None,
     }
 }
 
 /// Read-only Sweep: scan Target Folder as a flat Supported-Format Snapshot,
 /// hash each entry, match sha256 against the reference Organizer Database union.
-/// Reports matched path, hash, origin Action and triage time without modifying
+/// Reports matched path, hash, origin Category and triage time without modifying
 /// files or the database. Unmatched files are untouched and unlisted.
 pub fn run_sweep_report(target: &Path, db_path: &Path) -> Result<SweepReport, SweepError> {
     run_sweep_report_with_filter(target, db_path, None)
 }
 
-/// Read-only Sweep with an origin-Action include filter (#27).
-/// - `None` matches hashes from all origin Actions (default).
-/// - `Some(set)` matches only hashes whose origin Action folder (case-insensitive)
+/// Read-only Sweep with an origin-Category filter (#27).
+/// - `None` matches hashes from all origin Categories (default).
+/// - `Some(set)` matches only hashes whose origin Category folder (case-insensitive)
 ///   is in `set`; other known hashes are left alone and unreported.
 /// Unknown-hash files remain untouched and unlisted regardless of filter.
 pub fn run_sweep_report_with_filter(
     target: &Path,
     db_path: &Path,
-    include: Option<&HashSet<String>>,
+    categories: Option<&HashSet<String>>,
 ) -> Result<SweepReport, SweepError> {
     if !target.is_dir() {
         return Err(SweepError::TargetNotDir(target.to_path_buf()));
@@ -226,8 +226,8 @@ pub fn run_sweep_report_with_filter(
     let snapshot =
         build_snapshot(target).map_err(|e| SweepError::TargetUnreadable(target.to_path_buf(), e.to_string()))?;
     let scanned = snapshot.len();
-    // Normalized lower-case allow-list; None means all origin Actions.
-    let allowed: Option<HashSet<String>> = include.map(|set| {
+    // Normalized lower-case allow-list; None means all origin Categories.
+    let allowed: Option<HashSet<String>> = categories.map(|set| {
         set.iter()
             .map(|s| s.trim().to_ascii_lowercase())
             .filter(|s| !s.is_empty())
@@ -243,14 +243,14 @@ pub fn run_sweep_report_with_filter(
             .map_err(|e| SweepError::Database(e.to_string()))?;
         if let Some(rec) = rec {
             if let Some(ref allow) = allowed {
-                if !allow.contains(&rec.action_folder.to_ascii_lowercase()) {
+                if !allow.contains(&rec.category_folder.to_ascii_lowercase()) {
                     continue;
                 }
             }
             matches.push(SweepMatch {
                 path,
                 hash,
-                action: rec.action_folder,
+                category: rec.category_folder,
                 triaged_at: rec.triaged_at,
             });
         }
@@ -263,11 +263,11 @@ pub fn run_sweep_report_with_filter(
     })
 }
 
-/// Destructive disposition for Sweep apply (#28): restorable OS trash and
-/// irreversible permanent delete, both gated behind an explicit execute flag.
+/// Sweep Action for apply (#28): `report` lists only, restorable OS trash and
+/// irreversible permanent delete are gated behind an explicit execute flag.
 /// `Report` (default) never touches the filesystem beyond hashing/reading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum Disposition {
+pub enum Action {
     Report,
     Trash,
     PermDelete,
@@ -280,34 +280,34 @@ pub struct ApplyError {
     pub message: String,
 }
 
-/// Outcome of a Sweep run with a disposition: the read-only match report plus
+/// Outcome of a Sweep run with an Action: the read-only match report plus
 /// what the execute gate did. `executed` is true only when a destructive
-/// disposition ran with `execute == true`; otherwise `removed`/`errors` are
+/// Action ran with `execute == true`; otherwise `removed`/`errors` are
 /// empty and every Target Folder file is untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepOutcome {
     pub report: SweepReport,
-    pub disposition: Disposition,
+    pub action: Action,
     pub executed: bool,
     pub removed: Vec<PathBuf>,
     pub errors: Vec<ApplyError>,
 }
 
 impl SweepOutcome {
-    /// True when a destructive disposition was selected but not executed:
+    /// True when a destructive Action was selected but not executed:
     /// the report lists what `--execute` would apply.
     pub fn is_dry_run(&self) -> bool {
-        !self.executed && self.disposition != Disposition::Report
+        !self.executed && self.action != Action::Report
     }
 }
 
-impl Disposition {
+impl Action {
     /// Machine/CLI spelling: `report`, `trash`, `perm-delete`.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Disposition::Report => "report",
-            Disposition::Trash => "trash",
-            Disposition::PermDelete => "perm-delete",
+            Action::Report => "report",
+            Action::Trash => "trash",
+            Action::PermDelete => "perm-delete",
         }
     }
 }
@@ -319,25 +319,25 @@ impl Disposition {
 /// and under `errors` in outcome JSON.
 fn outcome_headline(outcome: &SweepOutcome) -> String {
     let matched = outcome.report.matches.len();
-    if outcome.disposition == Disposition::Report {
+    if outcome.action == Action::Report {
         return "Report only — nothing modified.".to_string();
     }
     if outcome.is_dry_run() {
-        if outcome.disposition == Disposition::Trash {
+        if outcome.action == Action::Trash {
             return format!(
                 "Dry-run: would move {matched} file(s) to OS trash (restorable) — pass --execute to apply."
             );
         }
-        debug_assert_eq!(outcome.disposition, Disposition::PermDelete);
+        debug_assert_eq!(outcome.action, Action::PermDelete);
         return format!(
             "Dry-run: would permanently delete {matched} file(s) (irreversible) — pass --execute to apply."
         );
     }
     let done = outcome.removed.len();
-    if outcome.disposition == Disposition::Trash {
+    if outcome.action == Action::Trash {
         format!("Trashed {done} of {matched} file(s) — restorable from OS trash.")
     } else {
-        debug_assert_eq!(outcome.disposition, Disposition::PermDelete);
+        debug_assert_eq!(outcome.action, Action::PermDelete);
         format!("Permanently deleted {done} of {matched} file(s) — irreversible.")
     }
 }
@@ -359,23 +359,23 @@ fn apply_summary(outcome: &SweepOutcome) -> String {
     out
 }
 
-/// Sweep with a disposition and an explicit execute gate (#28).
+/// Sweep with an Action and an explicit execute gate (#28).
 /// Always scans and matches exactly like `run_sweep_report_with_filter`;
-/// without `execute`, destructive dispositions only report and change nothing.
+/// without `execute`, destructive Actions only report and change nothing.
 /// The reference database is only ever opened read-only; no Classification
-/// or moves to Action subfolders occur.
-pub fn run_sweep_with_disposition(
+/// or moves to Category subfolders occur.
+pub fn run_sweep_with_action(
     target: &Path,
     db_path: &Path,
-    include: Option<&HashSet<String>>,
-    disposition: Disposition,
+    categories: Option<&HashSet<String>>,
+    action: Action,
     execute: bool,
 ) -> Result<SweepOutcome, SweepError> {
-    let report = run_sweep_report_with_filter(target, db_path, include)?;
-    if disposition == Disposition::Report || !execute {
+    let report = run_sweep_report_with_filter(target, db_path, categories)?;
+    if action == Action::Report || !execute {
         return Ok(SweepOutcome {
             report,
-            disposition,
+            action,
             executed: false,
             removed: Vec::new(),
             errors: Vec::new(),
@@ -385,12 +385,12 @@ pub fn run_sweep_with_disposition(
     let mut removed = Vec::new();
     let mut errors = Vec::new();
     for m in &report.matches {
-        let res = match disposition {
-            Disposition::Trash => trash::delete(&m.path).map_err(|e| e.to_string()),
-            Disposition::PermDelete => {
+        let res = match action {
+            Action::Trash => trash::delete(&m.path).map_err(|e| e.to_string()),
+            Action::PermDelete => {
                 std::fs::remove_file(&m.path).map_err(|e| e.to_string())
             }
-            Disposition::Report => Ok(()),
+            Action::Report => Ok(()),
         };
         match res {
             Ok(()) => removed.push(m.path.clone()),
@@ -399,7 +399,7 @@ pub fn run_sweep_with_disposition(
     }
     Ok(SweepOutcome {
         report,
-        disposition,
+        action,
         executed: true,
         removed,
         errors,
@@ -437,7 +437,7 @@ fn push_matches_json(out: &mut String, matches: &[SweepMatch]) {
                 json_escape(&m.path.to_string_lossy())
             ));
             out.push_str(&format!("      \"hash\": \"{}\",\n", json_escape(&m.hash)));
-            out.push_str(&format!("      \"action\": \"{}\",\n", json_escape(&m.action)));
+            out.push_str(&format!("      \"category\": \"{}\",\n", json_escape(&m.category)));
             out.push_str(&format!("      \"triaged_at\": {}\n", m.triaged_at));
             if i + 1 == matches.len() {
                 out.push_str("    }\n");
@@ -461,13 +461,13 @@ fn format_table(report: &SweepReport) -> String {
     if report.matches.is_empty() {
         out.push_str("No Duplicates found — unknown files untouched and unlisted.\n");
     } else {
-        out.push_str("path\thash\taction\ttriaged_at\n");
+        out.push_str("path\thash\tcategory\ttriaged_at\n");
         for m in &report.matches {
             out.push_str(&format!(
                 "{}\t{}\t{}\t{}\n",
                 m.path.display(),
                 m.hash,
-                m.action,
+                m.category,
                 m.triaged_at
             ));
         }
@@ -501,9 +501,9 @@ pub fn format_report(report: &SweepReport, format: OutputFormat) -> String {
     }
 }
 
-/// Format a Sweep outcome (report plus disposition result) as human table or
+/// Format a Sweep outcome (report plus Action result) as human table or
 /// machine-readable json. Table appends the restorable/irreversible summary;
-/// json carries `disposition`, `executed`, `summary` (the same
+/// json carries `action`, `executed`, `summary` (the same
 /// restorable/irreversible headline), `removed` and `errors` alongside the
 /// report fields so scripts can follow up.
 pub fn format_outcome(outcome: &SweepOutcome, format: OutputFormat) -> String {
@@ -523,8 +523,8 @@ pub fn format_outcome(outcome: &SweepOutcome, format: OutputFormat) -> String {
             out.push_str(&format!("  \"scanned\": {},\n", outcome.report.scanned));
             out.push_str(&format!("  \"matched\": {},\n", outcome.report.matches.len()));
             out.push_str(&format!(
-                "  \"disposition\": \"{}\",\n",
-                outcome.disposition.as_str()
+                "  \"action\": \"{}\",\n",
+                outcome.action.as_str()
             ));
             out.push_str(&format!("  \"executed\": {},\n", outcome.executed));
             out.push_str(&format!(
@@ -581,19 +581,19 @@ mod tests {
     }
 
     /// Hash `file` and record it in the reference database as triaged to
-    /// `action` at `triaged_at`. Returns the lower-case sha256.
+    /// `category` at `triaged_at`. Returns the lower-case sha256.
     fn insert_known(
         store: &Store,
         file: &Path,
         name: &str,
-        action: &str,
+        category: &str,
         triaged_at: i64,
     ) -> String {
         let hash = compute_sha256(file).unwrap().to_ascii_lowercase();
         let size = fs::metadata(file).unwrap().len() as i64;
         store
             .insert_file(
-                &FileRecord::new(&hash, name, &format!("{action}/{name}"), action, size, 0, triaged_at)
+                &FileRecord::new(&hash, name, &format!("{category}/{name}"), category, size, 0, triaged_at)
                     .unwrap(),
             )
             .unwrap();
@@ -601,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn report_lists_matched_with_path_hash_action_time_and_leaves_files() {
+    fn report_lists_matched_with_path_hash_category_time_and_leaves_files() {
         let tmp = TempDir::new().unwrap();
         let source = tmp.path().join("source");
         fs::create_dir_all(&source).unwrap();
@@ -620,7 +620,7 @@ mod tests {
         let m = &report.matches[0];
         assert_eq!(m.path, known);
         assert_eq!(m.hash, known_hash);
-        assert_eq!(m.action, "keep");
+        assert_eq!(m.category, "keep");
         assert_eq!(m.triaged_at, triaged_at);
 
         // Read-only: files untouched, database has no extra rows.
@@ -722,7 +722,7 @@ mod tests {
         // Human table lists the match, omits the unknown.
         assert!(table.contains("known.jpg"), "table must list matched path:\n{table}");
         assert!(table.contains(&known_hash), "table must list hash:\n{table}");
-        assert!(table.contains("keep"), "table must list origin Action:\n{table}");
+        assert!(table.contains("keep"), "table must list origin Category:\n{table}");
         assert!(table.contains("42"), "table must list triage time:\n{table}");
         assert!(!table.contains("unknown.jpg"), "table must not list unmatched:\n{table}");
 
@@ -730,7 +730,7 @@ mod tests {
         assert!(json.contains("\"matches\""), "json must carry matches:\n{json}");
         assert!(json.contains("known.jpg"), "json must list matched path:\n{json}");
         assert!(json.contains(&known_hash), "json must list hash:\n{json}");
-        assert!(json.contains("keep"), "json must list origin Action:\n{json}");
+        assert!(json.contains("keep"), "json must list origin Category:\n{json}");
         assert!(json.contains("42"), "json must list triage time:\n{json}");
         assert!(!json.contains("unknown.jpg"), "json must not list unmatched:\n{json}");
         assert!(json.contains("\"scanned\""), "json must carry scan counts:\n{json}");
@@ -775,7 +775,7 @@ mod tests {
         let known = write_target(&target, "known.jpg", b"dup bytes");
         insert_known(&store, &known, "known.jpg", "keep", 9);
         let before_hashes = store.all_hashes().unwrap();
-        let before_actions = store.actions().unwrap();
+        let before_categories = store.categories().unwrap();
         let before_bytes = fs::read(&known).unwrap();
 
         // Warm-up run: SQLite WAL readers materialize the -shm/-wal index on
@@ -802,10 +802,10 @@ mod tests {
         let report = run_sweep_report(&target, &store.db_path()).unwrap();
         assert_eq!(report.matches.len(), 1);
 
-        // No row growth, no action changes, no file moves, no duplicate/ subfolder.
+        // No row growth, no category changes, no file moves, no duplicate/ subfolder.
         let reference = Store::open_reference_file(&store.db_path()).unwrap();
         assert_eq!(reference.all_hashes().unwrap(), before_hashes);
-        assert_eq!(reference.actions().unwrap(), before_actions);
+        assert_eq!(reference.categories().unwrap(), before_categories);
         assert_eq!(fs::read(&known).unwrap(), before_bytes);
         assert!(!target.join("duplicate").exists());
         assert!(!source.join("duplicate").exists() || source.join("duplicate").read_dir().map(|mut d| d.next().is_none()).unwrap_or(true));
@@ -820,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn filtered_run_matches_only_included_actions_and_leaves_others_unreported() {
+    fn filtered_run_matches_only_included_categories_and_leaves_others_unreported() {
         use std::collections::HashSet;
 
         let tmp = TempDir::new().unwrap();
@@ -843,7 +843,7 @@ mod tests {
         assert_eq!(report.scanned, 3);
         assert_eq!(report.matches.len(), 1);
         assert_eq!(report.matches[0].path, keep_file);
-        assert_eq!(report.matches[0].action, "keep");
+        assert_eq!(report.matches[0].category, "keep");
 
         // Excluded origin left alone and unreported; unknown untouched.
         assert!(maybe_file.exists());
@@ -854,65 +854,65 @@ mod tests {
     }
 
     #[test]
-    fn include_args_split_commas_trim_and_resolve_display_alias_case_insensitive() {
-        use crate::config::Action;
+    fn category_args_split_commas_trim_and_resolve_display_alias_case_insensitive() {
+        use crate::config::Category;
 
-        let actions = vec![
-            Action { display_name: "Keep".into(), folder_name: "keep".into(), shortcut: "1".into() },
-            Action { display_name: "Top Picks".into(), folder_name: "top_picks".into(), shortcut: "2".into() },
+        let categories = vec![
+            Category { display_name: "Keep".into(), folder_name: "keep".into(), shortcut: "1".into() },
+            Category { display_name: "Top Picks".into(), folder_name: "top_picks".into(), shortcut: "2".into() },
         ];
 
         // Repeatable + comma-separated, trimmed, lower-cased, empties dropped.
         let raw = vec!["keep, KEEP ".to_string(), "  ".to_string(), "Top Picks".to_string()];
-        let tokens = parse_include_args(&raw);
+        let tokens = parse_category_args(&raw);
         assert!(tokens.contains("keep"));
         assert!(tokens.contains("top picks"));
         assert_eq!(tokens.len(), 2);
 
         // Display-name alias resolves to folder; unknown stays as-is (matches nothing).
-        let resolved = resolve_include_filter(&["KEEP".to_string()], &actions);
+        let resolved = resolve_category_filter(&["KEEP".to_string()], &categories);
         assert!(resolved.contains("keep"));
-        let resolved_display = resolve_include_filter(&["top picks".to_string()], &actions);
+        let resolved_display = resolve_category_filter(&["top picks".to_string()], &categories);
         assert!(resolved_display.contains("top_picks"));
-        let resolved_unknown = resolve_include_filter(&["nope".to_string()], &actions);
+        let resolved_unknown = resolve_category_filter(&["nope".to_string()], &categories);
         assert!(resolved_unknown.contains("nope"));
     }
 
     #[test]
-    fn toggle_selection_parses_numbers_names_all_none_and_lists_actions() {
-        use crate::config::Action;
+    fn toggle_selection_parses_numbers_names_all_none_and_lists_categories() {
+        use crate::config::Category;
 
-        let actions = vec![
-            Action { display_name: "Keep".into(), folder_name: "keep".into(), shortcut: "1".into() },
-            Action { display_name: "Maybe".into(), folder_name: "maybe".into(), shortcut: "2".into() },
-            Action { display_name: "Reject".into(), folder_name: "reject".into(), shortcut: "3".into() },
+        let categories = vec![
+            Category { display_name: "Keep".into(), folder_name: "keep".into(), shortcut: "1".into() },
+            Category { display_name: "Maybe".into(), folder_name: "maybe".into(), shortcut: "2".into() },
+            Category { display_name: "Reject".into(), folder_name: "reject".into(), shortcut: "3".into() },
         ];
 
-        // Toggle list is sourced from database Actions.
-        let list = format_toggle_list(&actions);
+        // Toggle list is sourced from database Categories.
+        let list = format_toggle_list(&categories);
         assert!(list.contains("Keep"));
         assert!(list.contains("keep"));
         assert!(list.contains("Maybe"));
 
         // Empty / all means default-all (None).
-        assert_eq!(parse_toggle_selection("", &actions), None);
-        assert_eq!(parse_toggle_selection("all", &actions), None);
-        assert_eq!(parse_toggle_selection("ALL", &actions), None);
+        assert_eq!(parse_toggle_selection("", &categories), None);
+        assert_eq!(parse_toggle_selection("all", &categories), None);
+        assert_eq!(parse_toggle_selection("ALL", &categories), None);
 
         // None means match nothing.
         assert_eq!(
-            parse_toggle_selection("none", &actions),
+            parse_toggle_selection("none", &categories),
             Some(std::collections::HashSet::new())
         );
 
         // Numbers select by position.
-        let sel = parse_toggle_selection("1,3", &actions).unwrap();
+        let sel = parse_toggle_selection("1,3", &categories).unwrap();
         assert!(sel.contains("keep"));
         assert!(sel.contains("reject"));
         assert!(!sel.contains("maybe"));
 
         // Names select case-insensitively, folder or display.
-        let sel = parse_toggle_selection("KEEP, maybe", &actions).unwrap();
+        let sel = parse_toggle_selection("KEEP, maybe", &categories).unwrap();
         assert!(sel.contains("keep"));
         assert!(sel.contains("maybe"));
     }
@@ -935,7 +935,7 @@ mod tests {
         insert_known(&store, &maybe_file, "maybe.jpg", "maybe", 22);
         let unknown_hash = compute_sha256(&unknown).unwrap().to_ascii_lowercase();
 
-        // Default (None) matches hashes from all origin Actions.
+        // Default (None) matches hashes from all origin Categories.
         let all = run_sweep_report_with_filter(&target, &store.db_path(), None).unwrap();
         assert_eq!(all.scanned, 3);
         assert_eq!(all.matches.len(), 2);
@@ -963,21 +963,21 @@ mod tests {
     }
 
     #[test]
-    fn toggle_selection_feeds_same_filter_as_include_flag() {
-        use crate::config::Action;
+    fn toggle_selection_feeds_same_filter_as_categories_flag() {
+        use crate::config::Category;
 
         let tmp = TempDir::new().unwrap();
         let source = tmp.path().join("source");
         fs::create_dir_all(&source).unwrap();
         let store = Store::open(&source).unwrap();
-        // Custom Actions prove toggles are sourced from the database, not defaults.
+        // Custom Categories prove toggles are sourced from the database, not defaults.
         let custom = vec![
-            Action { display_name: "Keep".into(), folder_name: "keep".into(), shortcut: "1".into() },
-            Action { display_name: "Archive".into(), folder_name: "archive".into(), shortcut: "2".into() },
+            Category { display_name: "Keep".into(), folder_name: "keep".into(), shortcut: "1".into() },
+            Category { display_name: "Archive".into(), folder_name: "archive".into(), shortcut: "2".into() },
         ];
-        store.set_actions(&custom).unwrap();
-        let db_actions = store.actions().unwrap();
-        assert_eq!(db_actions, custom);
+        store.set_categories(&custom).unwrap();
+        let db_categories = store.categories().unwrap();
+        assert_eq!(db_categories, custom);
 
         let target = tmp.path().join("target");
         fs::create_dir_all(&target).unwrap();
@@ -986,18 +986,18 @@ mod tests {
         insert_known(&store, &keep_file, "keep.jpg", "keep", 31);
         insert_known(&store, &arch_file, "arch.jpg", "archive", 32);
 
-        // Same selection via number toggle and via --include flag value.
-        let via_toggle = parse_toggle_selection("1", &db_actions).unwrap();
-        let via_flag = resolve_include_filter(&["keep".to_string()], &db_actions);
-        assert_eq!(via_toggle, via_flag);
+        // Same selection via number toggle and via --categories flag value.
+        let via_toggle = parse_toggle_selection("1", &db_categories).unwrap();
+        let via_arg = resolve_category_filter(&["keep".to_string()], &db_categories);
+        assert_eq!(via_toggle, via_arg);
 
         let from_toggle =
             run_sweep_report_with_filter(&target, &store.db_path(), Some(&via_toggle)).unwrap();
-        let from_flag =
-            run_sweep_report_with_filter(&target, &store.db_path(), Some(&via_flag)).unwrap();
-        assert_eq!(from_toggle.matches, from_flag.matches);
+        let from_arg =
+            run_sweep_report_with_filter(&target, &store.db_path(), Some(&via_arg)).unwrap();
+        assert_eq!(from_toggle.matches, from_arg.matches);
         assert_eq!(from_toggle.matches.len(), 1);
-        assert_eq!(from_toggle.matches[0].action, "keep");
+        assert_eq!(from_toggle.matches[0].category, "keep");
     }
 
     #[test]
@@ -1013,15 +1013,15 @@ mod tests {
         let unknown = write_target(&target, "unknown.jpg", b"brand new");
         insert_known(&store, &known, "known.jpg", "keep", 11);
 
-        for disposition in [Disposition::Trash, Disposition::PermDelete] {
+        for action in [Action::Trash, Action::PermDelete] {
             let outcome =
-                run_sweep_with_disposition(&target, &store.db_path(), None, disposition, false)
+                run_sweep_with_action(&target, &store.db_path(), None, action, false)
                     .unwrap();
             assert_eq!(outcome.report.matches.len(), 1);
-            assert!(!outcome.executed, "dry-run must not execute {disposition:?}");
+            assert!(!outcome.executed, "dry-run must not execute {action:?}");
             assert!(outcome.removed.is_empty());
             assert!(outcome.errors.is_empty());
-            assert!(known.exists(), "dry-run must leave matched file: {disposition:?}");
+            assert!(known.exists(), "dry-run must leave matched file: {action:?}");
             assert!(unknown.exists());
             assert_eq!(fs::read(&known).unwrap(), b"known content");
             assert_eq!(store.all_hashes().unwrap().len(), 1);
@@ -1043,7 +1043,7 @@ mod tests {
         let before_hashes = store.all_hashes().unwrap();
 
         let outcome =
-            run_sweep_with_disposition(&target, &store.db_path(), None, Disposition::Trash, true)
+            run_sweep_with_action(&target, &store.db_path(), None, Action::Trash, true)
                 .unwrap();
         assert!(outcome.executed);
         assert_eq!(outcome.report.matches.len(), 1);
@@ -1052,7 +1052,7 @@ mod tests {
         assert!(!known.exists(), "trash must remove matched file from target");
         assert!(unknown.exists(), "unmatched files are never modified");
         assert_eq!(fs::read(&unknown).unwrap(), b"brand new");
-        // Reference database gains no rows, loses none; no Action moves.
+        // Reference database gains no rows, loses none; no Category moves.
         assert_eq!(store.all_hashes().unwrap(), before_hashes);
         assert!(!target.join("duplicate").exists());
         for entry in fs::read_dir(&target).unwrap().flatten() {
@@ -1061,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    fn perm_delete_execute_honors_include_filter_and_removes_irreversibly() {
+    fn perm_delete_execute_honors_category_filter_and_removes_irreversibly() {
         use std::collections::HashSet;
 
         let tmp = TempDir::new().unwrap();
@@ -1080,17 +1080,17 @@ mod tests {
 
         let mut only_keep = HashSet::new();
         only_keep.insert("keep".to_string());
-        let outcome = run_sweep_with_disposition(
+        let outcome = run_sweep_with_action(
             &target,
             &store.db_path(),
             Some(&only_keep),
-            Disposition::PermDelete,
+            Action::PermDelete,
             true,
         )
         .unwrap();
         assert!(outcome.executed);
         assert_eq!(outcome.report.matches.len(), 1);
-        assert_eq!(outcome.report.matches[0].action, "keep");
+        assert_eq!(outcome.report.matches[0].category, "keep");
         assert_eq!(outcome.removed, vec![keep_file.clone()]);
         assert!(outcome.errors.is_empty());
         assert!(!keep_file.exists(), "perm-delete removes matched file irreversibly");
@@ -1115,7 +1115,7 @@ mod tests {
 
         // Dry-run trash: restorable wording plus the execute hint, files untouched.
         let dry_trash =
-            run_sweep_with_disposition(&target, &store.db_path(), None, Disposition::Trash, false)
+            run_sweep_with_action(&target, &store.db_path(), None, Action::Trash, false)
                 .unwrap();
         assert!(dry_trash.is_dry_run());
         let dry_table = format_outcome(&dry_trash, OutputFormat::Table);
@@ -1126,11 +1126,11 @@ mod tests {
         assert!(known.exists());
 
         // Dry-run perm-delete: irreversible wording plus the execute hint.
-        let dry_del = run_sweep_with_disposition(
+        let dry_del = run_sweep_with_action(
             &target,
             &store.db_path(),
             None,
-            Disposition::PermDelete,
+            Action::PermDelete,
             false,
         )
         .unwrap();
@@ -1145,7 +1145,7 @@ mod tests {
 
         // Executed trash: restorable outcome, never irreversible wording.
         let done_trash =
-            run_sweep_with_disposition(&target, &store.db_path(), None, Disposition::Trash, true)
+            run_sweep_with_action(&target, &store.db_path(), None, Action::Trash, true)
                 .unwrap();
         assert!(!done_trash.is_dry_run());
         let done_table = format_outcome(&done_trash, OutputFormat::Table);
@@ -1156,11 +1156,11 @@ mod tests {
 
         // Executed perm-delete on a fresh match: irreversible outcome.
         let known2 = write_target(&target, "known2.jpg", b"known content");
-        let done_del = run_sweep_with_disposition(
+        let done_del = run_sweep_with_action(
             &target,
             &store.db_path(),
             Some(&HashSet::from(["keep".to_string()])),
-            Disposition::PermDelete,
+            Action::PermDelete,
             true,
         )
         .unwrap();
@@ -1174,9 +1174,9 @@ mod tests {
         }
         assert!(!known2.exists());
 
-        // Machine-readable outcome carries disposition and execute state.
+        // Machine-readable outcome carries action and execute state.
         let json = format_outcome(&done_del, OutputFormat::Json);
-        for needle in ["\"disposition\"", "\"executed\"", "\"summary\"", "perm-delete", "known2.jpg", "irreversible"] {
+        for needle in ["\"action\"", "\"executed\"", "\"summary\"", "perm-delete", "known2.jpg", "irreversible"] {
             assert!(json.contains(needle), "json outcome must carry {needle:?}:\n{json}");
         }
     }
@@ -1187,7 +1187,7 @@ mod tests {
         let made = |name: &str| SweepMatch {
             path: target.join(name),
             hash: "ab".repeat(32),
-            action: "keep".to_string(),
+            category: "keep".to_string(),
             triaged_at: 7,
         };
         let first = made("a.jpg");
@@ -1199,7 +1199,7 @@ mod tests {
                 scanned: 2,
                 matches: vec![first.clone(), second.clone()],
             },
-            disposition: Disposition::Trash,
+            action: Action::Trash,
             executed: true,
             removed: vec![first.path.clone()],
             errors: vec![ApplyError {

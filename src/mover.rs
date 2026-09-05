@@ -88,7 +88,7 @@ pub fn mover_error_message(e: &MoverError, file_name: &str) -> String {
 /// Callers match instead of inferring `duplicate/` from the destination path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClassifyOutcome {
-    /// Moved to the chosen Action subfolder.
+    /// Moved to the chosen Category subfolder.
     Classified(PathBuf),
     /// Hash already known: routed to `duplicate/` with no extra row.
     Duplicate(PathBuf),
@@ -111,7 +111,7 @@ impl ClassifyOutcome {
 }
 
 /// Destination subfolder inside the Source Folder itself (lazily created).
-/// Action and `duplicate/` folders live *inside* the Source Folder, never as
+/// Category and `duplicate/` folders live *inside* the Source Folder, never as
 /// siblings: the Queue scanner only takes direct-child files, so triaged
 /// files can never re-enter the Queue, even across relaunches.
 fn dest_subdir(source_folder: &Path, name: &str) -> PathBuf {
@@ -167,7 +167,7 @@ fn rollback_to_source(source_folder: &Path, dest_path: &Path, file_name: &str) {
 
 /// GUI Classification on the Organizer Database.
 ///
-/// Moves Current File to the chosen Action subfolder inside the Source Folder
+/// Moves Current File to the chosen Category subfolder inside the Source Folder
 /// and records its sha256 with Source Folder-relative paths. Duplicate hashes
 /// (already known to the database) route to the fixed `duplicate/` subfolder
 /// with no extra record growth. On DB failure the rename is rolled back.
@@ -176,13 +176,13 @@ fn rollback_to_source(source_folder: &Path, dest_path: &Path, file_name: &str) {
 /// Atomicity (ADR 0007): the filesystem rename cannot live inside a SQLite
 /// transaction, so atomicity comes from `Store::insert_file` (`BEGIN
 /// IMMEDIATE` + `INSERT OR IGNORE` idempotent claim) plus handling here:
-/// a `contains` fast-path avoids moving known duplicates into Action folders,
+/// a `contains` fast-path avoids moving known duplicates into Category folders,
 /// and an `insert -> false` race (another writer claimed the hash between our
 /// check and insert) routes the already-moved file on to `duplicate/` with no
 /// extra row. `Store` retries transient BUSY internally.
 ///
 /// Relative layout: `original_rel` is the flat file name, `final_rel` is
-/// `<action>/<dest file name>` (suffix-aware on collision).
+/// `<category>/<dest file name>` (suffix-aware on collision).
 pub fn classify_file(
     store: &Store,
     current_file: &Path,
@@ -194,7 +194,7 @@ pub fn classify_file(
     if folder_name.is_empty() {
         return Err(MoverError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "invalid action folder",
+            "invalid category folder",
         )));
     }
     let file_name = current_file
@@ -267,7 +267,7 @@ pub fn classify_file(
         Ok(false) => {
             // Lost a concurrent race: another writer inserted the same hash
             // between our contains-check and insert. Route the already-moved
-            // file on to duplicate/ so Action folders never gain duplicates
+            // file on to duplicate/ so Category folders never gain duplicates
             // and the database gains no extra row.
             if folder_name == "duplicate" {
                 return Ok(ClassifyOutcome::Duplicate(dest_path));
@@ -347,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_moves_to_action_and_records_relative_paths() {
+    fn classify_moves_to_category_and_records_relative_paths() {
         let (_dir, source, store) = setup_source();
         let foo = source.join("foo.jpg");
         fs::write(&foo, b"hello classify").unwrap();
@@ -365,7 +365,7 @@ mod tests {
         let rec = store.lookup(hash.as_str()).unwrap().expect("row must exist");
         assert_eq!(rec.original_rel, "foo.jpg");
         assert_eq!(rec.final_rel, "keep/foo.jpg");
-        assert_eq!(rec.action_folder, "keep");
+        assert_eq!(rec.category_folder, "keep");
         assert_eq!(rec.size, meta_before.len() as i64);
         // No legacy txt/toml logs created by the database path.
         assert!(!source.join("keep.txt").exists());
@@ -373,9 +373,9 @@ mod tests {
     }
 
     #[test]
-    fn classify_creates_no_legacy_files_across_actions() {
+    fn classify_creates_no_legacy_files_across_categories() {
         let (_dir, source, store) = setup_source();
-        for (name, content, action) in [
+        for (name, content, category) in [
             ("a.jpg", b"content a".as_slice(), "keep"),
             ("b.jpg", b"content b".as_slice(), "maybe"),
             ("c.jpg", b"content c".as_slice(), "reject"),
@@ -383,7 +383,7 @@ mod tests {
             let p = source.join(name);
             fs::write(&p, content).unwrap();
             let hash = hash_of(&p);
-            classify_file(&store, &p, action, &hash).unwrap();
+            classify_file(&store, &p, category, &hash).unwrap();
         }
         assert!(legacy_files_in(&source).is_empty(), "Classification must create no .txt/.toml");
         assert_eq!(store.all_hashes().unwrap().len(), 3);
@@ -442,7 +442,7 @@ mod tests {
         assert_eq!(store.all_hashes().unwrap().len(), 1);
         let rec = store.lookup(hash.as_str()).unwrap().unwrap();
         assert_eq!(rec.original_rel, "a.jpg");
-        assert_eq!(rec.action_folder, "keep");
+        assert_eq!(rec.category_folder, "keep");
         // Origin still keep for toast.
         assert_eq!(store.origin(hash_b.as_str()).unwrap().as_deref(), Some("keep"));
     }

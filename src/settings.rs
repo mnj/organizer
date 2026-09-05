@@ -2,7 +2,7 @@ use gtk4::prelude::*;
 use gtk4::{gio, glib, ApplicationWindow, Box as GtkBox, Button, Entry, Label, Orientation};
 use libadwaita as adw;
 use adw::prelude::*;
-use crate::config::{slugify, validate_actions, Action};
+use crate::config::{slugify, validate_categories, Category};
 use crate::store::Store;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -11,9 +11,9 @@ use std::rc::Rc;
 /// Bundled context for settings dialog — avoids Data Clumps
 pub struct SettingsContext {
     pub store: Store,
-    pub live_actions: Rc<RefCell<Vec<Action>>>,
-    pub disk_actions: Rc<RefCell<Vec<Action>>>,
-    pub rebuild_action_bar: Rc<dyn Fn()>,
+    pub live_categories: Rc<RefCell<Vec<Category>>>,
+    pub disk_categories: Rc<RefCell<Vec<Category>>>,
+    pub rebuild_category_bar: Rc<dyn Fn()>,
 }
 
 #[allow(dead_code)]
@@ -33,21 +33,21 @@ struct RowError {
 }
 
 /// Helper to compute per-row validation flags for precise inline `error` CSS
-fn per_row_errors(actions: &[Action]) -> Vec<RowError> {
-    let mut out = vec![RowError::default(); actions.len()];
+fn per_row_errors(categories: &[Category]) -> Vec<RowError> {
+    let mut out = vec![RowError::default(); categories.len()];
 
     // Too few/many is global, not per-row
 
     // display duplicates case-insensitive
     let mut display_counts: HashMap<String, usize> = HashMap::new();
-    for a in actions {
-        let key = a.display_name.trim().to_ascii_lowercase();
+    for c in categories {
+        let key = c.display_name.trim().to_ascii_lowercase();
         if !key.is_empty() {
             *display_counts.entry(key).or_default() += 1;
         }
     }
-    for (i, a) in actions.iter().enumerate() {
-        let trimmed = a.display_name.trim();
+    for (i, c) in categories.iter().enumerate() {
+        let trimmed = c.display_name.trim();
         if trimmed.is_empty() {
             out[i].display = true;
         } else {
@@ -61,14 +61,14 @@ fn per_row_errors(actions: &[Action]) -> Vec<RowError> {
     // folder: duplicate slug, reserved, empty, duplicate, path
     let mut slug_counts: HashMap<String, usize> = HashMap::new();
     let mut slugs: Vec<String> = Vec::new();
-    for a in actions {
-        let s = slugify(&a.folder_name);
+    for c in categories {
+        let s = slugify(&c.folder_name);
         slugs.push(s.clone());
         if !s.is_empty() {
             *slug_counts.entry(s).or_default() += 1;
         }
     }
-    for (i, a) in actions.iter().enumerate() {
+    for (i, c) in categories.iter().enumerate() {
         let slug = &slugs[i];
         if slug.is_empty() {
             out[i].folder = true;
@@ -77,7 +77,7 @@ fn per_row_errors(actions: &[Action]) -> Vec<RowError> {
         if slug == "duplicate" {
             out[i].folder = true;
         }
-        if a.folder_name.contains('/') || a.folder_name.contains('\\') || a.folder_name.trim() == ".." {
+        if c.folder_name.contains('/') || c.folder_name.contains('\\') || c.folder_name.trim() == ".." {
             out[i].folder = true;
         }
         if slug_counts.get(slug).copied().unwrap_or(0) > 1 {
@@ -87,14 +87,14 @@ fn per_row_errors(actions: &[Action]) -> Vec<RowError> {
 
     // shortcut duplicates / invalid
     let mut sc_counts: HashMap<String, usize> = HashMap::new();
-    for a in actions {
-        let s = a.shortcut.trim();
+    for c in categories {
+        let s = c.shortcut.trim();
         if s.len() == 1 && matches!(s.chars().next().unwrap(), '1'..='9') {
             *sc_counts.entry(s.to_string()).or_default() += 1;
         }
     }
-    for (i, a) in actions.iter().enumerate() {
-        let s = a.shortcut.trim();
+    for (i, c) in categories.iter().enumerate() {
+        let s = c.shortcut.trim();
         if s.len() != 1 || !matches!(s.chars().next().unwrap_or(' '), '1'..='9') {
             out[i].shortcut = true;
         } else if sc_counts.get(s).copied().unwrap_or(0) > 1 {
@@ -104,9 +104,9 @@ fn per_row_errors(actions: &[Action]) -> Vec<RowError> {
     out.into_iter().map(|e| RowError { display: e.display, folder: e.folder, shortcut: e.shortcut }).collect()
 }
 
-fn swap_actions(actions: &mut Vec<Action>, i: usize, j: usize) {
-    if i < actions.len() && j < actions.len() {
-        actions.swap(i, j);
+fn swap_categories(categories: &mut Vec<Category>, i: usize, j: usize) {
+    if i < categories.len() && j < categories.len() {
+        categories.swap(i, j);
     }
 }
 
@@ -120,19 +120,19 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
     let adw_win = adw::PreferencesWindow::builder()
         .transient_for(parent)
         .modal(true)
-        .title("Settings — Actions")
+        .title("Settings — Categories")
         .default_width(780)
         .default_height(560)
         .build();
 
     // PreferencesWindow content: single page + group containing our custom rows
     let page = adw::PreferencesPage::new();
-    page.set_title("Actions");
+    page.set_title("Categories");
     page.set_description("Organizer Database inside the Source Folder — copied with the folder, slug a-z0-9_-");
     adw_win.add(&page);
 
     let group = adw::PreferencesGroup::new();
-    group.set_title("Action mappings");
+    group.set_title("Category mappings");
     group.set_description(Some("Display name, folder name, shortcut 1-9 — max 9, min 1"));
     page.add(&group);
 
@@ -152,8 +152,8 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
     // Bottom bar: Add / Save / Cancel (placed below group via rows_box)
     let bottom = GtkBox::new(Orientation::Horizontal, 8);
     bottom.set_margin_top(12);
-    let btn_add = Button::with_label("Add Action");
-    btn_add.set_tooltip_text(Some("Add new action (max 9)"));
+    let btn_add = Button::with_label("Add Category");
+    btn_add.set_tooltip_text(Some("Add new category (max 9)"));
     let btn_save = Button::with_label("Save");
     btn_save.add_css_class("suggested-action");
     let btn_cancel = Button::with_label("Cancel");
@@ -168,8 +168,8 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
     bottom_group.add(&bottom);
     page.add(&bottom_group);
 
-    // ui_actions mirrors edits
-    let ui_actions: Rc<RefCell<Vec<Action>>> = Rc::new(RefCell::new(ctx.live_actions.borrow().clone()));
+    // ui_categories mirrors edits
+    let ui_categories: Rc<RefCell<Vec<Category>>> = Rc::new(RefCell::new(ctx.live_categories.borrow().clone()));
     let handles: Rc<RefCell<Vec<RowHandle>>> = Rc::new(RefCell::new(Vec::new()));
 
     // We need a rebuild closure that can be called after any mutation that changes order or length.
@@ -178,23 +178,23 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
 
     // Validate + live-apply helper (per-row errors)
     let validate_and_live = {
-        let ui_clone = ui_actions.clone();
+        let ui_clone = ui_categories.clone();
         let validation_c = validation_label.clone();
         let btn_save_c = btn_save.clone();
         let btn_add_c = btn_add.clone();
-        let live_c = ctx.live_actions.clone();
-        let rebuild_c = ctx.rebuild_action_bar.clone();
+        let live_c = ctx.live_categories.clone();
+        let rebuild_c = ctx.rebuild_category_bar.clone();
         let handles_c = handles.clone();
         Rc::new(move || {
-            let actions = ui_clone.borrow().clone();
+            let categories = ui_clone.borrow().clone();
             // update dropdown tooltips for conflict preview
             {
                 let hs = handles_c.borrow();
                 for h in hs.iter() {
                     let cur = format!("{}", h.dropdown.selected() + 1);
-                    let count = actions.iter().filter(|a| a.shortcut == cur).count();
+                    let count = categories.iter().filter(|c| c.shortcut == cur).count();
                     if count > 1 {
-                        if let Some(owner) = actions.iter().find(|a| a.shortcut == cur) {
+                        if let Some(owner) = categories.iter().find(|c| c.shortcut == cur) {
                             h.dropdown.set_tooltip_text(Some(&format!("Shortcut {} already used by '{}'", cur, owner.display_name)));
                         }
                     } else {
@@ -205,8 +205,8 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
                 }
             }
 
-            let per_row = per_row_errors(&actions);
-            match validate_actions(&actions) {
+            let per_row = per_row_errors(&categories);
+            match validate_categories(&categories) {
                 Ok(()) => {
                     validation_c.set_text("");
                     btn_save_c.set_sensitive(true);
@@ -215,7 +215,7 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
                         if err.folder { h.folder.add_css_class("error"); } else { h.folder.remove_css_class("error"); }
                         if err.shortcut { h.dropdown.add_css_class("error"); } else { h.dropdown.remove_css_class("error"); }
                     }
-                    *live_c.borrow_mut() = actions.clone();
+                    *live_c.borrow_mut() = categories.clone();
                     rebuild_c();
                 }
                 Err(errs) => {
@@ -231,9 +231,9 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
             }
             btn_add_c.set_sensitive(ui_clone.borrow().len() < 9);
             if ui_clone.borrow().len() >= 9 {
-                btn_add_c.set_tooltip_text(Some("Max 9 actions"));
+                btn_add_c.set_tooltip_text(Some("Max 9 categories"));
             } else {
-                btn_add_c.set_tooltip_text(Some("Add new action (max 9)"));
+                btn_add_c.set_tooltip_text(Some("Add new category (max 9)"));
             }
             // update Up/Down/Remove sensitivities
             let len = handles_c.borrow().len();
@@ -251,7 +251,7 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
                             } else if t.contains("Remove") || t.contains("At least") {
                                 btn.set_sensitive(len > 1);
                                 if len <= 1 {
-                                    btn.set_tooltip_text(Some("At least 1 action required"));
+                                     btn.set_tooltip_text(Some("At least 1 category required"));
                                 } else {
                                     btn.set_tooltip_text(Some("Remove"));
                                 }
@@ -264,9 +264,9 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
         }) as Rc<dyn Fn()>
     };
 
-    // Rebuild all rows from ui_actions (fresh indices)
+    // Rebuild all rows from ui_categories (fresh indices)
     let rebuild_rows = {
-        let ui_clone = ui_actions.clone();
+        let ui_clone = ui_categories.clone();
         let rows_box_c = rows_box.clone();
         let handles_c = handles.clone();
         let validate_c = validate_and_live.clone();
@@ -280,24 +280,24 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
             }
             handles_c.borrow_mut().clear();
 
-            let actions = ui_clone.borrow().clone();
-            for (idx, act) in actions.into_iter().enumerate() {
+            let categories = ui_clone.borrow().clone();
+            for (idx, cat) in categories.into_iter().enumerate() {
                 let row = GtkBox::new(Orientation::Horizontal, 8);
                 row.set_margin_bottom(4);
 
                 let display_entry = Entry::new();
                 display_entry.set_placeholder_text(Some("Display name"));
-                display_entry.set_text(&act.display_name);
+                display_entry.set_text(&cat.display_name);
                 display_entry.set_hexpand(true);
                 display_entry.set_width_chars(12);
 
                 let folder_entry = Entry::new();
                 folder_entry.set_placeholder_text(Some("Folder name"));
-                folder_entry.set_text(&act.folder_name);
+                folder_entry.set_text(&cat.folder_name);
                 folder_entry.set_hexpand(true);
                 folder_entry.set_width_chars(12);
 
-                let slug = slugify(&act.folder_name);
+                let slug = slugify(&cat.folder_name);
                 let slug_label = Label::new(Some(&format!("→ ../{}/", if slug.is_empty() { "—".to_string() } else { slug.clone() })));
                 slug_label.add_css_class("dim-label");
                 slug_label.set_width_chars(14);
@@ -306,9 +306,9 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
 
                 let list = gtk4::StringList::new(&["1","2","3","4","5","6","7","8","9"]);
                 let dropdown = gtk4::DropDown::new(Some(list), None::<gtk4::Expression>);
-                let sel = act.shortcut.parse::<u32>().ok().and_then(|n| if (1..=9).contains(&n) { Some(n-1) } else { None }).unwrap_or(0);
+                let sel = cat.shortcut.parse::<u32>().ok().and_then(|n| if (1..=9).contains(&n) { Some(n-1) } else { None }).unwrap_or(0);
                 dropdown.set_selected(sel);
-                dropdown.set_tooltip_text(Some(&format!("Shortcut {} — {} or Ctrl+{}", act.shortcut, act.shortcut, act.shortcut)));
+                dropdown.set_tooltip_text(Some(&format!("Shortcut {} — {} or Ctrl+{}", cat.shortcut, cat.shortcut, cat.shortcut)));
 
                 let btn_up = Button::builder().icon_name("go-up-symbolic").tooltip_text("Move up").build();
                 let btn_down = Button::builder().icon_name("go-down-symbolic").tooltip_text("Move down").build();
@@ -399,7 +399,7 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
                         if idx == 0 { return; }
                         {
                             let mut v = ui_c.borrow_mut();
-                            swap_actions(&mut v, idx, idx - 1);
+                            swap_categories(&mut v, idx, idx - 1);
                         }
                         if let Some(rb) = rebuild_c.borrow().as_ref() {
                             rb();
@@ -415,7 +415,7 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
                         if idx + 1 >= len { return; }
                         {
                             let mut v = ui_c.borrow_mut();
-                            swap_actions(&mut v, idx, idx + 1);
+                            swap_categories(&mut v, idx, idx + 1);
                         }
                         if let Some(rb) = rebuild_c.borrow().as_ref() {
                             rb();
@@ -446,13 +446,13 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
     // Initial build
     rebuild_rows();
 
-    // Add button: push new action and rebuild
+    // Add button: push new category and rebuild
     {
-        let ui_c = ui_actions.clone();
+        let ui_c = ui_categories.clone();
         let rebuild_c = rebuild_rows.clone();
         btn_add.connect_clicked(move |_| {
             if ui_c.borrow().len() >= 9 { return; }
-            let used: HashSet<String> = ui_c.borrow().iter().map(|a| a.shortcut.clone()).collect();
+            let used: HashSet<String> = ui_c.borrow().iter().map(|c| c.shortcut.clone()).collect();
             let mut new_short = "1".to_string();
             for n in 1..=9 {
                 let s = format!("{n}");
@@ -461,8 +461,8 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
                     break;
                 }
             }
-            let new_act = Action { display_name: "New Action".into(), folder_name: "new_action".into(), shortcut: new_short };
-            ui_c.borrow_mut().push(new_act);
+            let new_cat = Category { display_name: "New Category".into(), folder_name: "new_category".into(), shortcut: new_short };
+            ui_c.borrow_mut().push(new_cat);
             rebuild_c();
         });
     }
@@ -471,14 +471,14 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
     {
         let win_c = adw_win.clone();
         let store_c = ctx.store.clone();
-        let ui_c = ui_actions.clone();
-        let live_c = ctx.live_actions.clone();
-        let disk_c = ctx.disk_actions.clone();
-        let rebuild_c = ctx.rebuild_action_bar.clone();
+        let ui_c = ui_categories.clone();
+        let live_c = ctx.live_categories.clone();
+        let disk_c = ctx.disk_categories.clone();
+        let rebuild_c = ctx.rebuild_category_bar.clone();
         btn_save.connect_clicked(move |_| {
             let collected = ui_c.borrow().clone();
-            if validate_actions(&collected).is_err() { return; }
-            match store_c.set_actions(&collected) {
+            if validate_categories(&collected).is_err() { return; }
+            match store_c.set_categories(&collected) {
                 Ok(()) => {
                     *live_c.borrow_mut() = collected.clone();
                     *disk_c.borrow_mut() = collected.clone();
@@ -495,9 +495,9 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
     // Cancel
     {
         let win_c = adw_win.clone();
-        let live_c = ctx.live_actions.clone();
-        let disk_c = ctx.disk_actions.clone();
-        let rebuild_c = ctx.rebuild_action_bar.clone();
+        let live_c = ctx.live_categories.clone();
+        let disk_c = ctx.disk_categories.clone();
+        let rebuild_c = ctx.rebuild_category_bar.clone();
         btn_cancel.connect_clicked(move |_| {
             *live_c.borrow_mut() = disk_c.borrow().clone();
             rebuild_c();
@@ -507,11 +507,11 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
 
     // Close without Save prompts Save/Discard/Cancel
     {
-        let ui_c = ui_actions.clone();
-        let live_c = ctx.live_actions.clone();
-        let disk_c = ctx.disk_actions.clone();
+        let ui_c = ui_categories.clone();
+        let live_c = ctx.live_categories.clone();
+        let disk_c = ctx.disk_categories.clone();
         let store_c = ctx.store.clone();
-        let rebuild_c = ctx.rebuild_action_bar.clone();
+        let rebuild_c = ctx.rebuild_category_bar.clone();
         adw_win.connect_close_request(move |w| {
             let collected = ui_c.borrow().clone();
             let disk = disk_c.borrow().clone();
@@ -520,7 +520,7 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
             }
             let alert = gtk4::AlertDialog::builder()
                 .message("Save changes?")
-                .detail("You have unsaved changes to Actions. Save, discard, or cancel?")
+                .detail("You have unsaved changes to Categories. Save, discard, or cancel?")
                 .buttons(vec!["Save", "Discard", "Cancel"])
                 .default_button(2)
                 .cancel_button(2)
@@ -535,7 +535,7 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
                 if let Ok(idx) = res {
                     match idx {
                         0 => {
-                            let _ = store_clone.set_actions(&collected_clone);
+                            let _ = store_clone.set_categories(&collected_clone);
                             *live_clone.borrow_mut() = collected_clone.clone();
                             *disk_clone.borrow_mut() = collected_clone.clone();
                             rebuild_clone();

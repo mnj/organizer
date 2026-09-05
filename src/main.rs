@@ -6,18 +6,18 @@ use gtk4::{
     gdk, gio, glib, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, Entry,
     Label, Orientation, Paned, Stack,
 };
-use organizer_lib::config::Action;
+use organizer_lib::config::Category;
 use organizer_lib::dedup::{compute_sha256, FileHash};
 use organizer_lib::mover::{classify_file, mover_error_message};
 use organizer_lib::preview::{ensure_sandbox_bwrap, is_glycin_supported, load_texture};
 use organizer_lib::queue::build_snapshot;
 use organizer_lib::store::Store;
 use organizer_lib::sweep::{
-    format_outcome, resolve_include_filter, resolve_reference_db_path,
-    run_sweep_with_disposition, Disposition, OutputFormat, SweepError,
+    format_outcome, resolve_category_filter, resolve_reference_db_path,
+    run_sweep_with_action, Action, OutputFormat, SweepError,
 };
 use organizer_lib::sweep_tui::{
-    action_options, count_hashes_per_action, run_include_tui, TuiOutcome,
+    category_options, count_hashes_per_category, run_categories_tui, TuiOutcome,
 };
 use organizer_lib::undo::{push_undo_capped, undo_classification, UndoEntry};
 use organizer_lib::video;
@@ -49,11 +49,11 @@ struct Args {
 enum Commands {
     /// Sweep a Target Folder against a reference Organizer Database.
     /// Scans a flat Supported-Format Snapshot, matches sha256, reports matched
-    /// path, hash, origin Action and triage time. Default is a read-only
-    /// dry-run report; `--on-match trash|perm-delete` with `--execute` applies
-    /// the disposition to matched Target Folder files only. The reference
+    /// path, hash, origin Category and triage time. Default is a read-only
+    /// dry-run report; `--action trash|perm-delete` with `--execute` applies
+    /// the Action to matched Target Folder files only. The reference
     /// database is never modified; unmatched files are untouched and unlisted,
-    /// and no Classification or moves to Action subfolders occur.
+    /// and no Classification or moves to Category subfolders occur.
     // Canonical name follows the domain vocabulary (Sweep); `cleanup` stays a
     // visible alias for the ADR 0007 contract (`organizer cleanup <TARGET>`).
     #[command(visible_alias = "cleanup")]
@@ -73,14 +73,14 @@ enum Commands {
         #[arg(long, value_enum, default_value = "table")]
         format: OutputFormat,
 
-        /// Only include hashes from these origin Actions (folder or display
+        /// Only match hashes from these origin Categories (folder or display
         /// name, repeatable and comma-separated, case-insensitive).
         /// Skips the interactive toggle screen; scripting escape hatch with
         /// identical semantics to TUI toggles.
-        #[arg(long, value_name = "ACTION")]
-        include: Vec<String>,
+        #[arg(long, value_name = "CATEGORY")]
+        categories: Vec<String>,
 
-        /// Skip the interactive toggle screen and match all origin Actions.
+        /// Skip the interactive toggle screen and match all origin Categories.
         /// For scripts; non-TTY runs already skip the TUI by default.
         #[arg(long)]
         non_interactive: bool,
@@ -89,21 +89,21 @@ enum Commands {
         /// only lists them, `trash` moves them to OS trash (restorable),
         /// `perm-delete` removes them irreversibly. Without `--execute` the
         /// run only reports and changes nothing, whatever is selected here.
-        #[arg(long = "on-match", value_enum, default_value = "report", alias = "disposition")]
-        on_match: Disposition,
+        #[arg(long, value_enum, default_value = "report")]
+        action: Action,
 
-        /// Actually apply `--on-match trash|perm-delete` to matched files.
+        /// Actually apply `--action trash|perm-delete` to matched files.
         /// Without it the run is a dry-run report and changes nothing.
         #[arg(long)]
         execute: bool,
     },
 }
 
-/// CLI Sweep entry point (#26 dry-run, #27 include filter, #28 apply).
-/// Resolves `--db` (defaulting to the current folder), then picks the include
-/// filter: `--include` wins (no TUI), else the fullscreen ratatui checklist
+/// CLI Sweep entry point (#26 dry-run, #27 category filter, #28 apply).
+/// Resolves `--db` (defaulting to the current folder), then picks the category
+/// filter: `--categories` wins (no TUI), else the fullscreen ratatui checklist
 /// when interactive, else default-all for scripts/non-TTY. Runs the Sweep
-/// with the `--on-match` disposition: without `--execute` every disposition
+/// with the `--action` Action: without `--execute` every Action
 /// only reports and changes nothing; with `--execute`, `trash` moves matched
 /// Target Folder files to OS trash (restorable) and `perm-delete` removes
 /// them irreversibly. Prints table/json plus the restorable/irreversible
@@ -112,19 +112,19 @@ enum Commands {
 /// 1 on error (missing database, bad target, hash/database failure, any
 /// per-file apply failure) or TUI cancellation. The reference database is
 /// never modified; unmatched files are untouched; no Classification or moves
-/// to Action subfolders occur.
+/// to Category subfolders occur.
 fn run_sweep_cli(
     target: PathBuf,
     db_raw: Option<PathBuf>,
-    include_raw: Vec<String>,
+    categories_raw: Vec<String>,
     non_interactive: bool,
     format: OutputFormat,
-    on_match: Disposition,
+    action: Action,
     execute: bool,
 ) -> i32 {
     use std::io::IsTerminal;
     let db_path = resolve_reference_db_path(db_raw.as_deref());
-    // Load reference Actions first: missing database errors clearly before any TUI.
+    // Load reference Categories first: missing database errors clearly before any TUI.
     let reference = match Store::open_reference_file(&db_path) {
         Ok(s) => s,
         Err(e) => {
@@ -142,30 +142,30 @@ fn run_sweep_cli(
             return 1;
         }
     };
-    let db_actions = match reference.actions() {
+    let db_categories = match reference.categories() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("organizer: database error: {e}");
             return 1;
         }
     };
-    // Filter selection: --include bypasses the TUI entirely.
-    let include_filter: Option<std::collections::HashSet<String>> =
-        if !include_raw.is_empty() {
-            Some(resolve_include_filter(&include_raw, &db_actions))
+    // Filter selection: --categories bypasses the TUI entirely.
+    let category_filter: Option<std::collections::HashSet<String>> =
+        if !categories_raw.is_empty() {
+            Some(resolve_category_filter(&categories_raw, &db_categories))
         } else if non_interactive {
             None
         } else if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-            if db_actions.is_empty() {
+            if db_categories.is_empty() {
                 None
             } else {
                 // Per-row known-hash badges, grouped from the reference union.
                 let counts = match reference.list_files() {
-                    Ok(rows) => count_hashes_per_action(&rows),
+                    Ok(rows) => count_hashes_per_category(&rows),
                     Err(_) => Default::default(),
                 };
-                let options = action_options(&db_actions, &counts);
-                match run_include_tui(&options, &target, &db_path) {
+                let options = category_options(&db_categories, &counts);
+                match run_categories_tui(&options, &target, &db_path) {
                     Ok(TuiOutcome::Confirmed(filter)) => filter,
                     Ok(TuiOutcome::Cancelled) => {
                         eprintln!("organizer: sweep cancelled — no files touched.");
@@ -183,7 +183,7 @@ fn run_sweep_cli(
             // Scripts / piped output: no prompt, default-all.
             None
         };
-    match run_sweep_with_disposition(&target, &db_path, include_filter.as_ref(), on_match, execute) {
+    match run_sweep_with_action(&target, &db_path, category_filter.as_ref(), action, execute) {
         Ok(outcome) => {
             print!("{}", format_outcome(&outcome, format));
             if outcome.errors.is_empty() {
@@ -288,7 +288,7 @@ fn css() -> CssProvider {
             border-radius: 4px; padding: 0 6px;
             font-size: 11px; font-weight: 700;
         }
-        .action-btn { padding: 8px 14px; font-weight: 600; }
+        .category-btn { padding: 8px 14px; font-weight: 600; }
         .error { color: #f38ba8; }
         entry.error { border-color: #f38ba8; }
         "#,
@@ -350,7 +350,7 @@ struct VideoTarget {
 fn set_busy_state(
     busy: &Rc<RefCell<bool>>,
     spinner: &gtk4::Spinner,
-    actions_row: &GtkBox,
+    categories_row: &GtkBox,
     btn_prev: &Button,
     btn_next: &Button,
     is_busy: bool,
@@ -358,7 +358,7 @@ fn set_busy_state(
     *busy.borrow_mut() = is_busy;
     spinner.set_visible(is_busy);
     spinner.set_spinning(is_busy);
-    let mut child = actions_row.first_child();
+    let mut child = categories_row.first_child();
     while let Some(c) = child {
         if let Some(btn) = c.downcast_ref::<Button>() {
             btn.set_sensitive(!is_busy);
@@ -585,15 +585,15 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
             return;
         }
     };
-    let initial_actions = match store.actions() {
+    let initial_categories = match store.categories() {
         Ok(a) => a,
         Err(e) => {
-            show_database_error_window(app, format!("Failed to load Actions: {e}"));
+            show_database_error_window(app, format!("Failed to load Categories: {e}"));
             return;
         }
     };
-    let live_actions: Rc<RefCell<Vec<Action>>> = Rc::new(RefCell::new(initial_actions.clone()));
-    let disk_actions: Rc<RefCell<Vec<Action>>> = Rc::new(RefCell::new(initial_actions));
+    let live_categories: Rc<RefCell<Vec<Category>>> = Rc::new(RefCell::new(initial_categories.clone()));
+    let disk_categories: Rc<RefCell<Vec<Category>>> = Rc::new(RefCell::new(initial_categories));
 
     let hash_cache: Arc<Mutex<HashMap<PathBuf, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let busy: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
@@ -753,11 +753,11 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
     nav_row.append(&btn_settings);
     action_bar.append(&nav_row);
 
-    // Centered Action buttons row
-    let actions_row = GtkBox::new(Orientation::Horizontal, 10);
-    actions_row.set_halign(gtk4::Align::Center);
-    actions_row.set_hexpand(true);
-    action_bar.append(&actions_row);
+    // Centered Category buttons row
+    let categories_row = GtkBox::new(Orientation::Horizontal, 10);
+    categories_row.set_halign(gtk4::Align::Center);
+    categories_row.set_hexpand(true);
+    action_bar.append(&categories_row);
 
     let hint = Label::new(None);
     hint.add_css_class("dim-label");
@@ -943,7 +943,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let hint_c = hint.clone();
         let source_c = source_folder.clone();
         let busy_c = busy.clone();
-        let actions_row_c = actions_row.clone();
+        let categories_row_c = categories_row.clone();
         let undo_c = undo_stack.clone();
         let redo_c = redo_stack.clone();
         let override_c = current_override.clone();
@@ -1033,8 +1033,8 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
             btn_prev_c.set_sensitive(i > 0 && !is_busy);
             btn_next_c.set_sensitive(i + 1 < len && !is_busy);
             refresh_undo_redo();
-            // disable action buttons while busy
-            let mut child = actions_row_c.first_child();
+            // disable category buttons while busy
+            let mut child = categories_row_c.first_child();
             while let Some(c) = child {
                 if let Some(btn) = c.downcast_ref::<Button>() {
                     btn.set_sensitive(!is_busy);
@@ -1150,26 +1150,26 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         Rc::new(move || hs.prehash_next())
     };
 
-    // Trigger move for a given Action — uses HashService + set_busy_state + background hash
-    let trigger_move: Rc<dyn Fn(Action)> = {
+    // Trigger move for a given Category — uses HashService + set_busy_state + background hash
+    let trigger_move: Rc<dyn Fn(Category)> = {
         let idx_c = idx.clone();
         let snap_c = snapshot_rc.clone();
         let store_c = store.clone();
         let hash_service_c = hash_service.clone();
         let busy_c = busy.clone();
         let spinner_c = spinner.clone();
-        let actions_row_c = actions_row.clone();
+        let categories_row_c = categories_row.clone();
         let btn_prev_c = btn_prev.clone();
         let btn_next_c = btn_next.clone();
         let show_toast_c = show_toast.clone();
         let update_ui_c = update_ui.clone();
         let prehash_c = prehash_next.clone();
-        let live_actions_c = live_actions.clone();
+        let live_categories_c = live_categories.clone();
         let undo_stack_c = undo_stack.clone();
         let redo_stack_c = redo_stack.clone();
         let override_c = current_override.clone();
         let stop_video_c = stop_video.clone();
-        Rc::new(move |action: Action| {
+        Rc::new(move |category: Category| {
             if guard_busy(&busy_c) {
                 return;
             }
@@ -1195,11 +1195,11 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
             // while PLAYING would otherwise post a late bus Error that
             // overwrites the success toast/placeholder.
             stop_video_c();
-            set_busy_state(&busy_c, &spinner_c, &actions_row_c, &btn_prev_c, &btn_next_c, true);
+            set_busy_state(&busy_c, &spinner_c, &categories_row_c, &btn_prev_c, &btn_next_c, true);
             update_ui_c();
 
-            let folder_name = action.folder_name.clone();
-            let display_name = action.display_name.clone();
+            let folder_name = category.folder_name.clone();
+            let display_name = category.display_name.clone();
             let file_name = current.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
 
             // Shared continuation for move after hash is ready (sync or async)
@@ -1207,10 +1207,10 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 let idx_c = idx_c.clone();
                 let snap_c = snap_c.clone();
                 let store_c = store_c.clone();
-                let live_actions_c = live_actions_c.clone();
+                let live_categories_c = live_categories_c.clone();
                 let busy_c = busy_c.clone();
                 let spinner_c = spinner_c.clone();
-                let actions_row_c = actions_row_c.clone();
+                let categories_row_c = categories_row_c.clone();
                 let btn_prev_c = btn_prev_c.clone();
                 let btn_next_c = btn_next_c.clone();
                 let show_toast_c = show_toast_c.clone();
@@ -1229,7 +1229,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                         Err(e) => {
                             tracing::warn!("invalid hash for {}: {}", file_name, e);
                             show_toast_c(format!("Failed to hash {}: invalid hash", file_name));
-                            set_busy_state(&busy_c, &spinner_c, &actions_row_c, &btn_prev_c, &btn_next_c, false);
+                            set_busy_state(&busy_c, &spinner_c, &categories_row_c, &btn_prev_c, &btn_next_c, false);
                             update_ui_c();
                             return;
                         }
@@ -1254,20 +1254,20 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                                 // Single origin lookup post-move for the toast.
                                 let origin_folder = store_c.origin(&hash_lower).unwrap_or(None);
                                 let origin_display = origin_folder.as_ref().and_then(|folder| {
-                                    live_actions_c.borrow().iter().find(|a| &a.folder_name == folder).map(|a| a.display_name.clone())
+                                    live_categories_c.borrow().iter().find(|c| &c.folder_name == folder).map(|c| c.display_name.clone())
                                 }).or(origin_folder).unwrap_or_else(|| display_name.clone());
                                 show_toast_c(format!("Duplicate — already in ‘{}’ — moved to duplicate/{}", origin_display, dest.file_name().and_then(|n| n.to_str()).unwrap_or(&file_name)));
                             } else {
                                 show_toast_c(format!("Moved {} → {}/{} ", file_name, display_name, dest.file_name().and_then(|n| n.to_str()).unwrap_or("")));
                             }
                             advance_idx(&idx_c, snap_c.len());
-                            set_busy_state(&busy_c, &spinner_c, &actions_row_c, &btn_prev_c, &btn_next_c, false);
+                            set_busy_state(&busy_c, &spinner_c, &categories_row_c, &btn_prev_c, &btn_next_c, false);
                             update_ui_c();
                             prehash_c();
                         }
                         Err(e) => {
                             show_toast_c(mover_error_message(&e, &file_name));
-                            set_busy_state(&busy_c, &spinner_c, &actions_row_c, &btn_prev_c, &btn_next_c, false);
+                            set_busy_state(&busy_c, &spinner_c, &categories_row_c, &btn_prev_c, &btn_next_c, false);
                             update_ui_c();
                         }
                     }
@@ -1287,7 +1287,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 let show_toast_err = show_toast_c.clone();
                 let busy_c2 = busy_c.clone();
                 let spinner_c2 = spinner_c.clone();
-                let actions_row_c2 = actions_row_c.clone();
+                let categories_row_c2 = categories_row_c.clone();
                 let btn_prev_c2 = btn_prev_c.clone();
                 let btn_next_c2 = btn_next_c.clone();
                 let update_ui_c2 = update_ui_c.clone();
@@ -1302,7 +1302,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                         Ok(Err(err_msg)) => {
                             tracing::warn!("hash failed for {}: {}", file_name_err, err_msg);
                             show_toast_err(format!("Failed to hash {}: {}", file_name_err, err_msg));
-                            set_busy_state(&busy_c2, &spinner_c2, &actions_row_c2, &btn_prev_c2, &btn_next_c2, false);
+                            set_busy_state(&busy_c2, &spinner_c2, &categories_row_c2, &btn_prev_c2, &btn_next_c2, false);
                             update_ui_c2();
                             glib::ControlFlow::Break
                         }
@@ -1458,44 +1458,44 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         })
     };
 
-    // Rebuild Action Bar buttons from live_actions (real mover)
-    let rebuild_action_bar: Rc<dyn Fn()> = {
-        let actions_row_c = actions_row.clone();
-        let live_c = live_actions.clone();
+    // Rebuild Category buttons in the Action Bar from live_categories (real mover)
+    let rebuild_category_bar: Rc<dyn Fn()> = {
+        let categories_row_c = categories_row.clone();
+        let live_c = live_categories.clone();
         let trigger_c = trigger_move.clone();
         Rc::new(move || {
-            while let Some(child) = actions_row_c.first_child() {
-                actions_row_c.remove(&child);
+            while let Some(child) = categories_row_c.first_child() {
+                categories_row_c.remove(&child);
             }
-            let actions = live_c.borrow().clone();
-            for act in actions.iter() {
+            let categories = live_c.borrow().clone();
+            for cat in categories.iter() {
                 let btn = Button::new();
-                btn.add_css_class("action-btn");
-                if act.display_name == "Keep" {
+                btn.add_css_class("category-btn");
+                if cat.display_name == "Keep" {
                     btn.add_css_class("suggested-action");
-                } else if act.display_name == "Reject" {
+                } else if cat.display_name == "Reject" {
                     btn.add_css_class("destructive-action");
                 }
                 let inner = GtkBox::new(Orientation::Horizontal, 6);
                 inner.set_halign(gtk4::Align::Center);
-                let lbl = Label::new(Some(&act.display_name));
-                let badge = Label::new(Some(&format!("[{}]", act.shortcut)));
+                let lbl = Label::new(Some(&cat.display_name));
+                let badge = Label::new(Some(&format!("[{}]", cat.shortcut)));
                 badge.add_css_class("shortcut-badge");
                 inner.append(&lbl);
                 inner.append(&badge);
                 btn.set_child(Some(&inner));
-                btn.set_tooltip_text(Some(&format!("{} — {} or Ctrl+{}", act.display_name, act.shortcut, act.shortcut)));
-                let act_clone = act.clone();
+                btn.set_tooltip_text(Some(&format!("{} — {} or Ctrl+{}", cat.display_name, cat.shortcut, cat.shortcut)));
+                let cat_clone = cat.clone();
                 let trig = trigger_c.clone();
                 btn.connect_clicked(move |_| {
-                    trig(act_clone.clone());
+                    trig(cat_clone.clone());
                 });
-                actions_row_c.append(&btn);
+                categories_row_c.append(&btn);
             }
         })
     };
     // Initial build
-    rebuild_action_bar();
+    rebuild_category_bar();
 
     // Empty button rebuild
     {
@@ -1584,11 +1584,11 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
     // Edit → Preferences all open the same dialog from the same context.
     let show_settings: Rc<dyn Fn(&ApplicationWindow)> = {
         let store_c = store.clone();
-        let live_c = live_actions.clone();
-        let disk_c = disk_actions.clone();
-        let rebuild_c = rebuild_action_bar.clone();
+        let live_c = live_categories.clone();
+        let disk_c = disk_categories.clone();
+        let rebuild_c = rebuild_category_bar.clone();
         Rc::new(move |parent: &ApplicationWindow| {
-            open_settings(parent, SettingsContext { store: store_c.clone(), live_actions: live_c.clone(), disk_actions: disk_c.clone(), rebuild_action_bar: rebuild_c.clone() });
+            open_settings(parent, SettingsContext { store: store_c.clone(), live_categories: live_c.clone(), disk_categories: disk_c.clone(), rebuild_category_bar: rebuild_c.clone() });
         })
     };
 
@@ -1607,7 +1607,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let snap_k = snapshot_rc.clone();
         let btn_next_k = btn_next.clone();
         let btn_prev_k = btn_prev.clone();
-        let live_k = live_actions.clone();
+        let live_k = live_categories.clone();
         let window_weak = window.downgrade();
         let show_settings_k = show_settings.clone();
         let trigger_k = trigger_move.clone();
@@ -1681,7 +1681,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 _ => {}
             }
 
-            // Action shortcuts 1-9
+            // Category shortcuts 1-9
             let digit = match key {
                 gdk::Key::_1 | gdk::Key::KP_1 => Some('1'),
                 gdk::Key::_2 | gdk::Key::KP_2 => Some('2'),
@@ -1703,13 +1703,13 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                         }
                     }
                 }
-                // Find action with this shortcut in live_actions
-                let actions = live_k.borrow();
-                if let Some(act) = actions.iter().find(|a| a.shortcut == d.to_string()).cloned() {
-                    drop(actions);
+                // Find category with this shortcut in live_categories
+                let categories = live_k.borrow();
+                if let Some(cat) = categories.iter().find(|c| c.shortcut == d.to_string()).cloned() {
+                    drop(categories);
                     // trigger real move
                     let _ = &snap_k; // keep alive
-                    trigger_k(act);
+                    trigger_k(cat);
                     return glib::Propagation::Stop;
                 } else {
                     return glib::Propagation::Proceed;
@@ -1771,8 +1771,8 @@ fn main() -> glib::ExitCode {
     if args.self_test_sandbox {
         std::process::exit(run_self_test_sandbox());
     }
-    if let Some(Commands::Sweep { target, db, format, include, non_interactive, on_match, execute }) = args.command {
-        std::process::exit(run_sweep_cli(target, db, include, non_interactive, format, on_match, execute));
+    if let Some(Commands::Sweep { target, db, format, categories, non_interactive, action, execute }) = args.command {
+        std::process::exit(run_sweep_cli(target, db, categories, non_interactive, format, action, execute));
     }
     let app = Application::builder()
         .application_id("com.example.organizer")

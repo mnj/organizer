@@ -10,8 +10,8 @@ pub struct UndoEntry {
     pub src_name: String,    // e.g. "foo.jpg"
     pub dest_path: PathBuf,  // absolute subfolder destination that file was moved to
     pub was_duplicate: bool, // true if routed to duplicate/ subfolder
-    pub folder_name: String, // Action folder_name for the database row
-    pub display_name: String, // Action display_name for toast
+    pub folder_name: String, // Category folder_name for the database row
+    pub display_name: String, // Category display_name for toast
 }
 
 impl UndoEntry {
@@ -120,7 +120,7 @@ fn split_filename(name: &str) -> (&str, Option<&str>) {
 
 /// Undo a Classification stored in the Organizer Database.
 ///
-/// Moves the file back from its Action/`duplicate/` destination to the Source
+/// Moves the file back from its Category/`duplicate/` destination to the Source
 /// Folder (suffixing `_undo_1` on clash) and, for non-duplicates, reverts the
 /// database row via `Store::remove`. Duplicate undos touch no rows. Never
 /// reads or writes legacy `*.txt` logs (#25).
@@ -331,7 +331,7 @@ mod tests {
             let hash = hash_of(&foo);
             let outcome = classify_file(&store, &foo, "keep", &hash).unwrap();
             let dest = outcome.into_dest();
-            // Remove the Action subfolder to simulate a vanished destination parent.
+            // Remove the Category subfolder to simulate a vanished destination parent.
             fs::remove_dir_all(source.join("keep")).unwrap();
             assert!(!dest.exists());
             // Undo now fails at the rename step (dest missing), row stays.

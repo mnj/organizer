@@ -1,29 +1,29 @@
-//! Beautiful fullscreen TUI checklist for Sweep include filtering (#27).
+//! Beautiful fullscreen TUI checklist for Sweep category filtering (#27).
 //!
 //! Framework: [`ratatui`] with the crossterm backend — no hand-rolled ANSI.
 //! The pure [`ToggleModel`] below holds all toggle semantics and is fully
-//! testable without a terminal; [`run_include_tui`] is a thin ratatui shell
+//! testable without a terminal; [`run_categories_tui`] is a thin ratatui shell
 //! over it (all ON by default, Space/click toggles, Enter confirms).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::config::Action;
+use crate::config::Category;
 
-/// One Action row in the toggle screen, with its known-hash count for display.
+/// One Category row in the toggle screen, with its known-hash count for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActionOption {
-    pub action: Action,
+pub struct CategoryOption {
+    pub category: Category,
     pub hash_count: usize,
 }
 
-/// Build display options from database Actions plus per-Action known-hash counts.
+/// Build display options from database Categories plus per-Category known-hash counts.
 /// `counts` keys are folder names (any case); missing entries count as zero.
-/// Order follows `actions`.
-pub fn action_options(
-    actions: &[Action],
+/// Order follows `categories`.
+pub fn category_options(
+    categories: &[Category],
     counts: &HashMap<String, usize>,
-) -> Vec<ActionOption> {
+) -> Vec<CategoryOption> {
     // Normalize count keys once so callers may pass any case.
     let normalized: HashMap<String, usize> = counts
         .iter()
@@ -32,67 +32,67 @@ pub fn action_options(
             *acc.entry(k).or_insert(0) += v;
             acc
         });
-    actions
+    categories
         .iter()
-        .map(|a| {
+        .map(|c| {
             let count = normalized
-                .get(&a.folder_name.to_ascii_lowercase())
+                .get(&c.folder_name.to_ascii_lowercase())
                 .copied()
                 .unwrap_or(0);
-            ActionOption {
-                action: a.clone(),
+            CategoryOption {
+                category: c.clone(),
                 hash_count: count,
             }
         })
         .collect()
 }
 
-/// Count known hashes per origin Action folder (lower-cased) from file rows.
+/// Count known hashes per origin Category folder (lower-cased) from file rows.
 /// Powers the per-row "N known" badges in the TUI.
-pub fn count_hashes_per_action(files: &[crate::store::FileRecord]) -> HashMap<String, usize> {
+pub fn count_hashes_per_category(files: &[crate::store::FileRecord]) -> HashMap<String, usize> {
     let mut out = HashMap::new();
     for f in files {
         *out
-            .entry(f.action_folder.to_ascii_lowercase())
+            .entry(f.category_folder.to_ascii_lowercase())
             .or_insert(0) += 1;
     }
     out
 }
 
-/// Pure toggle model: which origin Actions count as Sweep matches.
+/// Pure toggle model: which origin Categories count as Sweep matches.
 /// All ON by default; toggling off excludes that origin's hashes.
 /// No terminal here — fully unit-testable at the seam.
 #[derive(Debug, Clone)]
 pub struct ToggleModel {
-    actions: Vec<Action>,
+    categories: Vec<Category>,
     enabled: Vec<bool>,
     cursor: usize,
 }
 
 impl ToggleModel {
-    /// All Actions enabled, cursor on the first row.
-    pub fn new(actions: &[Action]) -> Self {
+    /// All Categories enabled, cursor on the first row.
+    pub fn new(categories: &[Category]) -> Self {
         Self {
-            actions: actions.to_vec(),
-            enabled: vec![true; actions.len()],
+            categories: categories.to_vec(),
+            enabled: vec![true; categories.len()],
             cursor: 0,
         }
     }
 
     pub fn len(&self) -> usize {
-        self.actions.len()
+        self.categories.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.actions.is_empty()
+        self.categories.is_empty()
     }
 
     pub fn cursor(&self) -> usize {
         self.cursor
     }
 
-    pub fn actions(&self) -> &[Action] {
-        &self.actions
+    pub fn categories(&self) -> &[Category] {
+        &self.categories
     }
 
     pub fn is_enabled(&self, index: usize) -> bool {
@@ -122,25 +122,25 @@ impl ToggleModel {
     }
 
     pub fn move_up(&mut self) {
-        if self.actions.is_empty() {
+        if self.categories.is_empty() {
             return;
         }
         self.cursor = if self.cursor == 0 {
-            self.actions.len() - 1
+            self.categories.len() - 1
         } else {
             self.cursor - 1
         };
     }
 
     pub fn move_down(&mut self) {
-        if self.actions.is_empty() {
+        if self.categories.is_empty() {
             return;
         }
-        self.cursor = (self.cursor + 1) % self.actions.len();
+        self.cursor = (self.cursor + 1) % self.categories.len();
     }
 
     pub fn move_to(&mut self, index: usize) {
-        if index < self.actions.len() {
+        if index < self.categories.len() {
             self.cursor = index;
         }
     }
@@ -157,8 +157,8 @@ impl ToggleModel {
         }
     }
 
-    /// Confirmed selection as a Sweep include filter:
-    /// - `None` when every Action is ON (default: match all origins).
+    /// Confirmed selection as a Sweep category filter:
+    /// - `None` when every Category is ON (default: match all origins).
     /// - `Some(set)` otherwise (folder lower-cased allow-list; possibly empty
     ///   for "match nothing"). Unknown-hash files stay untouched either way.
     pub fn to_filter(&self) -> Option<HashSet<String>> {
@@ -166,9 +166,9 @@ impl ToggleModel {
             return None;
         }
         let mut out = HashSet::new();
-        for (a, &on) in self.actions.iter().zip(self.enabled.iter()) {
+        for (c, &on) in self.categories.iter().zip(self.enabled.iter()) {
             if on {
-                out.insert(a.folder_name.to_ascii_lowercase());
+                out.insert(c.folder_name.to_ascii_lowercase());
             }
         }
         Some(out)
@@ -186,13 +186,13 @@ pub enum TuiOutcome {
 
 /// Run the beautiful fullscreen checklist with ratatui (crossterm backend).
 ///
-/// - Lists every origin Action, all ON by default.
+/// - Lists every origin Category, all ON by default.
 /// - Space/x toggles the highlighted row, click toggles any row, `a` = all,
 ///   `n` = none, `1`-`9` toggle by position, Enter confirms, Esc/q cancels.
-/// - Returns the confirmed include filter with identical semantics to
-///   `--include` (`None` = all origins).
-pub fn run_include_tui(
-    options: &[ActionOption],
+/// - Returns the confirmed category filter with identical semantics to
+///   `--categories` (`None` = all origins).
+pub fn run_categories_tui(
+    options: &[CategoryOption],
     target: &Path,
     db_path: &Path,
 ) -> std::io::Result<TuiOutcome> {
@@ -209,11 +209,11 @@ pub fn run_include_tui(
     use ratatui::backend::CrosstermBackend;
     use std::io::{self, Stdout};
 
-    let actions: Vec<Action> = options.iter().map(|o| o.action.clone()).collect();
-    if actions.is_empty() {
+    let categories: Vec<Category> = options.iter().map(|o| o.category.clone()).collect();
+    if categories.is_empty() {
         return Ok(TuiOutcome::Confirmed(None));
     }
-    let mut model = ToggleModel::new(&actions);
+    let mut model = ToggleModel::new(&categories);
 
     enable_raw_mode()?;
     let mut stdout: Stdout = io::stdout();
@@ -259,7 +259,7 @@ pub fn run_include_tui(
                             Style::default().fg(accent).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
-                            "— choose origin Actions ",
+                            "— choose origin Categories ",
                             Style::default().fg(Color::White),
                         ),
                     ]));
@@ -272,7 +272,7 @@ pub fn run_include_tui(
                             Style::default().fg(green).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
-                            "· only hashes from enabled Actions count as matches",
+                            "· only hashes from enabled Categories count as matches",
                             Style::default().fg(dim),
                         ),
                     ])),
@@ -297,7 +297,7 @@ pub fn run_include_tui(
                 );
                 frame.render_widget(info, chunks[1]);
 
-                // Action rows.
+                // Category rows.
                 let mut items: Vec<ListItem> = Vec::with_capacity(options.len());
                 for (i, opt) in options.iter().enumerate() {
                     let on = model.is_enabled(i);
@@ -330,13 +330,13 @@ pub fn run_include_tui(
                                 format!("{checkbox} "),
                                 checkbox_style,
                             ),
-                            Span::styled(opt.action.display_name.clone(), name_style),
+                            Span::styled(opt.category.display_name.clone(), name_style),
                             Span::styled(
-                                format!("  ({})", opt.action.folder_name),
+                                format!("  ({})", opt.category.folder_name),
                                 Style::default().fg(dim),
                             ),
                             Span::styled(
-                                format!("  [{}]", opt.action.shortcut),
+                                format!("  [{}]", opt.category.shortcut),
                                 Style::default().fg(accent),
                             ),
                             Span::styled(
@@ -349,7 +349,7 @@ pub fn run_include_tui(
                 let list_block = Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(accent))
-                    .title(format!(" Origin Actions ({} rows) ", options.len()));
+                    .title(format!(" Category toggles ({} rows) ", options.len()));
                 let list = List::new(items)
                     .block(list_block)
                     .highlight_style(
@@ -410,17 +410,17 @@ pub fn run_include_tui(
                                         },
                                     ),
                                     Span::styled(
-                                        opt.action.display_name.clone(),
+                                        opt.category.display_name.clone(),
                                         Style::default()
                                             .fg(Color::White)
                                             .add_modifier(Modifier::BOLD),
                                     ),
                                     Span::styled(
-                                        format!("  ({})", opt.action.folder_name),
+                                        format!("  ({})", opt.category.folder_name),
                                         Style::default().fg(dim),
                                     ),
                                     Span::styled(
-                                        format!("  [{}]", opt.action.shortcut),
+                                        format!("  [{}]", opt.category.shortcut),
                                         Style::default().fg(accent),
                                     ),
                                 ])),
@@ -533,19 +533,19 @@ pub fn run_include_tui(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Action;
+    use crate::config::Category;
 
-    fn sample_actions() -> Vec<Action> {
+    fn sample_categories() -> Vec<Category> {
         vec![
-            Action { display_name: "Keep".into(), folder_name: "keep".into(), shortcut: "1".into() },
-            Action { display_name: "Maybe".into(), folder_name: "maybe".into(), shortcut: "2".into() },
-            Action { display_name: "Reject".into(), folder_name: "reject".into(), shortcut: "3".into() },
+            Category { display_name: "Keep".into(), folder_name: "keep".into(), shortcut: "1".into() },
+            Category { display_name: "Maybe".into(), folder_name: "maybe".into(), shortcut: "2".into() },
+            Category { display_name: "Reject".into(), folder_name: "reject".into(), shortcut: "3".into() },
         ]
     }
 
     #[test]
     fn new_model_has_all_on_and_none_filter() {
-        let model = ToggleModel::new(&sample_actions());
+        let model = ToggleModel::new(&sample_categories());
         assert_eq!(model.len(), 3);
         assert_eq!(model.cursor(), 0);
         assert_eq!(model.enabled_count(), 3);
@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn toggling_off_excludes_and_toggling_on_reincludes() {
-        let mut model = ToggleModel::new(&sample_actions());
+        let mut model = ToggleModel::new(&sample_categories());
         // Cursor starts on row 0 (keep): toggle it off.
         model.toggle_cursor();
         assert!(!model.is_enabled(0));
@@ -573,7 +573,7 @@ mod tests {
 
     #[test]
     fn cursor_movement_and_index_toggle_drive_confirmed_selection() {
-        let mut model = ToggleModel::new(&sample_actions());
+        let mut model = ToggleModel::new(&sample_categories());
         model.move_down();
         assert_eq!(model.cursor(), 1);
         model.toggle_cursor(); // maybe off
@@ -592,7 +592,7 @@ mod tests {
 
     #[test]
     fn select_none_matches_nothing_select_all_restores_default() {
-        let mut model = ToggleModel::new(&sample_actions());
+        let mut model = ToggleModel::new(&sample_categories());
         model.select_none();
         assert_eq!(model.enabled_count(), 0);
         assert_eq!(model.to_filter(), Some(HashSet::new()));
@@ -603,7 +603,7 @@ mod tests {
 
     #[test]
     fn move_wraps_around_for_fast_keyboard_triage() {
-        let mut model = ToggleModel::new(&sample_actions());
+        let mut model = ToggleModel::new(&sample_categories());
         model.move_up(); // wrap from 0 to last
         assert_eq!(model.cursor(), 2);
         model.move_down(); // wrap back to 0
@@ -611,13 +611,13 @@ mod tests {
     }
 
     #[test]
-    fn action_options_carry_counts_case_insensitively() {
-        let actions = sample_actions();
+    fn category_options_carry_counts_case_insensitively() {
+        let categories = sample_categories();
         let counts = HashMap::from([
             ("KEEP".to_string(), 4usize),
             ("maybe".to_string(), 1usize),
         ]);
-        let opts = action_options(&actions, &counts);
+        let opts = category_options(&categories, &counts);
         assert_eq!(opts.len(), 3);
         assert_eq!(opts[0].hash_count, 4);
         assert_eq!(opts[1].hash_count, 1);
@@ -640,22 +640,22 @@ mod tests {
             )
             .unwrap(),
         ];
-        let counts = count_hashes_per_action(&files);
+        let counts = count_hashes_per_category(&files);
         assert_eq!(counts.get("keep"), Some(&2));
         assert_eq!(counts.get("maybe"), Some(&1));
     }
 
     #[test]
-    fn toggle_model_filter_matches_include_flag_resolution() {
-        use crate::sweep::resolve_include_filter;
-        let actions = sample_actions();
+    fn toggle_model_filter_matches_categories_flag_resolution() {
+        use crate::sweep::resolve_category_filter;
+        let categories = sample_categories();
         // TUI: keep only row 0 (toggle the other two off).
-        let mut model = ToggleModel::new(&actions);
+        let mut model = ToggleModel::new(&categories);
         model.toggle_index(1);
         model.toggle_index(2);
         let via_toggle = model.to_filter().expect("must be Some");
-        // Flag: --include keep resolves to the same folder allow-list.
-        let via_flag = resolve_include_filter(&["keep".to_string()], &actions);
-        assert_eq!(via_toggle, via_flag);
+        // Flag: --categories keep resolves to the same folder allow-list.
+        let via_arg = resolve_category_filter(&["keep".to_string()], &categories);
+        assert_eq!(via_toggle, via_arg);
     }
 }

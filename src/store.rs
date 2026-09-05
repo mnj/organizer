@@ -1,4 +1,4 @@
-use crate::config::{default_actions, validate_actions, Action, ValidationError};
+use crate::config::{default_categories, validate_categories, Category, ValidationError};
 use crate::dedup::{is_valid_hash, FileHash};
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 use std::collections::HashSet;
@@ -62,7 +62,7 @@ impl std::fmt::Display for StoreError {
             StoreError::Io(e) => write!(f, "io error: {e}"),
             StoreError::Validation(errs) => {
                 let msg = errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
-                write!(f, "invalid actions: {msg}")
+                write!(f, "invalid categories: {msg}")
             }
             StoreError::InvalidHash(h) => write!(f, "invalid hash: {h}"),
             StoreError::InvalidPath(p) => write!(f, "invalid relative path: {p}"),
@@ -95,7 +95,7 @@ pub struct FileRecord {
     pub hash: String,
     pub original_rel: String,
     pub final_rel: String,
-    pub action_folder: String,
+    pub category_folder: String,
     pub size: i64,
     pub mtime: i64,
     pub triaged_at: i64,
@@ -107,7 +107,7 @@ impl FileRecord {
         hash: &str,
         original_rel: &str,
         final_rel: &str,
-        action_folder: &str,
+        category_folder: &str,
         size: i64,
         mtime: i64,
         triaged_at: i64,
@@ -129,14 +129,14 @@ impl FileRecord {
                 return Err(StoreError::InvalidPath(p.to_string()));
             }
         }
-        if action_folder.is_empty() {
-            return Err(StoreError::InvalidPath("action folder empty".into()));
+        if category_folder.is_empty() {
+            return Err(StoreError::InvalidPath("category folder empty".into()));
         }
         Ok(Self {
             hash: validated.to_string(),
             original_rel: original_rel.to_string(),
             final_rel: final_rel.to_string(),
-            action_folder: action_folder.to_string(),
+            category_folder: category_folder.to_string(),
             size,
             mtime,
             triaged_at: triaged_at,
@@ -221,7 +221,7 @@ impl Store {
     /// (resolved by `sweep::resolve_reference_db_path` from `--db` or its default).
     /// Errors clearly when the file is missing so callers can hint `--db`.
     /// The handle is read-only at the SQLite level (`SQLITE_OPEN_READ_ONLY`
-    /// on every connection): Sweep never calls `insert_file`/`set_actions`/
+    /// on every connection): Sweep never calls `insert_file`/`set_categories`/
     /// `remove`, and the open itself cannot create `-wal`/`-shm` sidecars.
     pub fn open_reference_file(db_path: &Path) -> Result<Self, StoreError> {
         if !db_path.is_file() {
@@ -288,12 +288,13 @@ impl Store {
     }
 
     fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {
+        Self::migrate_legacy_action_schema(conn)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS actions (
+            CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 display_name TEXT NOT NULL UNIQUE COLLATE NOCASE,
                 folder_name TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -304,15 +305,61 @@ impl Store {
                 hash TEXT PRIMARY KEY CHECK (length(hash) = 64 AND hash = lower(hash)),
                 original_rel TEXT NOT NULL,
                 final_rel TEXT NOT NULL,
-                action_folder TEXT NOT NULL,
+                category_folder TEXT NOT NULL,
                 size INTEGER NOT NULL,
                 mtime INTEGER NOT NULL,
                 triaged_at INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_files_action ON files(action_folder);
+            CREATE INDEX IF NOT EXISTS idx_files_category ON files(category_folder);
             INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1');
             INSERT OR IGNORE INTO meta (key, value) VALUES ('config_version', '1');",
         )?;
+        Ok(())
+    }
+
+    /// Migrate pre-rename databases to the Category vocabulary without losing rows.
+    /// Older opens created an `actions` table and `files.action_folder`; the rename
+    /// carries them to `categories` / `category_folder` (copying rows when the new
+    /// table already exists but is empty). Fresh databases skip this entirely.
+    fn migrate_legacy_action_schema(conn: &Connection) -> Result<(), StoreError> {
+        let table_exists = |name: &str| -> Result<bool, StoreError> {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1",
+                params![name],
+                |r| r.get(0),
+            )?;
+            Ok(n > 0)
+        };
+        if table_exists("actions")? {
+            if !table_exists("categories")? {
+                conn.execute_batch("ALTER TABLE actions RENAME TO categories;")?;
+            } else {
+                let legacy_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM actions", [], |r| r.get(0))?;
+                let current_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM categories", [], |r| r.get(0))?;
+                if legacy_count > 0 && current_count == 0 {
+                    conn.execute_batch(
+                        "INSERT INTO categories (display_name, folder_name, shortcut, position) SELECT display_name, folder_name, shortcut, position FROM actions;",
+                    )?;
+                }
+                conn.execute_batch("DROP TABLE actions;")?;
+            }
+        }
+        if table_exists("files")? {
+            let mut stmt = conn.prepare("PRAGMA table_info(files)")?;
+            let cols: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<_, _>>()?;
+            if cols.iter().any(|c| c == "action_folder")
+                && !cols.iter().any(|c| c == "category_folder")
+            {
+                conn.execute_batch(
+                    "ALTER TABLE files RENAME COLUMN action_folder TO category_folder;",
+                )?;
+            }
+        }
+        conn.execute_batch("DROP INDEX IF EXISTS idx_files_action;")?;
         Ok(())
     }
 
@@ -333,17 +380,17 @@ impl Store {
         // Acquire the write lock first so two fresh openers serialize:
         // the second blocks on BEGIN IMMEDIATE, then sees COUNT > 0.
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let count: i64 = tx.query_row("SELECT COUNT(*) FROM actions", [], |r| r.get(0))?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM categories", [], |r| r.get(0))?;
         if count == 0 {
-            let defaults = default_actions();
+            let defaults = default_categories();
             // Defaults are known-valid; validation here guards against regressions.
-            validate_actions(&defaults).map_err(StoreError::Validation)?;
-            for (pos, a) in defaults.iter().enumerate() {
+            validate_categories(&defaults).map_err(StoreError::Validation)?;
+            for (pos, c) in defaults.iter().enumerate() {
                 // OR IGNORE keeps a lost race (both saw 0 before locks existed)
                 // from corrupting: second opener becomes a no-op reopen.
                 tx.execute(
-                    "INSERT OR IGNORE INTO actions (display_name, folder_name, shortcut, position) VALUES (?1, ?2, ?3, ?4)",
-                    params![a.display_name, a.folder_name, a.shortcut, pos as i64],
+                    "INSERT OR IGNORE INTO categories (display_name, folder_name, shortcut, position) VALUES (?1, ?2, ?3, ?4)",
+                    params![c.display_name, c.folder_name, c.shortcut, pos as i64],
                 )?;
             }
         }
@@ -351,17 +398,17 @@ impl Store {
         Ok(())
     }
 
-    fn insert_action_row(
+    fn insert_category_row(
         tx: &rusqlite::Transaction<'_>,
-        action: &Action,
+        category: &Category,
         position: usize,
     ) -> Result<(), StoreError> {
         tx.execute(
-            "INSERT INTO actions (display_name, folder_name, shortcut, position) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO categories (display_name, folder_name, shortcut, position) VALUES (?1, ?2, ?3, ?4)",
             params![
-                action.display_name,
-                action.folder_name,
-                action.shortcut,
+                category.display_name,
+                category.folder_name,
+                category.shortcut,
                 position as i64
             ],
         )?;
@@ -373,21 +420,21 @@ impl Store {
             hash: row.get(0)?,
             original_rel: row.get(1)?,
             final_rel: row.get(2)?,
-            action_folder: row.get(3)?,
+            category_folder: row.get(3)?,
             size: row.get(4)?,
             mtime: row.get(5)?,
             triaged_at: row.get(6)?,
         })
     }
 
-    /// Current Actions ordered by position.
-    pub fn actions(&self) -> Result<Vec<Action>, StoreError> {
+    /// Current Categories ordered by position.
+    pub fn categories(&self) -> Result<Vec<Category>, StoreError> {
         let conn = self.connection()?;
         let mut stmt = conn.prepare(
-            "SELECT display_name, folder_name, shortcut FROM actions ORDER BY position ASC, id ASC",
+            "SELECT display_name, folder_name, shortcut FROM categories ORDER BY position ASC, id ASC",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok(Action {
+            Ok(Category {
                 display_name: row.get(0)?,
                 folder_name: row.get(1)?,
                 shortcut: row.get(2)?,
@@ -400,16 +447,16 @@ impl Store {
         Ok(out)
     }
 
-    /// Replace all Actions atomically after running existing validation.
+    /// Replace all Categories atomically after running existing validation.
     /// On validation failure the database is left unchanged.
-    pub fn set_actions(&self, actions: &[Action]) -> Result<(), StoreError> {
-        validate_actions(actions).map_err(StoreError::Validation)?;
+    pub fn set_categories(&self, categories: &[Category]) -> Result<(), StoreError> {
+        validate_categories(categories).map_err(StoreError::Validation)?;
         retry_on_busy(|| {
             let mut conn = self.connection()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute("DELETE FROM actions", [])?;
-            for (pos, a) in actions.iter().enumerate() {
-                Self::insert_action_row(&tx, a, pos)?;
+            tx.execute("DELETE FROM categories", [])?;
+            for (pos, c) in categories.iter().enumerate() {
+                Self::insert_category_row(&tx, c, pos)?;
             }
             tx.commit()?;
             Ok(())
@@ -429,7 +476,7 @@ impl Store {
         }
         let conn = self.connection()?;
         let mut stmt = conn.prepare(
-            "SELECT hash, original_rel, final_rel, action_folder, size, mtime, triaged_at FROM files WHERE hash = ?1",
+            "SELECT hash, original_rel, final_rel, category_folder, size, mtime, triaged_at FROM files WHERE hash = ?1",
         )?;
         let mut rows = stmt.query_map(params![lower], Self::file_record_from_row)?;
         match rows.next() {
@@ -449,18 +496,18 @@ impl Store {
         let hash = validated.as_str().to_string();
         let original_rel = record.original_rel.clone();
         let final_rel = record.final_rel.clone();
-        let action_folder = record.action_folder.clone();
+        let category_folder = record.category_folder.clone();
         let (size, mtime, triaged_at) = (record.size, record.mtime, record.triaged_at);
         retry_on_busy(|| {
             let mut conn = self.connection()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let changed = tx.execute(
-                "INSERT OR IGNORE INTO files (hash, original_rel, final_rel, action_folder, size, mtime, triaged_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT OR IGNORE INTO files (hash, original_rel, final_rel, category_folder, size, mtime, triaged_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     hash,
                     original_rel,
                     final_rel,
-                    action_folder,
+                    category_folder,
                     size,
                     mtime,
                     triaged_at
@@ -498,16 +545,16 @@ impl Store {
         Ok(set)
     }
 
-    /// Origin Action folder for a known hash, if any (Sweep report + Classification toast seam).
+    /// Origin Category folder for a known hash, if any (Sweep report + Classification toast seam).
     pub fn origin(&self, hash: &str) -> Result<Option<String>, StoreError> {
-        Ok(self.lookup(hash)?.map(|r| r.action_folder))
+        Ok(self.lookup(hash)?.map(|r| r.category_folder))
     }
 
     /// All file rows ordered by hash (Sweep report seam).
     pub fn list_files(&self) -> Result<Vec<FileRecord>, StoreError> {
         let conn = self.connection()?;
         let mut stmt = conn.prepare(
-            "SELECT hash, original_rel, final_rel, action_folder, size, mtime, triaged_at FROM files ORDER BY hash ASC",
+            "SELECT hash, original_rel, final_rel, category_folder, size, mtime, triaged_at FROM files ORDER BY hash ASC",
         )?;
         let rows = stmt.query_map([], Self::file_record_from_row)?;
         let mut out = Vec::new();
@@ -528,7 +575,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Action;
+    use crate::config::Category;
     use std::fs;
     use tempfile::TempDir;
 
@@ -555,11 +602,11 @@ mod tests {
         .unwrap();
 
         let store = Store::open(&source).unwrap();
-        let actions = store.actions().unwrap();
-        assert_eq!(actions.len(), 3);
-        assert_eq!(actions[0].display_name, "Keep");
-        assert_eq!(actions[0].folder_name, "keep");
-        assert_eq!(actions[0].shortcut, "1");
+        let categories = store.categories().unwrap();
+        assert_eq!(categories.len(), 3);
+        assert_eq!(categories[0].display_name, "Keep");
+        assert_eq!(categories[0].folder_name, "keep");
+        assert_eq!(categories[0].shortcut, "1");
 
         // Database exists, legacy untouched and unread: the txt hash is NOT known.
         assert!(store.db_path().exists());
@@ -584,61 +631,123 @@ mod tests {
     }
 
     #[test]
-    fn reopen_preserves_custom_actions_does_not_reseed() {
+    fn legacy_action_schema_migrates_without_losing_rows() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let hash = test_hash(0x9E);
+        // Hand-build a pre-rename database: `actions` table + `files.action_folder`.
+        {
+            let conn = Connection::open(db_path_for(&source)).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '1'), ('config_version', '1');
+                 CREATE TABLE actions (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     display_name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                     folder_name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                     shortcut TEXT NOT NULL UNIQUE,
+                     position INTEGER NOT NULL
+                 );
+                 INSERT INTO actions (display_name, folder_name, shortcut, position) VALUES ('Night', 'night', '4', 0);
+                 CREATE TABLE files (
+                     hash TEXT PRIMARY KEY,
+                     original_rel TEXT NOT NULL,
+                     final_rel TEXT NOT NULL,
+                     action_folder TEXT NOT NULL,
+                     size INTEGER NOT NULL,
+                     mtime INTEGER NOT NULL,
+                     triaged_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO files (hash, original_rel, final_rel, action_folder, size, mtime, triaged_at) VALUES (?1, 'n.jpg', 'night/n.jpg', 'night', 3, 4, 5)",
+                rusqlite::params![hash],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&source).unwrap();
+        // Legacy rows carried over, not reseeded or dropped.
+        let cats = store.categories().unwrap();
+        assert_eq!(cats.len(), 1);
+        assert_eq!(cats[0].folder_name, "night");
+        let rec = store.lookup(&hash).unwrap().expect("file row must survive");
+        assert_eq!(rec.category_folder, "night");
+        assert_eq!(rec.final_rel, "night/n.jpg");
+        assert!(store.contains(&hash).unwrap());
+        assert_eq!(store.origin(&hash).unwrap().as_deref(), Some("night"));
+        // Legacy objects gone; reopen is stable and idempotent.
+        let conn = Connection::open(db_path_for(&source)).unwrap();
+        let legacy_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'actions'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_tables, 0);
+        let reopened = Store::open(&source).unwrap();
+        assert_eq!(reopened.categories().unwrap(), cats);
+        assert!(reopened.contains(&hash).unwrap());
+    }
+
+    #[test]
+    fn reopen_preserves_custom_categories_does_not_reseed() {
         let dir = TempDir::new().unwrap();
         let source = dir.path().join("source");
         let store = Store::open(&source).unwrap();
         let custom = vec![
-            Action { display_name: "A".into(), folder_name: "a".into(), shortcut: "1".into() },
-            Action { display_name: "B".into(), folder_name: "b".into(), shortcut: "2".into() },
+            Category { display_name: "A".into(), folder_name: "a".into(), shortcut: "1".into() },
+            Category { display_name: "B".into(), folder_name: "b".into(), shortcut: "2".into() },
         ];
-        store.set_actions(&custom).unwrap();
+        store.set_categories(&custom).unwrap();
         // Reopen must keep custom, not reseed defaults.
         let store2 = Store::open(&source).unwrap();
-        assert_eq!(store2.actions().unwrap(), custom);
+        assert_eq!(store2.categories().unwrap(), custom);
     }
 
     #[test]
-    fn set_actions_rejects_invalid_and_leaves_db_unchanged() {
+    fn set_categories_rejects_invalid_and_leaves_db_unchanged() {
         let dir = TempDir::new().unwrap();
         let source = dir.path().join("source");
         let store = Store::open(&source).unwrap();
-        let before = store.actions().unwrap();
+        let before = store.categories().unwrap();
 
         // Duplicate shortcut.
         let dup_short = vec![
-            Action { display_name: "A".into(), folder_name: "a".into(), shortcut: "1".into() },
-            Action { display_name: "B".into(), folder_name: "b".into(), shortcut: "1".into() },
+            Category { display_name: "A".into(), folder_name: "a".into(), shortcut: "1".into() },
+            Category { display_name: "B".into(), folder_name: "b".into(), shortcut: "1".into() },
         ];
-        assert!(store.set_actions(&dup_short).is_err());
+        assert!(store.set_categories(&dup_short).is_err());
         // Reserved duplicate.
         let reserved = vec![
-            Action { display_name: "Dup".into(), folder_name: "duplicate".into(), shortcut: "1".into() },
+            Category { display_name: "Dup".into(), folder_name: "duplicate".into(), shortcut: "1".into() },
         ];
-        assert!(store.set_actions(&reserved).is_err());
+        assert!(store.set_categories(&reserved).is_err());
         // Duplicate display case-insensitive.
         let dup_display = vec![
-            Action { display_name: "Keep".into(), folder_name: "keep".into(), shortcut: "1".into() },
-            Action { display_name: "keep".into(), folder_name: "keep2".into(), shortcut: "2".into() },
+            Category { display_name: "Keep".into(), folder_name: "keep".into(), shortcut: "1".into() },
+            Category { display_name: "keep".into(), folder_name: "keep2".into(), shortcut: "2".into() },
         ];
-        assert!(store.set_actions(&dup_display).is_err());
+        assert!(store.set_categories(&dup_display).is_err());
         // Too few / too many / invalid shortcut.
-        assert!(store.set_actions(&[]).is_err());
+        assert!(store.set_categories(&[]).is_err());
         let mut nine = Vec::new();
         for i in 1..=9 {
-            nine.push(Action { display_name: format!("A{i}"), folder_name: format!("a{i}"), shortcut: format!("{i}") });
+            nine.push(Category { display_name: format!("A{i}"), folder_name: format!("a{i}"), shortcut: format!("{i}") });
         }
-        assert!(store.set_actions(&nine).is_ok());
+        assert!(store.set_categories(&nine).is_ok());
         let mut ten = nine.clone();
-        ten.push(Action { display_name: "A10".into(), folder_name: "a10".into(), shortcut: "1".into() });
-        assert!(store.set_actions(&ten).is_err());
+        ten.push(Category { display_name: "A10".into(), folder_name: "a10".into(), shortcut: "1".into() });
+        assert!(store.set_categories(&ten).is_err());
         let bad_short = vec![
-            Action { display_name: "A".into(), folder_name: "a".into(), shortcut: "a".into() },
+            Category { display_name: "A".into(), folder_name: "a".into(), shortcut: "a".into() },
         ];
-        assert!(store.set_actions(&bad_short).is_err());
+        assert!(store.set_categories(&bad_short).is_err());
 
         // Failed validations must not have clobbered the last good state (nine).
-        assert_eq!(store.actions().unwrap(), nine);
+        assert_eq!(store.categories().unwrap(), nine);
         // Restore defaults check: before was 3 defaults, now nine — proves writes work when valid.
         assert_ne!(before, nine);
     }
@@ -658,7 +767,7 @@ mod tests {
         assert!(!store.insert_file(&rec2).unwrap());
         let got = store.lookup(&upper).unwrap().unwrap();
         assert_eq!(got.original_rel, "orig.jpg");
-        assert_eq!(got.action_folder, "keep");
+        assert_eq!(got.category_folder, "keep");
         // Case-insensitive lookup.
         assert!(store.contains(&upper.to_ascii_lowercase()).unwrap());
         assert!(store.contains(&upper).unwrap());
@@ -698,7 +807,7 @@ mod tests {
         let got = reopened.lookup(&h).unwrap().unwrap();
         assert_eq!(got.original_rel, "a.jpg");
         assert_eq!(got.final_rel, "keep/a.jpg");
-        assert_eq!(got.action_folder, "keep");
+        assert_eq!(got.category_folder, "keep");
         // Relative resolution still works at the new location.
         assert_eq!(moved.join(&got.final_rel), moved.join("keep/a.jpg"));
         assert!(reopened.contains(&h).unwrap());
@@ -720,7 +829,7 @@ mod tests {
         let db = store.db_path();
         let reference = Store::open_reference_file(&db).unwrap();
         // Reads work on the reference handle.
-        assert_eq!(reference.actions().unwrap().len(), 3);
+        assert_eq!(reference.categories().unwrap().len(), 3);
         // Every write path goes through the read-only connection, so SQLite
         // refuses with SQLITE_READONLY instead of touching the database.
         let rec = FileRecord::new(
@@ -740,7 +849,7 @@ mod tests {
         );
         assert!(
             reference
-                .set_actions(&[Action {
+                .set_categories(&[Category {
                     display_name: "A".into(),
                     folder_name: "a".into(),
                     shortcut: "1".into(),
@@ -748,7 +857,7 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("readonly"),
-            "reference set_actions must fail SQLITE_READONLY"
+            "reference set_categories must fail SQLITE_READONLY"
         );
         // The refused writes left no rows behind.
         assert!(Store::open(&source).unwrap().all_hashes().unwrap().is_empty());
@@ -804,7 +913,7 @@ mod tests {
             h.join().unwrap();
         }
         let store = Store::open(&source).unwrap();
-        assert_eq!(store.actions().unwrap().len(), 3);
+        assert_eq!(store.categories().unwrap().len(), 3);
         let conn = Connection::open(db_path_for(&source)).unwrap();
         let check: String = conn
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
@@ -856,7 +965,7 @@ mod tests {
         // Raw upper-case SQL bypassing FileRecord::new must fail at the DB level.
         let upper = test_hash(0xAB).to_ascii_uppercase();
         let res = conn.execute(
-            "INSERT INTO files (hash, original_rel, final_rel, action_folder, size, mtime, triaged_at) VALUES (?1, 'a.jpg', 'keep/a.jpg', 'keep', 1, 1, 1)",
+            "INSERT INTO files (hash, original_rel, final_rel, category_folder, size, mtime, triaged_at) VALUES (?1, 'a.jpg', 'keep/a.jpg', 'keep', 1, 1, 1)",
             rusqlite::params![upper],
         );
         assert!(res.is_err(), "upper-case hash must violate CHECK");
@@ -889,18 +998,18 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let source = dir.path().join("source");
         let store = Store::open(&source).unwrap();
-        let before_actions = store.actions().unwrap();
+        let before_categories = store.categories().unwrap();
         let before_hashes = store.all_hashes().unwrap();
-        // Invalid actions + invalid hash both fail before touching the DB.
+        // Invalid categories + invalid hash both fail before touching the DB.
         assert!(store
-            .set_actions(&[Action {
+            .set_categories(&[Category {
                 display_name: "Dup".into(),
                 folder_name: "duplicate".into(),
                 shortcut: "1".into(),
             }])
             .is_err());
         assert!(FileRecord::new("bad", "a.jpg", "keep/a.jpg", "keep", 0, 0, 0).is_err());
-        assert_eq!(store.actions().unwrap(), before_actions);
+        assert_eq!(store.categories().unwrap(), before_categories);
         assert_eq!(store.all_hashes().unwrap(), before_hashes);
     }
 }

@@ -1,6 +1,6 @@
 # Organizer
 
-File-triaging desktop app that shows one image at a time and moves it to a chosen action folder with shortcuts, while tracking duplicates by content hash.
+File-triaging desktop app that shows one image at a time and moves it to a chosen category folder with shortcuts, while tracking duplicates by content hash.
 
 ## Language
 
@@ -17,7 +17,7 @@ The file at the queue index currently shown in preview; the target of Classifica
 _Avoid_: Selected file, active file
 
 **Supported Format**:
-A file extension decodeable by glycin (png, jpg/jpeg, bmp, tiff, webp, gif-anim, avif/heic/svg/ico) or GStreamer (webm/mp4/mov/mkv/avi); only these enter the Queue.
+A file extension decodeable by glycin (png, jpg/jpeg, bmp, tiff/tif, webp, gif-anim, avif/heic/heif/svg/ico) or GStreamer (webm/mp4/mov/mkv/avi); only these enter the Queue.
 _Avoid_: Image type, valid file
 
 **Unsupported File**:

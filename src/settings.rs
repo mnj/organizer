@@ -168,8 +168,8 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
     bottom_group.add(&bottom);
     page.add(&bottom_group);
 
-    // ui_categories mirrors edits
-    let ui_categories: Rc<RefCell<Vec<Category>>> = Rc::new(RefCell::new(ctx.live_categories.borrow().clone()));
+    // draft_categories mirrors edits
+    let draft_categories: Rc<RefCell<Vec<Category>>> = Rc::new(RefCell::new(ctx.live_categories.borrow().clone()));
     let handles: Rc<RefCell<Vec<RowHandle>>> = Rc::new(RefCell::new(Vec::new()));
 
     // We need a rebuild closure that can be called after any mutation that changes order or length.
@@ -178,18 +178,18 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
 
     // Validate + live-apply helper (per-row errors)
     let validate_and_live = {
-        let ui_clone = ui_categories.clone();
-        let validation_c = validation_label.clone();
-        let btn_save_c = btn_save.clone();
-        let btn_add_c = btn_add.clone();
-        let live_c = ctx.live_categories.clone();
-        let rebuild_c = ctx.rebuild_category_bar.clone();
-        let handles_c = handles.clone();
+        let draft = draft_categories.clone();
+        let validation = validation_label.clone();
+        let save_button = btn_save.clone();
+        let add_button = btn_add.clone();
+        let live = ctx.live_categories.clone();
+        let rebuild_bar = ctx.rebuild_category_bar.clone();
+        let handles = handles.clone();
         Rc::new(move || {
-            let categories = ui_clone.borrow().clone();
+            let categories = draft.borrow().clone();
             // update dropdown tooltips for conflict preview
             {
-                let hs = handles_c.borrow();
+                let hs = handles.borrow();
                 for h in hs.iter() {
                     let cur = format!("{}", h.dropdown.selected() + 1);
                     let count = categories.iter().filter(|c| c.shortcut == cur).count();
@@ -208,36 +208,36 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
             let per_row = per_row_errors(&categories);
             match validate_categories(&categories) {
                 Ok(()) => {
-                    validation_c.set_text("");
-                    btn_save_c.set_sensitive(true);
-                    for (h, err) in handles_c.borrow().iter().zip(per_row.iter()) {
+                    validation.set_text("");
+                    save_button.set_sensitive(true);
+                    for (h, err) in handles.borrow().iter().zip(per_row.iter()) {
                         if err.display { h.display.add_css_class("error"); } else { h.display.remove_css_class("error"); }
                         if err.folder { h.folder.add_css_class("error"); } else { h.folder.remove_css_class("error"); }
                         if err.shortcut { h.dropdown.add_css_class("error"); } else { h.dropdown.remove_css_class("error"); }
                     }
-                    *live_c.borrow_mut() = categories.clone();
-                    rebuild_c();
+                    *live.borrow_mut() = categories.clone();
+                    rebuild_bar();
                 }
                 Err(errs) => {
                     let msg = errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
-                    validation_c.set_text(&msg);
-                    btn_save_c.set_sensitive(false);
-                    for (h, err) in handles_c.borrow().iter().zip(per_row.iter()) {
+                    validation.set_text(&msg);
+                    save_button.set_sensitive(false);
+                    for (h, err) in handles.borrow().iter().zip(per_row.iter()) {
                         if err.display { h.display.add_css_class("error"); } else { h.display.remove_css_class("error"); }
                         if err.folder { h.folder.add_css_class("error"); } else { h.folder.remove_css_class("error"); }
                         if err.shortcut { h.dropdown.add_css_class("error"); } else { h.dropdown.remove_css_class("error"); }
                     }
                 }
             }
-            btn_add_c.set_sensitive(ui_clone.borrow().len() < 9);
-            if ui_clone.borrow().len() >= 9 {
-                btn_add_c.set_tooltip_text(Some("Max 9 categories"));
+            add_button.set_sensitive(draft.borrow().len() < 9);
+            if draft.borrow().len() >= 9 {
+                add_button.set_tooltip_text(Some("Max 9 categories"));
             } else {
-                btn_add_c.set_tooltip_text(Some("Add new category (max 9)"));
+                add_button.set_tooltip_text(Some("Add new category (max 9)"));
             }
             // update Up/Down/Remove sensitivities
-            let len = handles_c.borrow().len();
-            for (idx, h) in handles_c.borrow().iter().enumerate() {
+            let len = handles.borrow().len();
+            for (idx, h) in handles.borrow().iter().enumerate() {
                 let up_sensitive = idx > 0;
                 let down_sensitive = idx + 1 < len;
                 let mut child = h.container.first_child();
@@ -264,23 +264,23 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
         }) as Rc<dyn Fn()>
     };
 
-    // Rebuild all rows from ui_categories (fresh indices)
+    // Rebuild all rows from draft_categories (fresh indices)
     let rebuild_rows = {
-        let ui_clone = ui_categories.clone();
-        let rows_box_c = rows_box.clone();
-        let handles_c = handles.clone();
-        let validate_c = validate_and_live.clone();
-        let rebuild_holder_c = rebuild_holder.clone();
+        let draft = draft_categories.clone();
+        let rows_box = rows_box.clone();
+        let handles = handles.clone();
+        let revalidate = validate_and_live.clone();
+        let rebuild_holder = rebuild_holder.clone();
         Rc::new(move || {
             // clear rows_box children except validation_label and bottom? Actually validation_label and bottom are not in rows_box's rows; rows_box contains rows + validation_label?
             // We appended validation_label inside rows_box earlier, so clearing would remove it. Instead we keep validation_label separate.
             // To avoid removing validation_label, we remove only RowHandle containers.
-            for h in handles_c.borrow().iter() {
-                rows_box_c.remove(&h.container);
+            for h in handles.borrow().iter() {
+                rows_box.remove(&h.container);
             }
-            handles_c.borrow_mut().clear();
+            handles.borrow_mut().clear();
 
-            let categories = ui_clone.borrow().clone();
+            let categories = draft.borrow().clone();
             for (idx, cat) in categories.into_iter().enumerate() {
                 let row = GtkBox::new(Orientation::Horizontal, 8);
                 row.set_margin_bottom(4);
@@ -326,10 +326,10 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
                 // Insert before validation_label: remove validation_label, append row, then re-append validation_label
                 // Since rows_box contains validation_label at end, we need to keep order: insert row before validation_label
                 // Remove validation_label temporarily, append row, re-add validation_label
-                let had_validation = rows_box_c.first_child().is_some() && {
+                let had_validation = rows_box.first_child().is_some() && {
                     // check if validation_label is child
                     let mut found = false;
-                    let mut c = rows_box_c.first_child();
+                    let mut c = rows_box.first_child();
                     while let Some(ch) = c {
                         if ch == validation_label.clone().upcast::<gtk4::Widget>() {
                             found = true;
@@ -340,12 +340,12 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
                     found
                 };
                 if had_validation {
-                    rows_box_c.remove(&validation_label);
+                    rows_box.remove(&validation_label);
                 }
-                rows_box_c.append(&row);
-                rows_box_c.append(&validation_label);
+                rows_box.append(&row);
+                rows_box.append(&validation_label);
 
-                handles_c.borrow_mut().push(RowHandle {
+                handles.borrow_mut().push(RowHandle {
                     container: row.clone(),
                     display: display_entry.clone(),
                     folder: folder_entry.clone(),
@@ -355,90 +355,90 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
 
                 // Wire signals capturing idx (fresh)
                 {
-                    let ui_c = ui_clone.clone();
-                    let validate_cc = validate_c.clone();
+                    let draft = draft.clone();
+                    let revalidate = revalidate.clone();
                     display_entry.connect_changed(move |e| {
                         let txt = e.text().to_string();
-                        if let Some(a) = ui_c.borrow_mut().get_mut(idx) {
-                            a.display_name = txt;
+                        if let Some(cat) = draft.borrow_mut().get_mut(idx) {
+                            cat.display_name = txt;
                         }
-                        validate_cc();
+                        revalidate();
                     });
                 }
                 {
-                    let ui_c = ui_clone.clone();
-                    let slug_c = slug_label.clone();
-                    let validate_cc = validate_c.clone();
+                    let draft = draft.clone();
+                    let slug_view = slug_label.clone();
+                    let revalidate = revalidate.clone();
                     folder_entry.connect_changed(move |e| {
                         let txt = e.text().to_string();
                         let slug = slugify(&txt);
-                        slug_c.set_text(&format!("→ ../{}/", if slug.is_empty() { "—".into() } else { slug.clone() }));
-                        slug_c.set_tooltip_text(Some(&format!("subfolder {}/, slug a-z0-9_-", slug)));
-                        if let Some(a) = ui_c.borrow_mut().get_mut(idx) {
-                            a.folder_name = txt;
+                        slug_view.set_text(&format!("→ ../{}/", if slug.is_empty() { "—".into() } else { slug.clone() }));
+                        slug_view.set_tooltip_text(Some(&format!("subfolder {}/, slug a-z0-9_-", slug)));
+                        if let Some(cat) = draft.borrow_mut().get_mut(idx) {
+                            cat.folder_name = txt;
                         }
-                        validate_cc();
+                        revalidate();
                     });
                 }
                 {
-                    let ui_c = ui_clone.clone();
-                    let validate_cc = validate_c.clone();
+                    let draft = draft.clone();
+                    let revalidate = revalidate.clone();
                     dropdown.connect_selected_notify(move |dd| {
                         let sc = format!("{}", dd.selected() + 1);
-                        if let Some(a) = ui_c.borrow_mut().get_mut(idx) {
-                            a.shortcut = sc;
+                        if let Some(cat) = draft.borrow_mut().get_mut(idx) {
+                            cat.shortcut = sc;
                         }
-                        validate_cc();
+                        revalidate();
                     });
                 }
                 // Up
                 {
-                    let ui_c = ui_clone.clone();
-                    let rebuild_c = rebuild_holder_c.clone();
+                    let draft = draft.clone();
+                    let rerender = rebuild_holder.clone();
                     btn_up.connect_clicked(move |_| {
                         if idx == 0 { return; }
                         {
-                            let mut v = ui_c.borrow_mut();
+                            let mut v = draft.borrow_mut();
                             swap_categories(&mut v, idx, idx - 1);
                         }
-                        if let Some(rb) = rebuild_c.borrow().as_ref() {
+                        if let Some(rb) = rerender.borrow().as_ref() {
                             rb();
                         }
                     });
                 }
                 // Down
                 {
-                    let ui_c = ui_clone.clone();
-                    let rebuild_c = rebuild_holder_c.clone();
+                    let draft = draft.clone();
+                    let rerender = rebuild_holder.clone();
                     btn_down.connect_clicked(move |_| {
-                        let len = ui_c.borrow().len();
+                        let len = draft.borrow().len();
                         if idx + 1 >= len { return; }
                         {
-                            let mut v = ui_c.borrow_mut();
+                            let mut v = draft.borrow_mut();
                             swap_categories(&mut v, idx, idx + 1);
                         }
-                        if let Some(rb) = rebuild_c.borrow().as_ref() {
+                        if let Some(rb) = rerender.borrow().as_ref() {
                             rb();
                         }
                     });
                 }
                 // Remove
                 {
-                    let ui_c = ui_clone.clone();
-                    let rebuild_c = rebuild_holder_c.clone();
+                    let draft = draft.clone();
+                    let rerender = rebuild_holder.clone();
                     btn_remove.connect_clicked(move |_| {
-                        if ui_c.borrow().len() <= 1 { return; }
+                        if draft.borrow().len() <= 1 { return; }
                         {
-                            let mut v = ui_c.borrow_mut();
+                            let mut v = draft.borrow_mut();
                             if idx < v.len() { v.remove(idx); }
                         }
-                        if let Some(rb) = rebuild_c.borrow().as_ref() {
+                        if let Some(rb) = rerender.borrow().as_ref() {
                             rb();
                         }
                     });
                 }
             }
-            validate_c();
+            revalidate();
         }) as Rc<dyn Fn()>
     };
     *rebuild_holder.borrow_mut() = Some(rebuild_rows.clone());
@@ -448,11 +448,11 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
 
     // Add button: push new category and rebuild
     {
-        let ui_c = ui_categories.clone();
-        let rebuild_c = rebuild_rows.clone();
+        let draft = draft_categories.clone();
+        let rerender = rebuild_rows.clone();
         btn_add.connect_clicked(move |_| {
-            if ui_c.borrow().len() >= 9 { return; }
-            let used: HashSet<String> = ui_c.borrow().iter().map(|c| c.shortcut.clone()).collect();
+            if draft.borrow().len() >= 9 { return; }
+            let used: HashSet<String> = draft.borrow().iter().map(|c| c.shortcut.clone()).collect();
             let mut new_short = "1".to_string();
             for n in 1..=9 {
                 let s = format!("{n}");
@@ -462,60 +462,60 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
                 }
             }
             let new_cat = Category { display_name: "New Category".into(), folder_name: "new_category".into(), shortcut: new_short };
-            ui_c.borrow_mut().push(new_cat);
-            rebuild_c();
+            draft.borrow_mut().push(new_cat);
+            rerender();
         });
     }
 
     // Save
     {
-        let win_c = adw_win.clone();
-        let store_c = ctx.store.clone();
-        let ui_c = ui_categories.clone();
-        let live_c = ctx.live_categories.clone();
-        let disk_c = ctx.disk_categories.clone();
-        let rebuild_c = ctx.rebuild_category_bar.clone();
+        let dialog = adw_win.clone();
+        let store = ctx.store.clone();
+        let draft = draft_categories.clone();
+        let live = ctx.live_categories.clone();
+        let disk = ctx.disk_categories.clone();
+        let rebuild_bar = ctx.rebuild_category_bar.clone();
         btn_save.connect_clicked(move |_| {
-            let collected = ui_c.borrow().clone();
+            let collected = draft.borrow().clone();
             if validate_categories(&collected).is_err() { return; }
-            match store_c.set_categories(&collected) {
+            match store.set_categories(&collected) {
                 Ok(()) => {
-                    *live_c.borrow_mut() = collected.clone();
-                    *disk_c.borrow_mut() = collected.clone();
-                    rebuild_c();
-                    win_c.close();
+                    *live.borrow_mut() = collected.clone();
+                    *disk.borrow_mut() = collected.clone();
+                    rebuild_bar();
+                    dialog.close();
                 }
                 Err(e) => {
                     let dlg = gtk4::AlertDialog::builder().message(format!("Failed to save: {e}")).build();
-                    dlg.show(Some(&win_c));
+                    dlg.show(Some(&dialog));
                 }
             }
         });
     }
     // Cancel
     {
-        let win_c = adw_win.clone();
-        let live_c = ctx.live_categories.clone();
-        let disk_c = ctx.disk_categories.clone();
-        let rebuild_c = ctx.rebuild_category_bar.clone();
+        let dialog = adw_win.clone();
+        let live = ctx.live_categories.clone();
+        let disk = ctx.disk_categories.clone();
+        let rebuild_bar = ctx.rebuild_category_bar.clone();
         btn_cancel.connect_clicked(move |_| {
-            *live_c.borrow_mut() = disk_c.borrow().clone();
-            rebuild_c();
-            win_c.close();
+            *live.borrow_mut() = disk.borrow().clone();
+            rebuild_bar();
+            dialog.close();
         });
     }
 
     // Close without Save prompts Save/Discard/Cancel
     {
-        let ui_c = ui_categories.clone();
-        let live_c = ctx.live_categories.clone();
-        let disk_c = ctx.disk_categories.clone();
-        let store_c = ctx.store.clone();
-        let rebuild_c = ctx.rebuild_category_bar.clone();
+        let draft = draft_categories.clone();
+        let live = ctx.live_categories.clone();
+        let disk = ctx.disk_categories.clone();
+        let store = ctx.store.clone();
+        let rebuild_bar = ctx.rebuild_category_bar.clone();
         adw_win.connect_close_request(move |w| {
-            let collected = ui_c.borrow().clone();
-            let disk = disk_c.borrow().clone();
-            if collected == disk {
+            let collected = draft.borrow().clone();
+            let saved = disk.borrow().clone();
+            if collected == saved {
                 return glib::Propagation::Proceed;
             }
             let alert = gtk4::AlertDialog::builder()
@@ -525,26 +525,26 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
                 .default_button(2)
                 .cancel_button(2)
                 .build();
-            let win_clone = w.clone();
-            let store_clone = store_c.clone();
-            let live_clone = live_c.clone();
-            let disk_clone = disk_c.clone();
-            let rebuild_clone = rebuild_c.clone();
-            let collected_clone = collected.clone();
+            let dialog = w.clone();
+            let store = store.clone();
+            let live = live.clone();
+            let disk = disk.clone();
+            let rebuild_bar = rebuild_bar.clone();
+            let collected = collected.clone();
             alert.choose(Some(w), gio::Cancellable::NONE, move |res| {
                 if let Ok(idx) = res {
                     match idx {
                         0 => {
-                            let _ = store_clone.set_categories(&collected_clone);
-                            *live_clone.borrow_mut() = collected_clone.clone();
-                            *disk_clone.borrow_mut() = collected_clone.clone();
-                            rebuild_clone();
-                            win_clone.close();
+                            let _ = store.set_categories(&collected);
+                            *live.borrow_mut() = collected.clone();
+                            *disk.borrow_mut() = collected.clone();
+                            rebuild_bar();
+                            dialog.close();
                         }
                         1 => {
-                            *live_clone.borrow_mut() = disk_clone.borrow().clone();
-                            rebuild_clone();
-                            win_clone.close();
+                            *live.borrow_mut() = disk.borrow().clone();
+                            rebuild_bar();
+                            dialog.close();
                         }
                         _ => {}
                     }

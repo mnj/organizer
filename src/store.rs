@@ -53,6 +53,7 @@ pub enum StoreError {
     InvalidHash(String),
     InvalidPath(String),
     UnsupportedSchema { found: String },
+    InvalidDatabase { path: PathBuf, reason: String },
 }
 
 impl std::fmt::Display for StoreError {
@@ -69,6 +70,12 @@ impl std::fmt::Display for StoreError {
             StoreError::UnsupportedSchema { found } => write!(
                 f,
                 "unsupported organizer.db schema_version {found:?} (expected \"1\"); move the Source Folder aside or delete organizer.db to reseed"
+            ),
+            StoreError::InvalidDatabase { path, reason } => write!(
+                f,
+                "invalid organizer database: {} ({})",
+                path.display(),
+                reason
             ),
         }
     }
@@ -102,9 +109,11 @@ pub struct FileRecord {
 }
 
 impl FileRecord {
-    /// Validate and normalize. Hash is lower-cased; paths must be relative and non-empty.
+    /// Build a validated row. The hash arrives as the `FileHash` domain type
+    /// (already lower-case hex), so callers cannot pass raw strings here;
+    /// paths must be relative and non-empty.
     pub fn new(
-        hash: &str,
+        hash: &FileHash,
         original_rel: &str,
         final_rel: &str,
         category_folder: &str,
@@ -112,10 +121,6 @@ impl FileRecord {
         mtime: i64,
         triaged_at: i64,
     ) -> Result<Self, StoreError> {
-        let validated = FileHash::new(hash).map_err(|_| StoreError::InvalidHash(hash.to_string()))?;
-        if !is_valid_hash(validated.as_str()) {
-            return Err(StoreError::InvalidHash(hash.to_string()));
-        }
         for (label, p) in [("original", original_rel), ("final", final_rel)] {
             if p.is_empty() {
                 return Err(StoreError::InvalidPath(format!("{label} path empty")));
@@ -133,7 +138,7 @@ impl FileRecord {
             return Err(StoreError::InvalidPath("category folder empty".into()));
         }
         Ok(Self {
-            hash: validated.to_string(),
+            hash: hash.to_string(),
             original_rel: original_rel.to_string(),
             final_rel: final_rel.to_string(),
             category_folder: category_folder.to_string(),
@@ -162,8 +167,9 @@ pub struct Store {
     source_folder: PathBuf,
     db_path: PathBuf,
     /// True for Sweep reference handles (#26): every connection opens
-    /// `SQLITE_OPEN_READ_ONLY`, so cleaning a target can never write rows
-    /// or create `-wal`/`-shm` sidecars on the reference database.
+    /// `SQLITE_OPEN_READ_ONLY`, so cleaning a target can never change the
+    /// reference database content. (WAL `-shm`/`-wal` index files may still
+    /// materialize; see `connect_reference_file`.)
     read_only: bool,
 }
 
@@ -196,6 +202,60 @@ fn retry_on_busy<T>(mut op: impl FnMut() -> Result<T, StoreError>) -> Result<T, 
     Err(last.expect("retry loop must have attempted"))
 }
 
+/// Read-only handle to a reference Organizer Database for Sweep.
+///
+/// Separate type (not just a flag) so Sweep code cannot name a write method:
+/// `set_categories` / `insert_file` / `remove` simply do not exist here.
+/// The wrapped handle additionally opens every connection
+/// `SQLITE_OPEN_READ_ONLY`, so even the read path cannot change reference
+/// rows. (WAL `-shm`/`-wal` index files may still materialize beside the
+/// database; content is what is protected, and the Queue Snapshot excludes
+/// those artifacts.)
+#[derive(Debug, Clone)]
+pub struct ReferenceStore {
+    store: Store,
+}
+
+impl ReferenceStore {
+    pub fn source_folder(&self) -> &Path {
+        self.store.source_folder()
+    }
+
+    pub fn db_path(&self) -> PathBuf {
+        self.store.db_path()
+    }
+
+    /// Current Categories ordered by position.
+    pub fn categories(&self) -> Result<Vec<Category>, StoreError> {
+        self.store.categories()
+    }
+
+    /// True if `hash` (any case) is already known.
+    pub fn contains(&self, hash: &str) -> Result<bool, StoreError> {
+        self.store.contains(hash)
+    }
+
+    /// Lookup a file row by hash (case-insensitive). Returns None for unknown or invalid hashes.
+    pub fn lookup(&self, hash: &str) -> Result<Option<FileRecord>, StoreError> {
+        self.store.lookup(hash)
+    }
+
+    /// Union of all known lower-case hashes (Sweep match seam).
+    pub fn all_hashes(&self) -> Result<HashSet<String>, StoreError> {
+        self.store.all_hashes()
+    }
+
+    /// Origin Category folder for a known hash, if any (Sweep report seam).
+    pub fn origin(&self, hash: &str) -> Result<Option<String>, StoreError> {
+        self.store.origin(hash)
+    }
+
+    /// All file rows ordered by hash (Sweep report seam).
+    pub fn list_files(&self) -> Result<Vec<FileRecord>, StoreError> {
+        self.store.list_files()
+    }
+}
+
 impl Store {
     /// Open (or seed) the Organizer Database in `source_folder`.
     /// Creates the folder if missing, enables WAL, creates schema, checks the
@@ -206,11 +266,12 @@ impl Store {
             std::fs::create_dir_all(source_folder)?;
             let mut conn = Self::connect(source_folder)?;
             Self::ensure_schema(&conn)?;
-            Self::check_schema_version(&conn)?;
+            let db_path = db_path_for(source_folder);
+            Self::check_schema_version(&conn, &db_path)?;
             Self::seed_if_empty(&mut conn)?;
             Ok(Self {
                 source_folder: source_folder.to_path_buf(),
-                db_path: db_path_for(source_folder),
+                db_path,
                 read_only: false,
             })
         })
@@ -220,10 +281,11 @@ impl Store {
     /// seeding, or writing rows. `db_path` is the exact `organizer.db` file
     /// (resolved by `sweep::resolve_reference_db_path` from `--db` or its default).
     /// Errors clearly when the file is missing so callers can hint `--db`.
-    /// The handle is read-only at the SQLite level (`SQLITE_OPEN_READ_ONLY`
-    /// on every connection): Sweep never calls `insert_file`/`set_categories`/
-    /// `remove`, and the open itself cannot create `-wal`/`-shm` sidecars.
-    pub fn open_reference_file(db_path: &Path) -> Result<Self, StoreError> {
+    /// Returns a `ReferenceStore`: the read-only surface is a separate type,
+    /// so Sweep code cannot even name a write method — on top of the
+    /// `SQLITE_OPEN_READ_ONLY` connections, which prevent any row change
+    /// (WAL index sidecars may still materialize; content cannot).
+    pub fn open_reference_file(db_path: &Path) -> Result<ReferenceStore, StoreError> {
         if !db_path.is_file() {
             return Err(StoreError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -231,7 +293,7 @@ impl Store {
             )));
         }
         let conn = Self::connect_reference_file(db_path)?;
-        Self::check_schema_version(&conn)?;
+        Self::check_schema_version(&conn, db_path)?;
         let source_folder = db_path
             .parent()
             .map(|p| {
@@ -242,10 +304,12 @@ impl Store {
                 }
             })
             .unwrap_or_else(|| PathBuf::from("."));
-        Ok(Self {
-            source_folder,
-            db_path: db_path.to_path_buf(),
-            read_only: true,
+        Ok(ReferenceStore {
+            store: Self {
+                source_folder,
+                db_path: db_path.to_path_buf(),
+                read_only: true,
+            },
         })
     }
 
@@ -271,8 +335,10 @@ impl Store {
 
     /// Read-only connection for Sweep reference handles: no WAL promotion,
     /// no synchronous change, only a per-connection busy timeout. Combined
-    /// with `SQLITE_OPEN_READ_ONLY` the reference database cannot gain rows
-    /// or `-wal`/`-shm` sidecars while a target is cleaned.
+    /// with `SQLITE_OPEN_READ_ONLY` the reference database content can never
+    /// change while a target is cleaned. Note: WAL `-shm`/`-wal` index files
+    /// may still materialize beside it (SQLite reader behavior, not content);
+    /// the Queue Snapshot excludes them via `is_internal_db_file`.
     fn connect_reference_file(db_path: &Path) -> Result<Connection, StoreError> {
         let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.execute_batch("PRAGMA busy_timeout=5000;")?;
@@ -364,16 +430,22 @@ impl Store {
     }
 
     /// Fail clearly on a database from a newer (or older) schema instead of
-    /// silently accepting rows we cannot interpret.
-    fn check_schema_version(conn: &Connection) -> Result<(), StoreError> {
-        let found: String =
+    /// silently accepting rows we cannot interpret. A file with no `meta`
+    /// row (empty or foreign SQLite file) reports `InvalidDatabase` with the
+    /// path, so callers can hint `--db` instead of showing rusqlite internals.
+    fn check_schema_version(conn: &Connection, db_path: &Path) -> Result<(), StoreError> {
+        let found: Result<String, rusqlite::Error> =
             conn.query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| {
                 r.get(0)
-            })?;
-        if found != "1" {
-            return Err(StoreError::UnsupportedSchema { found });
+            });
+        match found {
+            Ok(v) if v == "1" => Ok(()),
+            Ok(found) => Err(StoreError::UnsupportedSchema { found }),
+            Err(e) => Err(StoreError::InvalidDatabase {
+                path: db_path.to_path_buf(),
+                reason: e.to_string(),
+            }),
         }
-        Ok(())
     }
 
     fn seed_if_empty(conn: &mut Connection) -> Result<(), StoreError> {
@@ -585,7 +657,16 @@ mod tests {
     }
 
     fn sample_record(hash: &str) -> FileRecord {
-        FileRecord::new(hash, "a.jpg", "keep/a.jpg", "keep", 123, 456, 789).unwrap()
+        FileRecord::new(
+            &FileHash::new(hash).unwrap(),
+            "a.jpg",
+            "keep/a.jpg",
+            "keep",
+            123,
+            456,
+            789,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -758,12 +839,14 @@ mod tests {
         let source = dir.path().join("source");
         let store = Store::open(&source).unwrap();
         let upper = test_hash(0xAB).to_ascii_uppercase();
-        let rec = FileRecord::new(&upper, "orig.jpg", "keep/orig.jpg", "keep", 10, 20, 30).unwrap();
+        let upper_hash = FileHash::new(&upper).unwrap();
+        let rec = FileRecord::new(&upper_hash, "orig.jpg", "keep/orig.jpg", "keep", 10, 20, 30).unwrap();
         // Normalized to lower-case.
         assert_eq!(rec.hash, rec.hash.to_ascii_lowercase());
         assert!(store.insert_file(&rec).unwrap());
         // Duplicate insert is idempotent, keeps first row.
-        let rec2 = FileRecord::new(&upper.to_ascii_lowercase(), "other.jpg", "maybe/other.jpg", "maybe", 99, 99, 99).unwrap();
+        let lower_hash = FileHash::new(&upper.to_ascii_lowercase()).unwrap();
+        let rec2 = FileRecord::new(&lower_hash, "other.jpg", "maybe/other.jpg", "maybe", 99, 99, 99).unwrap();
         assert!(!store.insert_file(&rec2).unwrap());
         let got = store.lookup(&upper).unwrap().unwrap();
         assert_eq!(got.original_rel, "orig.jpg");
@@ -785,7 +868,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let source = dir.path().join("source");
         let store = Store::open(&source).unwrap();
-        assert!(FileRecord::new("not-a-hash", "a.jpg", "keep/a.jpg", "keep", 0, 0, 0).is_err());
+        // Raw strings can no longer reach FileRecord: the domain type rejects them.
+        assert!(FileHash::new("not-a-hash").is_err());
         // Direct invalid via lookup returns None, remove errors.
         assert!(store.lookup("not-a-hash").unwrap().is_none());
         assert!(store.remove("not-a-hash").is_err());
@@ -798,7 +882,8 @@ mod tests {
         let source = dir.path().join("source");
         let store = Store::open(&source).unwrap();
         let h = test_hash(0x42);
-        let rec = FileRecord::new(&h, "a.jpg", "keep/a.jpg", "keep", 5, 6, 7).unwrap();
+        let hash = FileHash::new(&h).unwrap();
+        let rec = FileRecord::new(&hash, "a.jpg", "keep/a.jpg", "keep", 5, 6, 7).unwrap();
         store.insert_file(&rec).unwrap();
         // Move the whole Source Folder (folder plus database move together).
         let moved = dir.path().join("moved");
@@ -822,45 +907,57 @@ mod tests {
     }
 
     #[test]
-    fn open_reference_file_rejects_writes_as_readonly() {
+    fn open_reference_file_exposes_reads_only_and_writes_no_rows() {
         let dir = TempDir::new().unwrap();
         let source = dir.path().join("source");
         let store = Store::open(&source).unwrap();
+        let h = test_hash(0x5A);
+        store.insert_file(&sample_record(&h)).unwrap();
         let db = store.db_path();
         let reference = Store::open_reference_file(&db).unwrap();
-        // Reads work on the reference handle.
-        assert_eq!(reference.categories().unwrap().len(), 3);
-        // Every write path goes through the read-only connection, so SQLite
-        // refuses with SQLITE_READONLY instead of touching the database.
-        let rec = FileRecord::new(
-            &"aa".repeat(32),
-            "a.jpg",
-            "keep/a.jpg",
-            "keep",
-            1,
-            0,
-            0,
-        )
-        .unwrap();
-        let err = reference.insert_file(&rec).unwrap_err().to_string();
-        assert!(
-            err.contains("readonly"),
-            "reference insert must fail SQLITE_READONLY, got: {err}"
-        );
-        assert!(
-            reference
-                .set_categories(&[Category {
-                    display_name: "A".into(),
-                    folder_name: "a".into(),
-                    shortcut: "1".into(),
-                }])
-                .unwrap_err()
-                .to_string()
-                .contains("readonly"),
-            "reference set_categories must fail SQLITE_READONLY"
-        );
-        // The refused writes left no rows behind.
-        assert!(Store::open(&source).unwrap().all_hashes().unwrap().is_empty());
+
+        // Reads work on the reference handle. Writes are impossible by
+        // construction: ReferenceStore has no set_categories/insert_file/remove
+        // methods, so a Sweep caller cannot even name one (this fails to
+        // compile if a write method is ever added to the read surface).
+        let read_all = |reference: &ReferenceStore| {
+            assert_eq!(reference.categories().unwrap().len(), 3);
+            assert!(reference.contains(&h).unwrap());
+            let rec = reference.lookup(&h).unwrap().unwrap();
+            assert_eq!(rec.category_folder, "keep");
+            assert_eq!(reference.origin(&h).unwrap().as_deref(), Some("keep"));
+            assert_eq!(reference.list_files().unwrap().len(), 1);
+            assert_eq!(reference.all_hashes().unwrap().len(), 1);
+        };
+        read_all(&reference);
+
+        // No rows gained or lost, and no real files created beside the
+        // reference database. (WAL `-shm`/`-wal` index files may materialize
+        // on reads — SQLite reader behavior, not content — so only
+        // non-sidecar entries are compared.)
+        let is_sidecar = |name: &str| {
+            name == "organizer.db-wal"
+                || name == "organizer.db-shm"
+                || name == "organizer.db-journal"
+        };
+        let mut real_files: Vec<String> = fs::read_dir(&source)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| !is_sidecar(n))
+            .collect();
+        real_files.sort();
+        assert_eq!(real_files, vec!["organizer.db".to_string()]);
+        read_all(&reference);
+        assert_eq!(Store::open(&source).unwrap().all_hashes().unwrap().len(), 1);
+        let mut real_after: Vec<String> = fs::read_dir(&source)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| !is_sidecar(n))
+            .collect();
+        real_after.sort();
+        assert_eq!(real_after, real_files);
     }
 
     #[test]
@@ -876,7 +973,8 @@ mod tests {
                 for i in 0..10u8 {
                     let byte = t.wrapping_mul(16).wrapping_add(i);
                     let h = format!("{:02x}", byte).repeat(32);
-                    let rec = FileRecord::new(&h, "a.jpg", "keep/a.jpg", "keep", 1, 1, 1).unwrap();
+                    let hash = FileHash::new(&h).unwrap();
+                    let rec = FileRecord::new(&hash, "a.jpg", "keep/a.jpg", "keep", 1, 1, 1).unwrap();
                     // No caller retry: Store retries transient BUSY internally.
                     store.insert_file(&rec).unwrap();
                 }
@@ -972,6 +1070,26 @@ mod tests {
     }
 
     #[test]
+    fn invalid_reference_file_errors_clearly_without_hinting_missing() {
+        let dir = TempDir::new().unwrap();
+        // Empty file: valid SQLite container, but no organizer schema.
+        let empty = dir.path().join("empty.db");
+        fs::write(&empty, b"").unwrap();
+        // Foreign content: not a database at all.
+        let foreign = dir.path().join("foreign.db");
+        fs::write(&foreign, b"definitely not sqlite").unwrap();
+        for bad in [&empty, &foreign] {
+            match Store::open_reference_file(bad) {
+                Err(StoreError::InvalidDatabase { path, reason }) => {
+                    assert_eq!(path, bad.clone());
+                    assert!(!reason.is_empty(), "reason must name the cause");
+                }
+                other => panic!("expected InvalidDatabase for {}, got {other:?}", bad.display()),
+            }
+        }
+    }
+
+    #[test]
     fn unsupported_schema_version_errors_clearly() {
         let dir = TempDir::new().unwrap();
         let source = dir.path().join("source");
@@ -1008,7 +1126,7 @@ mod tests {
                 shortcut: "1".into(),
             }])
             .is_err());
-        assert!(FileRecord::new("bad", "a.jpg", "keep/a.jpg", "keep", 0, 0, 0).is_err());
+        assert!(FileHash::new("bad").is_err());
         assert_eq!(store.categories().unwrap(), before_categories);
         assert_eq!(store.all_hashes().unwrap(), before_hashes);
     }

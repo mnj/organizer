@@ -67,8 +67,8 @@ pub fn validate_categories(categories: &[Category]) -> Result<(), Vec<Validation
 
     // display_name uniqueness case-insensitive trimmed
     let mut seen_display: HashMap<String, usize> = HashMap::new();
-    for (i, a) in categories.iter().enumerate() {
-        let trimmed = a.display_name.trim();
+    for (i, c) in categories.iter().enumerate() {
+        let trimmed = c.display_name.trim();
         if trimmed.is_empty() {
             errors.push(ValidationError::EmptyDisplayName(i));
         } else {
@@ -85,21 +85,21 @@ pub fn validate_categories(categories: &[Category]) -> Result<(), Vec<Validation
 
     // folder_name checks
     let mut seen_folder: HashSet<String> = HashSet::new();
-    for (i, a) in categories.iter().enumerate() {
+    for (i, c) in categories.iter().enumerate() {
         // Check raw contains / or .. before slug
-        if a.folder_name.contains('/') || a.folder_name.contains('\\') {
-            errors.push(ValidationError::ReservedPath(a.folder_name.clone()));
+        if c.folder_name.contains('/') || c.folder_name.contains('\\') {
+            errors.push(ValidationError::ReservedPath(c.folder_name.clone()));
         }
-        if a.folder_name.trim() == ".." {
-            errors.push(ValidationError::ReservedPath(a.folder_name.clone()));
+        if c.folder_name.trim() == ".." {
+            errors.push(ValidationError::ReservedPath(c.folder_name.clone()));
         }
-        let slug = slugify(&a.folder_name);
+        let slug = slugify(&c.folder_name);
         if slug.is_empty() {
             errors.push(ValidationError::EmptySlug(i));
             continue;
         }
         if slug == "duplicate" {
-            errors.push(ValidationError::ReservedDuplicate(a.folder_name.clone()));
+            errors.push(ValidationError::ReservedDuplicate(c.folder_name.clone()));
         }
         // slug must match regex ^[a-z0-9_-]+$  - our slugify already ensures, but if original had invalid chars stripped, we still consider slug as canonical; validation ensures no duplicate slug
         if !seen_folder.insert(slug.clone()) {
@@ -111,10 +111,10 @@ pub fn validate_categories(categories: &[Category]) -> Result<(), Vec<Validation
 
     // shortcut checks
     let mut seen_shortcut: HashSet<String> = HashSet::new();
-    for a in categories.iter() {
-        let s = a.shortcut.trim();
+    for c in categories.iter() {
+        let s = c.shortcut.trim();
         if s.len() != 1 || !matches!(s.chars().next().unwrap(), '1'..='9') {
-            errors.push(ValidationError::InvalidShortcut(a.shortcut.clone()));
+            errors.push(ValidationError::InvalidShortcut(c.shortcut.clone()));
         } else if !seen_shortcut.insert(s.to_string()) {
             if !errors.iter().any(|e| matches!(e, ValidationError::DuplicateShortcut(x) if x == s)) {
                 errors.push(ValidationError::DuplicateShortcut(s.to_string()));

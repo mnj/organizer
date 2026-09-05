@@ -626,17 +626,18 @@ mod tests {
 
     #[test]
     fn counts_group_by_lower_cased_origin_folder() {
+        use crate::dedup::FileHash;
         let files = vec![
             crate::store::FileRecord::new(
-                &"aa".repeat(32), "a.jpg", "keep/a.jpg", "Keep", 1, 0, 0,
+                &FileHash::new(&"aa".repeat(32)).unwrap(), "a.jpg", "keep/a.jpg", "Keep", 1, 0, 0,
             )
             .unwrap(),
             crate::store::FileRecord::new(
-                &"bb".repeat(32), "b.jpg", "keep/b.jpg", "KEEP", 1, 0, 0,
+                &FileHash::new(&"bb".repeat(32)).unwrap(), "b.jpg", "keep/b.jpg", "KEEP", 1, 0, 0,
             )
             .unwrap(),
             crate::store::FileRecord::new(
-                &"cc".repeat(32), "c.jpg", "maybe/c.jpg", "maybe", 1, 0, 0,
+                &FileHash::new(&"cc".repeat(32)).unwrap(), "c.jpg", "maybe/c.jpg", "maybe", 1, 0, 0,
             )
             .unwrap(),
         ];

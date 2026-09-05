@@ -98,6 +98,13 @@ pub fn parse_category_args(raw: &[String]) -> HashSet<String> {
     out
 }
 
+/// True when `token` (already lower-cased) names this Category by folder or
+/// display name. Single shared predicate for the flag and toggle paths so
+/// both filters agree on what a token selects.
+fn category_matches_token(c: &crate::config::Category, token: &str) -> bool {
+    c.folder_name.to_ascii_lowercase() == token || c.display_name.to_ascii_lowercase() == token
+}
+
 /// Resolve normalized category tokens against known Categories to folder allow-list.
 /// Each token matching a folder or display name (case-insensitive) maps to its
 /// folder lower-cased; unknown tokens are kept as-is so they match nothing
@@ -108,9 +115,7 @@ pub fn resolve_category_filter(raw: &[String], categories: &[crate::config::Cate
     for token in tokens {
         let mut mapped: Option<String> = None;
         for c in categories {
-            if c.folder_name.to_ascii_lowercase() == token
-                || c.display_name.to_ascii_lowercase() == token
-            {
+            if category_matches_token(c, &token) {
                 mapped = Some(c.folder_name.to_ascii_lowercase());
                 break;
             }
@@ -118,6 +123,25 @@ pub fn resolve_category_filter(raw: &[String], categories: &[crate::config::Cate
         out.insert(mapped.unwrap_or(token));
     }
     out
+}
+
+/// CLI `--categories` resolution: absent or empty selection means default-all
+/// (`None`); otherwise the resolved folder allow-list. An explicit selection
+/// that resolves to nothing (e.g. `--categories ""`) also means all, so only
+/// a non-empty selection narrows the Sweep.
+pub fn resolve_cli_category_filter(
+    raw: &[String],
+    categories: &[crate::config::Category],
+) -> Option<HashSet<String>> {
+    if raw.is_empty() {
+        return None;
+    }
+    let resolved = resolve_category_filter(raw, categories);
+    if resolved.is_empty() {
+        None
+    } else {
+        Some(resolved)
+    }
 }
 
 /// Human-readable numbered list of database Categories for the interactive toggle
@@ -136,8 +160,9 @@ pub fn format_toggle_list(categories: &[crate::config::Category]) -> String {
 /// - Empty or `all` (case-insensitive) yields `None` (default: all Categories).
 /// - `none` yields `Some(empty)` (match nothing).
 /// - Otherwise comma/whitespace-separated numbers (1-based position) or
-///   folder/display names (case-insensitive) select those Categories; unknown
-///   tokens are ignored so a typo narrows rather than widens.
+///   folder/display names (case-insensitive) select those Categories.
+///   Unknown names are kept as-is so they match nothing — identical to the
+///   `--categories` flag (a typo narrows instead of widening).
 /// Returns folder lower-cased allow-list for `run_sweep_report_with_filter`.
 pub fn parse_toggle_selection(
     input: &str,
@@ -165,13 +190,16 @@ pub fn parse_toggle_selection(
             }
             continue;
         }
+        let mut matched = false;
         for c in categories {
-            if c.folder_name.to_ascii_lowercase() == lower
-                || c.display_name.to_ascii_lowercase() == lower
-            {
+            if category_matches_token(c, &lower) {
                 out.insert(c.folder_name.to_ascii_lowercase());
+                matched = true;
                 break;
             }
+        }
+        if !matched {
+            out.insert(lower);
         }
     }
     Some(out)
@@ -570,6 +598,7 @@ pub fn format_outcome(outcome: &SweepOutcome, format: OutputFormat) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dedup::FileHash;
     use crate::store::FileRecord;
     use std::fs;
     use tempfile::TempDir;
@@ -590,10 +619,11 @@ mod tests {
         triaged_at: i64,
     ) -> String {
         let hash = compute_sha256(file).unwrap().to_ascii_lowercase();
+        let validated = FileHash::new(&hash).unwrap();
         let size = fs::metadata(file).unwrap().len() as i64;
         store
             .insert_file(
-                &FileRecord::new(&hash, name, &format!("{category}/{name}"), category, size, 0, triaged_at)
+                &FileRecord::new(&validated, name, &format!("{category}/{name}"), category, size, 0, triaged_at)
                     .unwrap(),
             )
             .unwrap();
@@ -915,6 +945,38 @@ mod tests {
         let sel = parse_toggle_selection("KEEP, maybe", &categories).unwrap();
         assert!(sel.contains("keep"));
         assert!(sel.contains("maybe"));
+
+        // Unknown names are kept as-is (match nothing), identical to the flag.
+        let sel = parse_toggle_selection("nope", &categories).unwrap();
+        assert_eq!(sel, std::collections::HashSet::from(["nope".to_string()]));
+        let via_toggle = parse_toggle_selection("keep,nope", &categories).unwrap();
+        let via_flag = resolve_category_filter(&["keep,nope".to_string()], &categories);
+        assert_eq!(via_toggle, via_flag, "toggle line and flag must agree on unknowns");
+    }
+
+    #[test]
+    fn cli_category_filter_defaults_all_on_absent_or_empty() {
+        use crate::config::Category;
+
+        let categories = vec![
+            Category { display_name: "Keep".into(), folder_name: "keep".into(), shortcut: "1".into() },
+        ];
+
+        // Absent flag means default-all.
+        assert_eq!(resolve_cli_category_filter(&[], &categories), None);
+        // An explicit selection that resolves to nothing also means all —
+        // only a non-empty selection narrows the Sweep.
+        assert_eq!(resolve_cli_category_filter(&["".to_string()], &categories), None);
+        assert_eq!(resolve_cli_category_filter(&["  ".to_string()], &categories), None);
+        // Non-empty selections pass through, unknowns kept (match nothing).
+        assert_eq!(
+            resolve_cli_category_filter(&["keep".to_string()], &categories),
+            Some(std::collections::HashSet::from(["keep".to_string()]))
+        );
+        assert_eq!(
+            resolve_cli_category_filter(&["nope".to_string()], &categories),
+            Some(std::collections::HashSet::from(["nope".to_string()]))
+        );
     }
 
     #[test]

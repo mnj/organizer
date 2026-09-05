@@ -13,7 +13,7 @@ use organizer_lib::preview::{ensure_sandbox_bwrap, is_glycin_supported, load_tex
 use organizer_lib::queue::build_snapshot;
 use organizer_lib::store::Store;
 use organizer_lib::sweep::{
-    format_outcome, resolve_category_filter, resolve_reference_db_path,
+    format_outcome, resolve_cli_category_filter, resolve_reference_db_path,
     run_sweep_with_action, Action, OutputFormat, SweepError,
 };
 use organizer_lib::sweep_tui::{
@@ -74,7 +74,8 @@ enum Commands {
         format: OutputFormat,
 
         /// Only match hashes from these origin Categories (folder or display
-        /// name, repeatable and comma-separated, case-insensitive).
+        /// name, repeatable and comma-separated, case-insensitive; empty
+        /// means all).
         /// Skips the interactive toggle screen; scripting escape hatch with
         /// identical semantics to TUI toggles.
         #[arg(long, value_name = "CATEGORY")]
@@ -110,7 +111,9 @@ enum Commands {
 /// outcome summary.
 /// Returns a process exit code: 0 on success (including empty matches),
 /// 1 on error (missing database, bad target, hash/database failure, any
-/// per-file apply failure) or TUI cancellation. The reference database is
+/// per-file apply failure, TUI failure), 130 when the user cancels the
+/// toggle screen (128 + SIGINT convention for user-aborted, so scripts can
+/// tell cancel apart from failure). The reference database is
 /// never modified; unmatched files are untouched; no Classification or moves
 /// to Category subfolders occur.
 fn run_sweep_cli(
@@ -149,10 +152,11 @@ fn run_sweep_cli(
             return 1;
         }
     };
-    // Filter selection: --categories bypasses the TUI entirely.
+    // Filter selection: --categories bypasses the TUI entirely; absent or
+    // empty means default-all. Only a non-empty selection narrows the Sweep.
     let category_filter: Option<std::collections::HashSet<String>> =
         if !categories_raw.is_empty() {
-            Some(resolve_category_filter(&categories_raw, &db_categories))
+            resolve_cli_category_filter(&categories_raw, &db_categories)
         } else if non_interactive {
             None
         } else if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
@@ -169,7 +173,7 @@ fn run_sweep_cli(
                     Ok(TuiOutcome::Confirmed(filter)) => filter,
                     Ok(TuiOutcome::Cancelled) => {
                         eprintln!("organizer: sweep cancelled — no files touched.");
-                        return 1;
+                        return 130;
                     }
                     Err(e) => {
                         // Unconfirmed selection must not widen to all origins:
@@ -378,9 +382,7 @@ fn guard_busy(busy: &Rc<RefCell<bool>>) -> bool {
 
 fn advance_idx(idx: &Rc<RefCell<usize>>, len: usize) {
     let mut v = idx.borrow_mut();
-    if *v + 1 < len {
-        *v += 1;
-    } else if *v + 1 == len {
+    if *v < len {
         *v += 1;
     }
 }
@@ -1244,7 +1246,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                             // push onto undo stack capped to min(50, queue len), clear redo and override
                             {
                                 let cap = snap_c.len();
-                                let entry = UndoEntry::new(&hash_lower, &file_name, dest.clone(), was_duplicate, &folder_name, &display_name);
+                                let entry = UndoEntry::new(&validated, &file_name, dest.clone(), was_duplicate, &folder_name, &display_name);
                                 push_undo_capped(&mut undo_stack_c.borrow_mut(), entry, cap);
                                 redo_stack_c.borrow_mut().clear();
                             }
@@ -1349,7 +1351,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 Ok(restored_path) => {
                     // push to redo with adjusted src_name (actual restored file name)
                     let restored_name = restored_path.file_name().and_then(|n| n.to_str()).unwrap_or(&entry.src_name).to_string();
-                    let redo_entry = UndoEntry::new(&entry.hash, &restored_name, entry.dest_path.clone(), entry.was_duplicate, &entry.folder_name, &entry.display_name);
+                    let redo_entry = UndoEntry::new(&FileHash::new(&entry.hash).expect("undo entry hash was validated at creation"), &restored_name, entry.dest_path.clone(), entry.was_duplicate, &entry.folder_name, &entry.display_name);
                     redo_c.borrow_mut().push(redo_entry);
                     // Make file Current File again (adjust queue index)
                     let search_name = entry.src_name.clone();
@@ -1435,7 +1437,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 Ok(outcome) => {
                     let redo_was_duplicate = outcome.was_duplicate();
                     let dest = outcome.into_dest();
-                    let new_undo = UndoEntry::new(&entry.hash, &entry.src_name, dest.clone(), redo_was_duplicate, &entry.folder_name, &entry.display_name);
+                    let new_undo = UndoEntry::new(&redo_hash, &entry.src_name, dest.clone(), redo_was_duplicate, &entry.folder_name, &entry.display_name);
                     push_undo_capped(&mut undo_c.borrow_mut(), new_undo, snap_c.len());
                     *override_c.borrow_mut() = None;
                     show_toast_c(format!("Redid {}: {} → {}", entry.display_name, entry.src_name, dest.file_name().and_then(|n| n.to_str()).unwrap_or("")));
@@ -1461,13 +1463,13 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
     // Rebuild Category buttons in the Action Bar from live_categories (real mover)
     let rebuild_category_bar: Rc<dyn Fn()> = {
         let categories_row_c = categories_row.clone();
-        let live_c = live_categories.clone();
+        let live = live_categories.clone();
         let trigger_c = trigger_move.clone();
         Rc::new(move || {
             while let Some(child) = categories_row_c.first_child() {
                 categories_row_c.remove(&child);
             }
-            let categories = live_c.borrow().clone();
+            let categories = live.borrow().clone();
             for cat in categories.iter() {
                 let btn = Button::new();
                 btn.add_css_class("category-btn");
@@ -1583,12 +1585,12 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
     // Shared Settings opener (Duplicated Code fix): gear button, Ctrl+, and
     // Edit → Preferences all open the same dialog from the same context.
     let show_settings: Rc<dyn Fn(&ApplicationWindow)> = {
-        let store_c = store.clone();
-        let live_c = live_categories.clone();
-        let disk_c = disk_categories.clone();
-        let rebuild_c = rebuild_category_bar.clone();
+        let store = store.clone();
+        let live = live_categories.clone();
+        let disk = disk_categories.clone();
+        let rebuild_bar = rebuild_category_bar.clone();
         Rc::new(move |parent: &ApplicationWindow| {
-            open_settings(parent, SettingsContext { store: store_c.clone(), live_categories: live_c.clone(), disk_categories: disk_c.clone(), rebuild_category_bar: rebuild_c.clone() });
+            open_settings(parent, SettingsContext { store: store.clone(), live_categories: live.clone(), disk_categories: disk.clone(), rebuild_category_bar: rebuild_bar.clone() });
         })
     };
 

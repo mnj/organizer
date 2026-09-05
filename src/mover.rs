@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 /// Intent-revealing name: resolve a destination collision by suffixing _1, _2 before extension.
 /// Preserves extension; if no extension, suffix after name.
-/// Kept `next_available_path` as alias for tests/back-compat (Mysterious Name fix).
 pub fn resolve_collision_path(dest_dir: &Path, file_name: &str) -> PathBuf {
     let candidate = dest_dir.join(file_name);
     if !candidate.exists() {
@@ -23,11 +22,6 @@ pub fn resolve_collision_path(dest_dir: &Path, file_name: &str) -> PathBuf {
         }
         i += 1;
     }
-}
-
-/// Back-compat alias (kept for existing tests/callers).
-pub fn next_available_path(dest_dir: &Path, file_name: &str) -> PathBuf {
-    resolve_collision_path(dest_dir, file_name)
 }
 
 fn split_filename(name: &str) -> (&str, Option<&str>) {
@@ -120,7 +114,7 @@ fn dest_subdir(source_folder: &Path, name: &str) -> PathBuf {
 
 fn atomic_rename_with_suffix(dest_dir: &Path, current_file: &Path, file_name: &str) -> Result<PathBuf, MoverError> {
     std::fs::create_dir_all(dest_dir).map_err(MoverError::Io)?;
-    let dest_path = next_available_path(dest_dir, file_name);
+    let dest_path = resolve_collision_path(dest_dir, file_name);
     match std::fs::rename(current_file, &dest_path) {
         Ok(()) => Ok(dest_path),
         Err(e) => {
@@ -152,7 +146,7 @@ fn rollback_to_source(source_folder: &Path, dest_path: &Path, file_name: &str) {
         if !candidate.exists() {
             candidate
         } else {
-            next_available_path(source_folder, file_name)
+            resolve_collision_path(source_folder, file_name)
         }
     };
     if let Err(e) = std::fs::rename(dest_path, &target) {
@@ -247,7 +241,7 @@ pub fn classify_file(
     let final_rel = format!("{folder_name}/{dest_file_name}");
 
     let record = match FileRecord::new(
-        &hash_lower,
+        hash,
         &original_rel,
         &final_rel,
         folder_name,
@@ -329,21 +323,21 @@ mod tests {
     }
 
     #[test]
-    fn next_available_path_suffix_before_extension() {
+    fn resolve_collision_path_suffix_before_extension() {
         let dir = TempDir::new().unwrap();
         let p = dir.path();
         // no clash
-        assert_eq!(next_available_path(p, "foo.jpg"), p.join("foo.jpg"));
+        assert_eq!(resolve_collision_path(p, "foo.jpg"), p.join("foo.jpg"));
         fs::write(p.join("foo.jpg"), b"x").unwrap();
-        assert_eq!(next_available_path(p, "foo.jpg"), p.join("foo_1.jpg"));
+        assert_eq!(resolve_collision_path(p, "foo.jpg"), p.join("foo_1.jpg"));
         fs::write(p.join("foo_1.jpg"), b"x").unwrap();
-        assert_eq!(next_available_path(p, "foo.jpg"), p.join("foo_2.jpg"));
+        assert_eq!(resolve_collision_path(p, "foo.jpg"), p.join("foo_2.jpg"));
         // with multiple dots
         fs::write(p.join("a.b.png"), b"x").unwrap();
-        assert_eq!(next_available_path(p, "a.b.png"), p.join("a.b_1.png"));
+        assert_eq!(resolve_collision_path(p, "a.b.png"), p.join("a.b_1.png"));
         // no extension
         fs::write(p.join("README"), b"x").unwrap();
-        assert_eq!(next_available_path(p, "README"), p.join("README_1"));
+        assert_eq!(resolve_collision_path(p, "README"), p.join("README_1"));
     }
 
     #[test]

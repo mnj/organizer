@@ -16,17 +16,16 @@ pub struct UndoEntry {
 
 impl UndoEntry {
     pub fn new(
-        hash: &str,
+        hash: &FileHash,
         src_name: &str,
         dest_path: PathBuf,
         was_duplicate: bool,
         folder_name: &str,
         display_name: &str,
     ) -> Self {
-        // Validate via FileHash to enforce domain type (Primitive Obsession fix)
-        let validated = FileHash::new(hash).map(|h| h.to_string()).unwrap_or_else(|_| hash.to_ascii_lowercase());
+        // The hash arrives as the domain type, so no re-validation is needed.
         Self {
-            hash: validated,
+            hash: hash.to_string(),
             src_name: src_name.to_string(),
             dest_path,
             was_duplicate,
@@ -173,7 +172,7 @@ mod tests {
 
     fn make_entry(i: usize) -> UndoEntry {
         UndoEntry::new(
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &FileHash::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
             &format!("f{i}.jpg"),
             PathBuf::from(format!("/tmp/dest/f{i}.jpg")),
             false,
@@ -234,7 +233,7 @@ mod tests {
             let dest = outcome.into_dest();
             assert!(store.contains(hash.as_str()).unwrap());
 
-            let entry = UndoEntry::new(hash.as_str(), "foo.jpg", dest.clone(), false, "keep", "Keep");
+            let entry = UndoEntry::new(&hash, "foo.jpg", dest.clone(), false, "keep", "Keep");
             let restored = undo_classification(&store, &source, &entry).unwrap();
             assert_eq!(restored, source.join("foo.jpg"));
             assert!(restored.exists());
@@ -259,7 +258,7 @@ mod tests {
             let dest_b = outcome_b.into_dest();
             assert_eq!(dest_b, source.join("duplicate").join("b.jpg"));
 
-            let entry = UndoEntry::new(hb.as_str(), "b.jpg", dest_b.clone(), true, "keep", "Keep");
+            let entry = UndoEntry::new(&hb, "b.jpg", dest_b.clone(), true, "keep", "Keep");
             let restored = undo_classification(&store, &source, &entry).unwrap();
             assert_eq!(restored, source.join("b.jpg"));
             assert!(restored.exists());
@@ -278,7 +277,7 @@ mod tests {
             let dest = outcome.into_dest();
             // Clash file appears before undo.
             fs::write(source.join("foo.jpg"), b"clash").unwrap();
-            let entry = UndoEntry::new(hash.as_str(), "foo.jpg", dest.clone(), false, "keep", "Keep");
+            let entry = UndoEntry::new(&hash, "foo.jpg", dest.clone(), false, "keep", "Keep");
             let restored = undo_classification(&store, &source, &entry).unwrap();
             assert_eq!(restored, source.join("foo_undo_1.jpg"));
             assert!(restored.exists());
@@ -294,7 +293,7 @@ mod tests {
             let hash = hash_of(&foo);
             let outcome = classify_file(&store, &foo, "keep", &hash).unwrap();
             let dest = outcome.into_dest();
-            let entry = UndoEntry::new(hash.as_str(), "foo.jpg", dest.clone(), false, "keep", "Keep");
+            let entry = UndoEntry::new(&hash, "foo.jpg", dest.clone(), false, "keep", "Keep");
             let restored = undo_classification(&store, &source, &entry).unwrap();
             assert!(!store.contains(hash.as_str()).unwrap());
             // Redo is a fresh Classification of the restored file.
@@ -314,7 +313,7 @@ mod tests {
             let dest = outcome.into_dest();
             // Externally delete the destination.
             fs::remove_file(&dest).unwrap();
-            let entry = UndoEntry::new(hash.as_str(), "foo.jpg", dest.clone(), false, "keep", "Keep");
+            let entry = UndoEntry::new(&hash, "foo.jpg", dest.clone(), false, "keep", "Keep");
             assert!(undo_classification(&store, &source, &entry).is_err());
             // Row must still be present since the file could not be restored.
             assert!(store.contains(hash.as_str()).unwrap());
@@ -335,7 +334,7 @@ mod tests {
             fs::remove_dir_all(source.join("keep")).unwrap();
             assert!(!dest.exists());
             // Undo now fails at the rename step (dest missing), row stays.
-            let entry = UndoEntry::new(hash.as_str(), "foo.jpg", dest.clone(), false, "keep", "Keep");
+            let entry = UndoEntry::new(&hash, "foo.jpg", dest.clone(), false, "keep", "Keep");
             assert!(undo_classification(&store, &source, &entry).is_err());
             assert!(store.contains(hash.as_str()).unwrap());
         }

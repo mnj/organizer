@@ -55,12 +55,10 @@ jobs:
         # as `appimage`, in dependency order — without it pkg-config fails
         # with "Requested 'gtk4 >= 4.16' but version of GTK is 4.6.9".
         run: |
-          pip3 install -U meson tomli
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.local/bin:$PATH"
-          # sudo scrubs PATH (secure_path), so expose pip's meson to it —
-          # otherwise every `sudo meson` below fails with "command not found".
-          sudo ln -sf "$HOME/.local/bin/meson" /usr/local/bin/meson
+          # pip as root so meson lands in /usr/local (visible to sudo's
+          # secure_path AND root python's site-packages); a user pip install
+          # breaks `sudo meson` (module not found under root's HOME).
+          sudo pip3 install -U meson tomli
           mkdir -p /tmp/dist-src && cd /tmp/dist-src
           curl -sL -o glib.tar.xz https://download.gnome.org/sources/glib/2.82/glib-2.82.5.tar.xz
           tar xf glib.tar.xz
@@ -267,12 +265,10 @@ jobs:
         # cairo>=1.17 (jammy: 1.16); gtk wants pango>=1.52. Proven chain,
         # in dependency order — mirrors packaging/build-appimage-container.sh.
         run: |
-          pip3 install -U meson tomli
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.local/bin:$PATH"
-          # sudo scrubs PATH (secure_path), so expose pip's meson to it —
-          # otherwise every `sudo meson` below fails with "command not found".
-          sudo ln -sf "$HOME/.local/bin/meson" /usr/local/bin/meson
+          # pip as root so meson lands in /usr/local (visible to sudo's
+          # secure_path AND root python's site-packages); a user pip install
+          # breaks `sudo meson` (module not found under root's HOME).
+          sudo pip3 install -U meson tomli
           mkdir -p /tmp/dist-src && cd /tmp/dist-src
           curl -sL -o glib.tar.xz https://download.gnome.org/sources/glib/2.82/glib-2.82.5.tar.xz
           tar xf glib.tar.xz

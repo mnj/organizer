@@ -58,6 +58,9 @@ jobs:
           pip3 install -U meson tomli
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.local/bin:$PATH"
+          # sudo scrubs PATH (secure_path), so expose pip's meson to it —
+          # otherwise every `sudo meson` below fails with "command not found".
+          sudo ln -sf "$HOME/.local/bin/meson" /usr/local/bin/meson
           mkdir -p /tmp/dist-src && cd /tmp/dist-src
           curl -sL -o glib.tar.xz https://download.gnome.org/sources/glib/2.82/glib-2.82.5.tar.xz
           tar xf glib.tar.xz
@@ -267,6 +270,9 @@ jobs:
           pip3 install -U meson tomli
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.local/bin:$PATH"
+          # sudo scrubs PATH (secure_path), so expose pip's meson to it —
+          # otherwise every `sudo meson` below fails with "command not found".
+          sudo ln -sf "$HOME/.local/bin/meson" /usr/local/bin/meson
           mkdir -p /tmp/dist-src && cd /tmp/dist-src
           curl -sL -o glib.tar.xz https://download.gnome.org/sources/glib/2.82/glib-2.82.5.tar.xz
           tar xf glib.tar.xz

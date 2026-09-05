@@ -122,6 +122,8 @@ fn txt_log_paths(source_folder: &Path) -> Vec<std::path::PathBuf> {
 /// Load union HashSet from all `SourceFolder/*.txt` logs (inside Source Folder).
 /// Each line trimmed, lower-cased, validated as hex; corrupted lines are skipped
 /// with `tracing::warn` and counted. Returns (union, warning_count).
+/// Legacy txt-log path (pre-#24); GUI Duplicate union (#24) reads the Organizer
+/// Database via `Store::contains`/`all_hashes`. Removal tracked in #25.
 pub fn load_union(source_folder: &Path) -> (HashSet<String>, usize) {
     let mut set = HashSet::new();
     let mut warnings = 0usize;
@@ -186,6 +188,8 @@ pub fn find_duplicate_origin(source_folder: &Path, hash: &str) -> Option<String>
 /// `O_APPEND` + `flock` exclusive + `fsync`, fsync parent dir.
 /// `folder_name` is already slug-sanitized; we use it as given.
 /// On non-unix (spec is Linux-only per ADR 0004) we still fsync without flock.
+/// Legacy txt-log path (pre-#24); GUI Classification (#24) records via
+/// `Store::insert_file`. Removal tracked in #25.
 pub fn append_hash_log(source_folder: &Path, folder_name: &str, hash: &str) -> std::io::Result<()> {
     let validated = FileHash::new(hash)?;
     let log_path = source_folder.join(format!("{}.txt", folder_name));

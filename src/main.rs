@@ -7,8 +7,8 @@ use gtk4::{
     Label, Orientation, Paned, Stack,
 };
 use organizer_lib::config::Action;
-use organizer_lib::dedup::compute_sha256;
-use organizer_lib::mover::{classify_file, MoverError};
+use organizer_lib::dedup::{compute_sha256, FileHash};
+use organizer_lib::mover::{classify_file, mover_error_message};
 use organizer_lib::preview::{ensure_sandbox_bwrap, is_glycin_supported, load_texture};
 use organizer_lib::queue::build_snapshot;
 use organizer_lib::store::Store;
@@ -344,6 +344,21 @@ impl HashService {
     }
 }
 
+/// Shared Organizer Database error window (Duplicated Code fix).
+/// Single place for `Store::open` / `store.actions` failures in `build_shell`.
+fn show_database_error_window(app: &Application, message: String) {
+    let window = ApplicationWindow::builder()
+        .application(app)
+        .title("Organizer — database error")
+        .default_width(500)
+        .default_height(120)
+        .build();
+    window.maximize();
+    let lbl = Label::new(Some(&message));
+    window.set_child(Some(&lbl));
+    window.present();
+}
+
 fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf) {
     let provider = css();
     if let Some(display) = gdk::Display::default() {
@@ -398,32 +413,14 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
     let store = match Store::open(&source_folder) {
         Ok(s) => s,
         Err(e) => {
-            let window = ApplicationWindow::builder()
-                .application(app)
-                .title("Organizer — database error")
-                .default_width(500)
-                .default_height(120)
-                .build();
-            window.maximize();
-            let lbl = Label::new(Some(&format!("Failed to open {}: {}", source_folder.join("organizer.db").display(), e)));
-            window.set_child(Some(&lbl));
-            window.present();
+            show_database_error_window(app, format!("Failed to open {}: {}", source_folder.join("organizer.db").display(), e));
             return;
         }
     };
     let initial_actions = match store.actions() {
         Ok(a) => a,
         Err(e) => {
-            let window = ApplicationWindow::builder()
-                .application(app)
-                .title("Organizer — database error")
-                .default_width(500)
-                .default_height(120)
-                .build();
-            window.maximize();
-            let lbl = Label::new(Some(&format!("Failed to load Actions: {e}")));
-            window.set_child(Some(&lbl));
-            window.present();
+            show_database_error_window(app, format!("Failed to load Actions: {e}"));
             return;
         }
     };
@@ -1059,17 +1056,23 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 let file_name = file_name.clone();
                 let current = current.clone();
                 Rc::new(move |hash: String| {
-                    let hash_lower = hash.to_ascii_lowercase();
-                    let is_duplicate = store_c.contains(&hash_lower).unwrap_or(false);
-                    let duplicate_origin_folder = if is_duplicate {
-                        store_c.origin(&hash_lower).unwrap_or(None)
-                    } else {
-                        None
+                    let validated = match FileHash::new(&hash) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            tracing::warn!("invalid hash for {}: {}", file_name, e);
+                            show_toast_c(format!("Failed to hash {}: invalid hash", file_name));
+                            set_busy_state(&busy_c, &spinner_c, &actions_row_c, &btn_prev_c, &btn_next_c, false);
+                            update_ui_c();
+                            return;
+                        }
                     };
-                    match classify_file(&store_c, &current, &folder_name, &hash) {
-                        Ok(dest) => {
-                            let is_dup_dest = dest.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("duplicate");
-                            let was_duplicate = is_dup_dest || is_duplicate;
+                    let hash_lower = validated.as_str().to_string();
+                    // Single Classification call: the outcome names duplicate
+                    // routing, so no pre-check contains/origin roundtrip here.
+                    match classify_file(&store_c, &current, &folder_name, &validated) {
+                        Ok(outcome) => {
+                            let was_duplicate = outcome.was_duplicate();
+                            let dest = outcome.into_dest();
                             // push onto undo stack capped to min(50, queue len), clear redo and override
                             {
                                 let cap = snap_c.len();
@@ -1079,12 +1082,9 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                             }
                             // clear any suffix override on normal move
                             *override_c.borrow_mut() = None;
-                            if is_dup_dest || is_duplicate {
-                                // Re-lookup origin post-move so a concurrent race that
-                                // routed to duplicate/ still toasts the true origin.
-                                let origin_folder = duplicate_origin_folder.or_else(|| {
-                                    store_c.origin(&hash_lower).unwrap_or(None)
-                                });
+                            if was_duplicate {
+                                // Single origin lookup post-move for the toast.
+                                let origin_folder = store_c.origin(&hash_lower).unwrap_or(None);
                                 let origin_display = origin_folder.as_ref().and_then(|folder| {
                                     live_actions_c.borrow().iter().find(|a| &a.folder_name == folder).map(|a| a.display_name.clone())
                                 }).or(origin_folder).unwrap_or_else(|| display_name.clone());
@@ -1098,18 +1098,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                             prehash_c();
                         }
                         Err(e) => {
-                            let msg = match e {
-                                MoverError::Exdev(_) => "Cross-device move not supported — move reverted".to_string(),
-                                MoverError::Db(ref dbe) => {
-                                    tracing::warn!("database failure for {}: {}", file_name, dbe);
-                                    "Database error — move reverted".to_string()
-                                }
-                                MoverError::Io(ref ioe) => {
-                                    tracing::warn!("move failure for {}: {}", file_name, ioe);
-                                    "Disk full / I/O error — move reverted".to_string()
-                                }
-                            };
-                            show_toast_c(msg);
+                            show_toast_c(mover_error_message(&e, &file_name));
                             set_busy_state(&busy_c, &spinner_c, &actions_row_c, &btn_prev_c, &btn_next_c, false);
                             update_ui_c();
                         }
@@ -1265,10 +1254,19 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 redo_c.borrow_mut().push(entry);
                 return;
             }
-            match classify_file(&store_c, &current_file, &entry.folder_name, &entry.hash) {
-                Ok(dest) => {
-                    // push back onto undo stack; was_duplicate is determined by actual redo destination, not carried from prior
-                    let redo_was_duplicate = dest.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("duplicate");
+            let redo_hash = match FileHash::new(&entry.hash) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!("redo invalid hash for {}: {}", entry.src_name, e);
+                    show_toast_c(format!("Redo failed: invalid hash for {}", entry.src_name));
+                    redo_c.borrow_mut().push(entry);
+                    return;
+                }
+            };
+            match classify_file(&store_c, &current_file, &entry.folder_name, &redo_hash) {
+                Ok(outcome) => {
+                    let redo_was_duplicate = outcome.was_duplicate();
+                    let dest = outcome.into_dest();
                     let new_undo = UndoEntry::new(&entry.hash, &entry.src_name, dest.clone(), redo_was_duplicate, &entry.folder_name, &entry.display_name);
                     push_undo_capped(&mut undo_c.borrow_mut(), new_undo, snap_c.len());
                     *override_c.borrow_mut() = None;
@@ -1285,18 +1283,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 }
                 Err(e) => {
                     redo_c.borrow_mut().push(entry);
-                    let msg = match e {
-                        MoverError::Exdev(_) => "Cross-device move not supported".to_string(),
-                        MoverError::Db(ref dbe) => {
-                            tracing::warn!("redo database failure: {}", dbe);
-                            "Database error — move reverted".to_string()
-                        }
-                        MoverError::Io(ref ioe) => {
-                            tracing::warn!("redo failure: {}", ioe);
-                            "Disk full / I/O error — move reverted".to_string()
-                        }
-                    };
-                    show_toast_c(format!("Redo failed: {}", msg));
+                    show_toast_c(format!("Redo failed: {}", mover_error_message(&e, "redo")));
                     update_ui_c();
                 }
             }
@@ -1425,15 +1412,24 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         });
     }
 
-    // Settings trigger via gear button
-    {
-        let win_c = window.clone();
+    // Shared Settings opener (Duplicated Code fix): gear button, Ctrl+, and
+    // Edit → Preferences all open the same dialog from the same context.
+    let show_settings: Rc<dyn Fn(&ApplicationWindow)> = {
+        let store_c = store.clone();
         let live_c = live_actions.clone();
         let disk_c = disk_actions.clone();
         let rebuild_c = rebuild_action_bar.clone();
-        let store_c = store.clone();
+        Rc::new(move |parent: &ApplicationWindow| {
+            open_settings(parent, SettingsContext { store: store_c.clone(), live_actions: live_c.clone(), disk_actions: disk_c.clone(), rebuild_action_bar: rebuild_c.clone() });
+        })
+    };
+
+    // Settings trigger via gear button
+    {
+        let win_c = window.clone();
+        let show_c = show_settings.clone();
         btn_settings.connect_clicked(move |_| {
-            open_settings(&win_c, SettingsContext { store: store_c.clone(), live_actions: live_c.clone(), disk_actions: disk_c.clone(), rebuild_action_bar: rebuild_c.clone() });
+            show_c(&win_c);
         });
     }
 
@@ -1445,10 +1441,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let btn_prev_k = btn_prev.clone();
         let live_k = live_actions.clone();
         let window_weak = window.downgrade();
-        let live_for_settings = live_actions.clone();
-        let disk_for_settings = disk_actions.clone();
-        let rebuild_for_settings = rebuild_action_bar.clone();
-        let store_for_settings = store.clone();
+        let show_settings_k = show_settings.clone();
         let trigger_k = trigger_move.clone();
         let busy_k = busy.clone();
         let undo_k = perform_undo.clone();
@@ -1460,7 +1453,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
             // Ctrl+, opens settings (comma)
             if is_ctrl && (key == gdk::Key::comma || key == gdk::Key::less) {
                 if let Some(win) = window_weak.upgrade() {
-                    open_settings(&win, SettingsContext { store: store_for_settings.clone(), live_actions: live_for_settings.clone(), disk_actions: disk_for_settings.clone(), rebuild_action_bar: rebuild_for_settings.clone() });
+                    show_settings_k(&win);
                     return glib::Propagation::Stop;
                 }
             }
@@ -1563,13 +1556,10 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
     // Also add shortcut actions for Edit menu: Undo, Redo, Preferences
     {
         let win_c = window.clone();
-        let live_c = live_actions.clone();
-        let disk_c = disk_actions.clone();
-        let rebuild_c = rebuild_action_bar.clone();
-        let store_c = store.clone();
+        let show_c = show_settings.clone();
         let action = gio::SimpleAction::new("preferences", None);
         action.connect_activate(move |_, _| {
-            open_settings(&win_c, SettingsContext { store: store_c.clone(), live_actions: live_c.clone(), disk_actions: disk_c.clone(), rebuild_action_bar: rebuild_c.clone() });
+            show_c(&win_c);
         });
         window.add_action(&action);
     }

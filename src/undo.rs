@@ -248,6 +248,8 @@ pub fn remove_last_hash_occurrence(
 /// and if not was_duplicate, remove last hash occurrence from `folder_name.txt` and
 /// remove from union HashSet (only if hash no longer present in any txt after removal).
 /// Returns the restored path on success.
+/// Legacy txt-log path (pre-#24); GUI Undo (#24) uses `undo_classification`.
+/// Removal tracked in #25 (ADR 0007 sqlite-only).
 pub fn undo_move(
     source_folder: &Path,
     entry: &UndoEntry,
@@ -270,9 +272,12 @@ pub fn undo_move(
 /// Folder (suffixing `_undo_1` on clash) and, for non-duplicates, reverts the
 /// database row via `Store::remove`. Duplicate undos touch no rows.
 ///
-/// If the row revert fails the filesystem rename is rolled forward again
-/// (file moved back to its destination) so filesystem and database cannot
-/// drift apart.
+/// If the row revert fails we attempt to roll the filesystem rename forward
+/// again (file back to its destination) so a bare DB failure does not leave
+/// filesystem restored but row present. The roll-forward recreates a missing
+/// destination parent first; if it also fails we return a combined error that
+/// names both failures — the file stays at the restored path and the row stays
+/// present, so the caller must surface drift instead of claiming consistency.
 pub fn undo_classification(
     store: &crate::store::Store,
     source_folder: &Path,
@@ -284,14 +289,24 @@ pub fn undo_classification(
     }
     match store.remove(&entry.hash) {
         Ok(_) => Ok(restored),
-        Err(e) => {
-            // Roll forward: put the file back where it was so a DB failure
-            // does not leave filesystem restored but row present.
-            let _ = std::fs::rename(&restored, &entry.dest_path);
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("database undo failed: {e}"),
-            ))
+        Err(db_err) => {
+            if let Some(parent) = entry.dest_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::rename(&restored, &entry.dest_path) {
+                Ok(()) => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("database undo failed: {db_err}"),
+                )),
+                Err(roll_err) => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "database undo failed ({db_err}); roll-forward also failed ({roll_err}): {} left at {}, row still present",
+                        entry.src_name,
+                        restored.display(),
+                    ),
+                )),
+            }
         }
     }
 }
@@ -575,7 +590,7 @@ mod tests {
 
     mod classification_on_store {
         use super::*;
-        use crate::dedup::compute_sha256;
+        use crate::dedup::{compute_sha256, FileHash};
         use crate::mover::classify_file;
         use crate::store::Store;
         use std::fs;
@@ -589,21 +604,26 @@ mod tests {
             (dir, source, store)
         }
 
+        fn hash_of(path: &std::path::Path) -> FileHash {
+            FileHash::new(&compute_sha256(path).unwrap()).unwrap()
+        }
+
         #[test]
         fn undo_nonduplicate_restores_file_and_reverts_row() {
             let (_dir, source, store) = setup_source();
             let foo = source.join("foo.jpg");
             fs::write(&foo, b"hello undo").unwrap();
-            let hash = compute_sha256(&foo).unwrap();
-            let dest = classify_file(&store, &foo, "keep", &hash).unwrap();
-            assert!(store.contains(&hash).unwrap());
+            let hash = hash_of(&foo);
+            let outcome = classify_file(&store, &foo, "keep", &hash).unwrap();
+            let dest = outcome.into_dest();
+            assert!(store.contains(hash.as_str()).unwrap());
 
-            let entry = UndoEntry::new(&hash, "foo.jpg", dest.clone(), false, "keep", "Keep");
+            let entry = UndoEntry::new(hash.as_str(), "foo.jpg", dest.clone(), false, "keep", "Keep");
             let restored = undo_classification(&store, &source, &entry).unwrap();
             assert_eq!(restored, source.join("foo.jpg"));
             assert!(restored.exists());
             assert!(!dest.exists());
-            assert!(!store.contains(&hash).unwrap());
+            assert!(!store.contains(hash.as_str()).unwrap());
             assert!(store.all_hashes().unwrap().is_empty());
         }
 
@@ -612,21 +632,23 @@ mod tests {
             let (_dir, source, store) = setup_source();
             let a = source.join("a.jpg");
             fs::write(&a, b"same").unwrap();
-            let ha = compute_sha256(&a).unwrap();
+            let ha = hash_of(&a);
             classify_file(&store, &a, "keep", &ha).unwrap();
 
             let b = source.join("b.jpg");
             fs::write(&b, b"same").unwrap();
-            let hb = compute_sha256(&b).unwrap();
-            let dest_b = classify_file(&store, &b, "keep", &hb).unwrap();
+            let hb = hash_of(&b);
+            let outcome_b = classify_file(&store, &b, "keep", &hb).unwrap();
+            assert!(outcome_b.was_duplicate());
+            let dest_b = outcome_b.into_dest();
             assert_eq!(dest_b, source.join("duplicate").join("b.jpg"));
 
-            let entry = UndoEntry::new(&hb, "b.jpg", dest_b.clone(), true, "keep", "Keep");
+            let entry = UndoEntry::new(hb.as_str(), "b.jpg", dest_b.clone(), true, "keep", "Keep");
             let restored = undo_classification(&store, &source, &entry).unwrap();
             assert_eq!(restored, source.join("b.jpg"));
             assert!(restored.exists());
             // Original row untouched.
-            assert!(store.contains(&ha).unwrap());
+            assert!(store.contains(ha.as_str()).unwrap());
             assert_eq!(store.all_hashes().unwrap().len(), 1);
         }
 
@@ -635,16 +657,17 @@ mod tests {
             let (_dir, source, store) = setup_source();
             let foo = source.join("foo.jpg");
             fs::write(&foo, b"hello redo db").unwrap();
-            let hash = compute_sha256(&foo).unwrap();
-            let dest = classify_file(&store, &foo, "keep", &hash).unwrap();
-            let entry = UndoEntry::new(&hash, "foo.jpg", dest.clone(), false, "keep", "Keep");
+            let hash = hash_of(&foo);
+            let outcome = classify_file(&store, &foo, "keep", &hash).unwrap();
+            let dest = outcome.into_dest();
+            let entry = UndoEntry::new(hash.as_str(), "foo.jpg", dest.clone(), false, "keep", "Keep");
             let restored = undo_classification(&store, &source, &entry).unwrap();
-            assert!(!store.contains(&hash).unwrap());
+            assert!(!store.contains(hash.as_str()).unwrap());
             // Redo is a fresh Classification of the restored file.
-            let dest2 = classify_file(&store, &restored, "keep", &hash).unwrap();
-            assert!(dest2.exists());
+            let redo = classify_file(&store, &restored, "keep", &hash).unwrap();
+            assert!(redo.dest().exists());
             assert!(!restored.exists());
-            assert!(store.contains(&hash).unwrap());
+            assert!(store.contains(hash.as_str()).unwrap());
         }
 
         #[test]
@@ -652,14 +675,35 @@ mod tests {
             let (_dir, source, store) = setup_source();
             let foo = source.join("foo.jpg");
             fs::write(&foo, b"data").unwrap();
-            let hash = compute_sha256(&foo).unwrap();
-            let dest = classify_file(&store, &foo, "keep", &hash).unwrap();
+            let hash = hash_of(&foo);
+            let outcome = classify_file(&store, &foo, "keep", &hash).unwrap();
+            let dest = outcome.into_dest();
             // Externally delete the destination.
             fs::remove_file(&dest).unwrap();
-            let entry = UndoEntry::new(&hash, "foo.jpg", dest.clone(), false, "keep", "Keep");
+            let entry = UndoEntry::new(hash.as_str(), "foo.jpg", dest.clone(), false, "keep", "Keep");
             assert!(undo_classification(&store, &source, &entry).is_err());
             // Row must still be present since the file could not be restored.
-            assert!(store.contains(&hash).unwrap());
+            assert!(store.contains(hash.as_str()).unwrap());
+        }
+
+        #[test]
+        fn undo_db_failure_reports_roll_forward_result() {
+            // Drop the database directory's write path by pointing the entry at a
+            // destination whose parent was removed: roll-forward must recreate the
+            // parent instead of silently drifting.
+            let (_dir, source, store) = setup_source();
+            let foo = source.join("foo.jpg");
+            fs::write(&foo, b"roll-forward").unwrap();
+            let hash = hash_of(&foo);
+            let outcome = classify_file(&store, &foo, "keep", &hash).unwrap();
+            let dest = outcome.into_dest();
+            // Remove the Action subfolder to simulate a vanished destination parent.
+            fs::remove_dir_all(source.join("keep")).unwrap();
+            assert!(!dest.exists());
+            // Undo now fails at the rename step (dest missing), row stays.
+            let entry = UndoEntry::new(hash.as_str(), "foo.jpg", dest.clone(), false, "keep", "Keep");
+            assert!(undo_classification(&store, &source, &entry).is_err());
+            assert!(store.contains(hash.as_str()).unwrap());
         }
     }
 }

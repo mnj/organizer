@@ -168,6 +168,8 @@ fn config_path(source_folder: &Path) -> PathBuf {
 
 /// Load or auto-create config for source_folder.
 /// Uses flock shared lock for reading, validates after parse.
+/// Legacy `organizer.toml` path (pre-#24); GUI Actions (#24) live in the
+/// Organizer Database via `Store::actions`/`set_actions`. Removal in #25.
 pub fn load_or_create(source_folder: &Path) -> std::io::Result<Config> {
     let path = config_path(source_folder);
     if !path.exists() {

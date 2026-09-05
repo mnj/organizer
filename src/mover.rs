@@ -75,7 +75,51 @@ impl std::fmt::Display for MoverError {
     }
 }
 
-/// Core mover that operates on domain types (Fixes Primitive Obsession / Data Clumps).
+/// Shared user-facing message for Classification failures (Repeated Switches fix).
+/// Single place mapping `MoverError` to toast text so move + redo cannot drift.
+pub fn mover_error_message(e: &MoverError, file_name: &str) -> String {
+    match e {
+        MoverError::Exdev(_) => "Cross-device move not supported — move reverted".to_string(),
+        MoverError::Db(dbe) => {
+            tracing::warn!("database failure for {}: {}", file_name, dbe);
+            "Database error — move reverted".to_string()
+        }
+        MoverError::Io(ioe) => {
+            tracing::warn!("move failure for {}: {}", file_name, ioe);
+            "Disk full / I/O error — move reverted".to_string()
+        }
+    }
+}
+
+/// Outcome of a Store-backed Classification (Feature Envy fix).
+/// Callers match instead of inferring `duplicate/` from the destination path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClassifyOutcome {
+    /// Moved to the chosen Action subfolder.
+    Classified(PathBuf),
+    /// Hash already known: routed to `duplicate/` with no extra row.
+    Duplicate(PathBuf),
+}
+
+impl ClassifyOutcome {
+    pub fn dest(&self) -> &Path {
+        match self {
+            ClassifyOutcome::Classified(p) | ClassifyOutcome::Duplicate(p) => p,
+        }
+    }
+    pub fn was_duplicate(&self) -> bool {
+        matches!(self, ClassifyOutcome::Duplicate(_))
+    }
+    pub fn into_dest(self) -> PathBuf {
+        match self {
+            ClassifyOutcome::Classified(p) | ClassifyOutcome::Duplicate(p) => p,
+        }
+    }
+}
+
+/// Legacy txt-log Classification path (pre-#24, ADR 0003).
+/// Retained for back-compat; GUI Classification (#24) uses `classify_file` on
+/// the Organizer Database. Removal tracked in #25 (ADR 0007 sqlite-only).
 pub fn move_to_action_with_target(
     target: ActionTarget<'_>,
     current_file: &Path,
@@ -167,6 +211,7 @@ fn move_to_action_inner(
 
 /// Public API preserving original signature (for tests/callers that use raw &str hash).
 /// Validates hash via FileHash before delegating (Primitive Obsession safe).
+/// Legacy txt-log path; see `move_to_action_with_target`. Removal in #25.
 pub fn move_to_action(
     source_folder: &Path,
     current_file: &Path,
@@ -180,7 +225,8 @@ pub fn move_to_action(
 }
 
 /// Roll a Classification rename back to the Source Folder on DB failure.
-/// Suffixes on clash so rollback never overwrites.
+/// Suffixes on clash so rollback never overwrites. Best-effort: warns on
+/// failure so a stuck file is visible instead of silently drifting.
 fn rollback_to_source(source_folder: &Path, dest_path: &Path, file_name: &str) {
     let target = {
         let candidate = source_folder.join(file_name);
@@ -190,7 +236,14 @@ fn rollback_to_source(source_folder: &Path, dest_path: &Path, file_name: &str) {
             next_available_path(source_folder, file_name)
         }
     };
-    let _ = std::fs::rename(dest_path, &target);
+    if let Err(e) = std::fs::rename(dest_path, &target) {
+        tracing::warn!(
+            "classification rollback failed: {} -> {}: {}",
+            dest_path.display(),
+            target.display(),
+            e
+        );
+    }
 }
 
 /// GUI Classification on the Organizer Database (#24).
@@ -200,16 +253,23 @@ fn rollback_to_source(source_folder: &Path, dest_path: &Path, file_name: &str) {
 /// (already known to the database) route to the fixed `duplicate/` subfolder
 /// with no extra record growth. On DB failure the rename is rolled back.
 ///
+/// Atomicity (ADR 0007): the filesystem rename cannot live inside a SQLite
+/// transaction, so atomicity comes from `Store::insert_file` (`BEGIN
+/// IMMEDIATE` + `INSERT OR IGNORE` idempotent claim) plus handling here:
+/// a `contains` fast-path avoids moving known duplicates into Action folders,
+/// and an `insert -> false` race (another writer claimed the hash between our
+/// check and insert) routes the already-moved file on to `duplicate/` with no
+/// extra row. `Store` retries transient BUSY internally.
+///
 /// Relative layout: `original_rel` is the flat file name, `final_rel` is
 /// `<action>/<dest file name>` (suffix-aware on collision).
 pub fn classify_file(
     store: &Store,
     current_file: &Path,
     folder_name: &str,
-    hash: &str,
-) -> Result<PathBuf, MoverError> {
-    let validated = FileHash::new(hash).map_err(MoverError::Io)?;
-    let hash_lower = validated.as_str().to_ascii_lowercase();
+    hash: &FileHash,
+) -> Result<ClassifyOutcome, MoverError> {
+    let hash_lower = hash.as_str().to_ascii_lowercase();
     let source_folder = store.source_folder().to_path_buf();
     if folder_name.is_empty() {
         return Err(MoverError::Io(std::io::Error::new(
@@ -232,7 +292,8 @@ pub fn classify_file(
     // duplicate/ with no record growth (origin lookup via Store::origin for toast).
     let is_duplicate = store.contains(&hash_lower).map_err(MoverError::from)?;
     if is_duplicate {
-        return move_to_duplicate_inner(&source_folder, current_file, &file_name);
+        let dup = move_to_duplicate_inner(&source_folder, current_file, &file_name)?;
+        return Ok(ClassifyOutcome::Duplicate(dup));
     }
 
     // Capture filesystem metadata before the rename for the file row.
@@ -282,18 +343,18 @@ pub fn classify_file(
     };
 
     match store.insert_file(&record) {
-        Ok(true) => Ok(dest_path),
+        Ok(true) => Ok(ClassifyOutcome::Classified(dest_path)),
         Ok(false) => {
             // Lost a concurrent race: another writer inserted the same hash
             // between our contains-check and insert. Route the already-moved
             // file on to duplicate/ so Action folders never gain duplicates
             // and the database gains no extra row.
             if folder_name == "duplicate" {
-                return Ok(dest_path);
+                return Ok(ClassifyOutcome::Duplicate(dest_path));
             }
             let dup_dir = dest_subdir(&source_folder, "duplicate");
             match atomic_rename_with_suffix(&dup_dir, &dest_path, &dest_file_name) {
-                Ok(dup_path) => Ok(dup_path),
+                Ok(dup_path) => Ok(ClassifyOutcome::Duplicate(dup_path)),
                 Err(e) => {
                     rollback_to_source(&source_folder, &dest_path, &file_name);
                     Err(e)
@@ -605,7 +666,7 @@ mod tests {
 
     mod classify_on_store {
         use super::*;
-        use crate::dedup::compute_sha256;
+        use crate::dedup::{compute_sha256, FileHash};
         use crate::store::Store;
         use std::fs;
         use tempfile::TempDir;
@@ -618,21 +679,28 @@ mod tests {
             (dir, source, store)
         }
 
+        fn hash_of(path: &std::path::Path) -> FileHash {
+            let raw = compute_sha256(path).unwrap();
+            FileHash::new(&raw).unwrap()
+        }
+
         #[test]
         fn classify_moves_to_action_and_records_relative_paths() {
             let (_dir, source, store) = setup_source();
             let foo = source.join("foo.jpg");
             fs::write(&foo, b"hello classify").unwrap();
-            let hash = compute_sha256(&foo).unwrap();
+            let hash = hash_of(&foo);
             let meta_before = fs::metadata(&foo).unwrap();
 
-            let dest = classify_file(&store, &foo, "keep", &hash).unwrap();
+            let outcome = classify_file(&store, &foo, "keep", &hash).unwrap();
+            assert!(!outcome.was_duplicate());
+            let dest = outcome.into_dest();
 
             assert!(!foo.exists());
             assert_eq!(dest, source.join("keep").join("foo.jpg"));
             assert!(dest.exists());
             // Database row present with Source Folder-relative paths.
-            let rec = store.lookup(&hash).unwrap().expect("row must exist");
+            let rec = store.lookup(hash.as_str()).unwrap().expect("row must exist");
             assert_eq!(rec.original_rel, "foo.jpg");
             assert_eq!(rec.final_rel, "keep/foo.jpg");
             assert_eq!(rec.action_folder, "keep");
@@ -646,31 +714,33 @@ mod tests {
             let (_dir, source, store) = setup_source();
             let a = source.join("a.jpg");
             fs::write(&a, b"same content").unwrap();
-            let hash = compute_sha256(&a).unwrap();
-            let dest_a = classify_file(&store, &a, "keep", &hash).unwrap();
-            assert_eq!(dest_a, source.join("keep").join("a.jpg"));
+            let hash = hash_of(&a);
+            let outcome_a = classify_file(&store, &a, "keep", &hash).unwrap();
+            assert!(!outcome_a.was_duplicate());
+            assert_eq!(outcome_a.dest(), &source.join("keep").join("a.jpg"));
             assert_eq!(store.all_hashes().unwrap().len(), 1);
-            assert_eq!(store.origin(&hash).unwrap().as_deref(), Some("keep"));
+            assert_eq!(store.origin(hash.as_str()).unwrap().as_deref(), Some("keep"));
 
             let b = source.join("b.jpg");
             fs::write(&b, b"same content").unwrap();
-            let hash_b = compute_sha256(&b).unwrap();
-            assert_eq!(hash, hash_b);
-            let dest_b = classify_file(&store, &b, "keep", &hash_b).unwrap();
+            let hash_b = hash_of(&b);
+            assert_eq!(hash.as_str(), hash_b.as_str());
+            let outcome_b = classify_file(&store, &b, "keep", &hash_b).unwrap();
+            assert!(outcome_b.was_duplicate());
             assert_eq!(
-                dest_b,
-                source.join("duplicate").join("b.jpg"),
+                outcome_b.dest(),
+                &source.join("duplicate").join("b.jpg"),
                 "duplicate hash must route to duplicate/"
             );
-            assert!(dest_b.exists());
+            assert!(outcome_b.dest().exists());
             assert!(!source.join("b.jpg").exists());
             // No extra record growth.
             assert_eq!(store.all_hashes().unwrap().len(), 1);
-            let rec = store.lookup(&hash).unwrap().unwrap();
+            let rec = store.lookup(hash.as_str()).unwrap().unwrap();
             assert_eq!(rec.original_rel, "a.jpg");
             assert_eq!(rec.action_folder, "keep");
             // Origin still keep for toast.
-            assert_eq!(store.origin(&hash_b).unwrap().as_deref(), Some("keep"));
+            assert_eq!(store.origin(hash_b.as_str()).unwrap().as_deref(), Some("keep"));
         }
 
         #[test]
@@ -682,10 +752,10 @@ mod tests {
 
             let foo = source.join("foo.jpg");
             fs::write(&foo, b"new content").unwrap();
-            let hash = compute_sha256(&foo).unwrap();
-            let dest = classify_file(&store, &foo, "keep", &hash).unwrap();
-            assert_eq!(dest, dest_dir.join("foo_1.jpg"));
-            let rec = store.lookup(&hash).unwrap().unwrap();
+            let hash = hash_of(&foo);
+            let outcome = classify_file(&store, &foo, "keep", &hash).unwrap();
+            assert_eq!(outcome.dest(), &dest_dir.join("foo_1.jpg"));
+            let rec = store.lookup(hash.as_str()).unwrap().unwrap();
             assert_eq!(rec.final_rel, "keep/foo_1.jpg");
         }
 
@@ -694,8 +764,8 @@ mod tests {
             let (_dir, source, store) = setup_source();
             let foo = source.join("foo.jpg");
             fs::write(&foo, b"data").unwrap();
-            let res = classify_file(&store, &foo, "keep", "not-a-hash");
-            assert!(res.is_err());
+            // Invalid hashes are rejected at the FileHash boundary before Classification.
+            assert!(FileHash::new("not-a-hash").is_err());
             assert!(foo.exists());
             assert!(store.all_hashes().unwrap().is_empty());
         }
@@ -708,13 +778,13 @@ mod tests {
             let store = Store::open(&source).unwrap();
             let foo = source.join("foo.jpg");
             fs::write(&foo, b"portable").unwrap();
-            let hash = compute_sha256(&foo).unwrap();
+            let hash = hash_of(&foo);
             classify_file(&store, &foo, "keep", &hash).unwrap();
             drop(store);
             let moved = dir.path().join("moved");
             fs::rename(&source, &moved).unwrap();
             let reopened = Store::open(&moved).unwrap();
-            let rec = reopened.lookup(&hash).unwrap().unwrap();
+            let rec = reopened.lookup(hash.as_str()).unwrap().unwrap();
             assert_eq!(rec.original_rel, "foo.jpg");
             assert_eq!(rec.final_rel, "keep/foo.jpg");
             assert!(moved.join(&rec.final_rel).exists());

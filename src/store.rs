@@ -149,6 +149,7 @@ impl FileRecord {
 #[derive(Debug, Clone)]
 pub struct Store {
     source_folder: PathBuf,
+    db_path: PathBuf,
 }
 
 /// True for transient lock contention that is safe to retry.
@@ -194,7 +195,43 @@ impl Store {
             Self::seed_if_empty(&mut conn)?;
             Ok(Self {
                 source_folder: source_folder.to_path_buf(),
+                db_path: db_path_for(source_folder),
             })
+        })
+    }
+
+    /// Open an existing reference database for Sweep (#26) without creating,
+    /// seeding, or writing rows. `db_path` is the exact `organizer.db` file
+    /// (resolved by `sweep::resolve_db_path` from `--db` or its default).
+    /// Errors clearly when the file is missing so callers can hint `--db`.
+    /// Only `SELECT` reads are used afterwards; Sweep never calls
+    /// `insert_file`/`set_actions`/`remove` on this handle.
+    pub fn open_reference_file(db_path: &Path) -> Result<Self, StoreError> {
+        if !db_path.is_file() {
+            return Err(StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "reference database not found: {} (default ./{} in current folder; override with --db PATH)",
+                    db_path.display(),
+                    DB_FILENAME
+                ),
+            )));
+        }
+        let conn = Self::connect_file(db_path)?;
+        Self::check_schema_version(&conn)?;
+        let source_folder = db_path
+            .parent()
+            .map(|p| {
+                if p.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    p.to_path_buf()
+                }
+            })
+            .unwrap_or_else(|| PathBuf::from("."));
+        Ok(Self {
+            source_folder,
+            db_path: db_path.to_path_buf(),
         })
     }
 
@@ -203,12 +240,15 @@ impl Store {
     }
 
     pub fn db_path(&self) -> PathBuf {
-        db_path_for(&self.source_folder)
+        self.db_path.clone()
     }
 
     fn connect(source_folder: &Path) -> Result<Connection, StoreError> {
-        let path = db_path_for(source_folder);
-        let conn = Connection::open(&path)?;
+        Self::connect_file(&db_path_for(source_folder))
+    }
+
+    fn connect_file(db_path: &Path) -> Result<Connection, StoreError> {
+        let conn = Connection::open(db_path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;",
         )?;
@@ -216,7 +256,7 @@ impl Store {
     }
 
     fn connection(&self) -> Result<Connection, StoreError> {
-        Self::connect(&self.source_folder)
+        Self::connect_file(&self.db_path)
     }
 
     fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {

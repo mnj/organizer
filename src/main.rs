@@ -12,6 +12,7 @@ use organizer_lib::mover::{classify_file, mover_error_message};
 use organizer_lib::preview::{ensure_sandbox_bwrap, is_glycin_supported, load_texture};
 use organizer_lib::queue::build_snapshot;
 use organizer_lib::store::Store;
+use organizer_lib::sweep::{format_report, resolve_db_path, run_sweep_report, OutputFormat};
 use organizer_lib::undo::{push_undo_capped, undo_classification, UndoEntry};
 use organizer_lib::video;
 use std::cell::RefCell;
@@ -33,6 +34,50 @@ struct Args {
     /// dep-stripped ubuntu:22.04 container.
     #[arg(long = "self-test-sandbox", hide = true)]
     self_test_sandbox: bool,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Commands {
+    /// Sweep a Target Folder against a reference Organizer Database (dry-run report).
+    /// Scans a flat Supported-Format Snapshot, matches sha256, reports matched
+    /// path, hash, origin Action and triage time. Read-only: never modifies
+    /// files or the database; unmatched files are untouched and unlisted.
+    #[command(alias = "cleanup")]
+    Sweep {
+        /// Target Folder to scan (flat, Supported Format only).
+        #[arg(value_name = "TARGET_FOLDER")]
+        target: PathBuf,
+
+        /// Path to the reference organizer.db file or its Source Folder.
+        /// Defaults to ./organizer.db in the current folder.
+        #[arg(long, value_name = "DB_PATH", aliases = ["reference-db", "reference"])]
+        db: Option<PathBuf>,
+
+        /// Output format: human table or machine-readable json.
+        #[arg(long, value_enum, default_value = "table")]
+        format: OutputFormat,
+    },
+}
+
+/// CLI Sweep report entry point (#26 dry-run). Resolves `--db` (defaulting to
+/// the current folder), runs the read-only report, prints table/json.
+/// Returns a process exit code: 0 on success, 1 on error (missing database,
+/// bad target, hash/database failure). Never modifies files or the database.
+fn run_sweep_cli(target: PathBuf, db_raw: Option<PathBuf>, format: OutputFormat) -> i32 {
+    let db_path = resolve_db_path(db_raw.as_deref());
+    match run_sweep_report(&target, &db_path) {
+        Ok(report) => {
+            print!("{}", format_report(&report, format));
+            0
+        }
+        Err(e) => {
+            eprintln!("organizer: {e}");
+            1
+        }
+    }
 }
 
 /// Headless probe behind `--self-test-sandbox` (spec #21 CI smoke).
@@ -1602,6 +1647,9 @@ fn main() -> glib::ExitCode {
     let args = Args::parse();
     if args.self_test_sandbox {
         std::process::exit(run_self_test_sandbox());
+    }
+    if let Some(Commands::Sweep { target, db, format }) = args.command {
+        std::process::exit(run_sweep_cli(target, db, format));
     }
     let app = Application::builder()
         .application_id("com.example.organizer")

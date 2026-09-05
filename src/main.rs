@@ -12,7 +12,7 @@ use organizer_lib::mover::{classify_file, mover_error_message};
 use organizer_lib::preview::{ensure_sandbox_bwrap, is_glycin_supported, load_texture};
 use organizer_lib::queue::build_snapshot;
 use organizer_lib::store::Store;
-use organizer_lib::sweep::{format_report, resolve_db_path, run_sweep_report, OutputFormat};
+use organizer_lib::sweep::{format_report, resolve_reference_db_path, run_sweep_report, OutputFormat};
 use organizer_lib::undo::{push_undo_capped, undo_classification, UndoEntry};
 use organizer_lib::video;
 use std::cell::RefCell;
@@ -45,7 +45,9 @@ enum Commands {
     /// Scans a flat Supported-Format Snapshot, matches sha256, reports matched
     /// path, hash, origin Action and triage time. Read-only: never modifies
     /// files or the database; unmatched files are untouched and unlisted.
-    #[command(alias = "cleanup")]
+    // Canonical name follows the domain vocabulary (Sweep); `cleanup` stays a
+    // visible alias for the ADR 0007 contract (`organizer cleanup <TARGET>`).
+    #[command(visible_alias = "cleanup")]
     Sweep {
         /// Target Folder to scan (flat, Supported Format only).
         #[arg(value_name = "TARGET_FOLDER")]
@@ -53,6 +55,8 @@ enum Commands {
 
         /// Path to the reference organizer.db file or its Source Folder.
         /// Defaults to ./organizer.db in the current folder.
+        // `--reference-db` / `--reference` are accepted because the issue
+        // text calls it the "reference database" while ADR 0007 calls it `--db`.
         #[arg(long, value_name = "DB_PATH", aliases = ["reference-db", "reference"])]
         db: Option<PathBuf>,
 
@@ -67,7 +71,7 @@ enum Commands {
 /// Returns a process exit code: 0 on success, 1 on error (missing database,
 /// bad target, hash/database failure). Never modifies files or the database.
 fn run_sweep_cli(target: PathBuf, db_raw: Option<PathBuf>, format: OutputFormat) -> i32 {
-    let db_path = resolve_db_path(db_raw.as_deref());
+    let db_path = resolve_reference_db_path(db_raw.as_deref());
     match run_sweep_report(&target, &db_path) {
         Ok(report) => {
             print!("{}", format_report(&report, format));

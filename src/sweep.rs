@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::dedup::compute_sha256;
 use crate::queue::build_snapshot;
-use crate::store::{Store, StoreError, DB_FILENAME};
+use crate::store::{missing_reference_message, Store, StoreError, DB_FILENAME};
 
 /// Output format for Sweep report (#26): human table alongside machine-readable json.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -47,12 +47,7 @@ impl std::fmt::Display for SweepError {
             SweepError::TargetUnreadable(p, e) => {
                 write!(f, "failed to scan target folder {}: {}", p.display(), e)
             }
-            SweepError::MissingDatabase(p) => write!(
-                f,
-                "reference database not found: {} (default ./{} in current folder; override with --db PATH)",
-                p.display(),
-                DB_FILENAME
-            ),
+            SweepError::MissingDatabase(p) => write!(f, "{}", missing_reference_message(p)),
             SweepError::Database(e) => write!(f, "{e}"),
             SweepError::HashFailed(p, e) => {
                 write!(f, "failed to hash {}: {}", p.display(), e)
@@ -63,21 +58,21 @@ impl std::fmt::Display for SweepError {
 
 impl std::error::Error for SweepError {}
 
-/// Resolve the reference database file path.
+/// Resolve the reference database file path (distinct from
+/// `store::db_path_for`, which derives `<Source Folder>/organizer.db` for
+/// Classification: this resolves the Sweep `--db` flag value instead).
 /// - None defaults to `./organizer.db` in the current folder.
-/// - An existing directory (or a non-existing path with no extension, i.e. dir-like)
-///   resolves to `<dir>/organizer.db`.
-/// - Otherwise the path is used as-is (explicit `.db` file).
-pub fn resolve_db_path(db_arg: Option<&Path>) -> PathBuf {
+/// - An existing directory resolves to `<dir>/organizer.db` (so a Source
+///   Folder can be passed directly).
+/// - Anything else is used as-is, so an explicit file path — with or without
+///   an extension — is never rewritten.
+pub fn resolve_reference_db_path(db_arg: Option<&Path>) -> PathBuf {
     match db_arg {
         None => std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(DB_FILENAME),
         Some(p) => {
             if p.is_dir() {
-                return p.join(DB_FILENAME);
-            }
-            if p.extension().is_none() && !p.is_file() {
                 return p.join(DB_FILENAME);
             }
             p.to_path_buf()
@@ -229,6 +224,26 @@ mod tests {
         p
     }
 
+    /// Hash `file` and record it in the reference database as triaged to
+    /// `action` at `triaged_at`. Returns the lower-case sha256.
+    fn insert_known(
+        store: &Store,
+        file: &Path,
+        name: &str,
+        action: &str,
+        triaged_at: i64,
+    ) -> String {
+        let hash = compute_sha256(file).unwrap().to_ascii_lowercase();
+        let size = fs::metadata(file).unwrap().len() as i64;
+        store
+            .insert_file(
+                &FileRecord::new(&hash, name, &format!("{action}/{name}"), action, size, 0, triaged_at)
+                    .unwrap(),
+            )
+            .unwrap();
+        hash
+    }
+
     #[test]
     fn report_lists_matched_with_path_hash_action_time_and_leaves_files() {
         let tmp = TempDir::new().unwrap();
@@ -240,29 +255,8 @@ mod tests {
         fs::create_dir_all(&target).unwrap();
         let known = write_target(&target, "known.jpg", b"known content");
         let unknown = write_target(&target, "unknown.jpg", b"brand new content");
-        let known_hash = compute_sha256(&known).unwrap().to_ascii_lowercase();
         let triaged_at = 1_700_000_000i64;
-        let meta = fs::metadata(&known).unwrap();
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        store
-            .insert_file(
-                &FileRecord::new(
-                    &known_hash,
-                    "known.jpg",
-                    "keep/known.jpg",
-                    "keep",
-                    meta.len() as i64,
-                    mtime,
-                    triaged_at,
-                )
-                .unwrap(),
-            )
-            .unwrap();
+        let known_hash = insert_known(&store, &known, "known.jpg", "keep", triaged_at);
 
         let report = run_sweep_report(&target, &store.db_path()).unwrap();
         assert_eq!(report.scanned, 2);
@@ -299,12 +293,7 @@ mod tests {
             ("clip.webm", b"video".as_slice()),
         ] {
             let p = write_target(&target, name, content);
-            let h = compute_sha256(&p).unwrap().to_ascii_lowercase();
-            store
-                .insert_file(
-                    &FileRecord::new(&h, name, &format!("keep/{name}"), "keep", 1, 0, 7).unwrap(),
-                )
-                .unwrap();
+            insert_known(&store, &p, name, "keep", 7);
         }
         // Unsupported + legacy + database artifacts must be excluded.
         for name in [
@@ -368,13 +357,7 @@ mod tests {
         fs::create_dir_all(&target).unwrap();
         let known = write_target(&target, "known.jpg", b"known bytes");
         write_target(&target, "unknown.jpg", b"unknown bytes");
-        let known_hash = compute_sha256(&known).unwrap().to_ascii_lowercase();
-        store
-            .insert_file(
-                &FileRecord::new(&known_hash, "known.jpg", "keep/known.jpg", "keep", 3, 0, 42)
-                    .unwrap(),
-            )
-            .unwrap();
+        let known_hash = insert_known(&store, &known, "known.jpg", "keep", 42);
 
         let report = run_sweep_report(&target, &store.db_path()).unwrap();
         let table = format_report(&report, OutputFormat::Table);
@@ -399,30 +382,33 @@ mod tests {
     }
 
     #[test]
-    fn resolve_db_path_defaults_to_current_and_handles_dir_vs_file() {
+    fn resolve_reference_db_path_defaults_to_current_and_handles_dir_vs_file() {
         let tmp = TempDir::new().unwrap();
         // Default resolves to current folder's organizer.db.
         let cur = std::env::current_dir().unwrap().join(DB_FILENAME);
-        assert_eq!(resolve_db_path(None), cur);
+        assert_eq!(resolve_reference_db_path(None), cur);
 
         // Existing dir resolves inside it.
         let dir = tmp.path().join("src");
         fs::create_dir_all(&dir).unwrap();
-        assert_eq!(resolve_db_path(Some(&dir)), dir.join(DB_FILENAME));
+        assert_eq!(resolve_reference_db_path(Some(&dir)), dir.join(DB_FILENAME));
 
         // Explicit .db file is used as-is.
         let file = tmp.path().join("custom").join("organizer.db");
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         fs::write(&file, b"").unwrap();
-        assert_eq!(resolve_db_path(Some(&file)), file);
+        assert_eq!(resolve_reference_db_path(Some(&file)), file);
 
-        // Non-existing dir-like path (no extension) resolves inside it.
-        let like_dir = tmp.path().join("future-folder");
-        assert_eq!(resolve_db_path(Some(&like_dir)), like_dir.join(DB_FILENAME));
+        // A non-directory path is used as-is even without an extension, so
+        // explicit file overrides are never rewritten to `<path>/organizer.db`.
+        let explicit = tmp.path().join("myref");
+        assert_eq!(resolve_reference_db_path(Some(&explicit)), explicit);
     }
 
     #[test]
     fn sweep_is_read_only_on_reference_and_target() {
+        use std::os::unix::fs::PermissionsExt;
+
         let tmp = TempDir::new().unwrap();
         let source = tmp.path().join("source");
         fs::create_dir_all(&source).unwrap();
@@ -431,25 +417,49 @@ mod tests {
         let target = tmp.path().join("target");
         fs::create_dir_all(&target).unwrap();
         let known = write_target(&target, "known.jpg", b"dup bytes");
-        let known_hash = compute_sha256(&known).unwrap().to_ascii_lowercase();
-        store
-            .insert_file(
-                &FileRecord::new(&known_hash, "known.jpg", "keep/known.jpg", "keep", 1, 0, 9)
-                    .unwrap(),
-            )
-            .unwrap();
+        insert_known(&store, &known, "known.jpg", "keep", 9);
         let before_hashes = store.all_hashes().unwrap();
         let before_actions = store.actions().unwrap();
         let before_bytes = fs::read(&known).unwrap();
+
+        // Warm-up run: SQLite WAL readers materialize the -shm/-wal index on
+        // first access even when read-only, so snapshot the file baseline after
+        // one Sweep. Everything asserted below is steady-state.
+        let warmup = run_sweep_report(&target, &store.db_path()).unwrap();
+        assert_eq!(warmup.matches.len(), 1);
+        let mut before_files: Vec<String> = fs::read_dir(&source)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        before_files.sort();
+
+        // Filesystem-level read-only: with every reference file chmodded
+        // 0o444, Sweep must still succeed — it performs no row writes, and
+        // any write attempt would fail against these permissions.
+        for e in fs::read_dir(&source).unwrap().flatten() {
+            let mut perms = e.metadata().unwrap().permissions();
+            perms.set_mode(0o444);
+            fs::set_permissions(e.path(), perms).unwrap();
+        }
 
         let report = run_sweep_report(&target, &store.db_path()).unwrap();
         assert_eq!(report.matches.len(), 1);
 
         // No row growth, no action changes, no file moves, no duplicate/ subfolder.
-        assert_eq!(store.all_hashes().unwrap(), before_hashes);
-        assert_eq!(store.actions().unwrap(), before_actions);
+        let reference = Store::open_reference_file(&store.db_path()).unwrap();
+        assert_eq!(reference.all_hashes().unwrap(), before_hashes);
+        assert_eq!(reference.actions().unwrap(), before_actions);
         assert_eq!(fs::read(&known).unwrap(), before_bytes);
         assert!(!target.join("duplicate").exists());
         assert!(!source.join("duplicate").exists() || source.join("duplicate").read_dir().map(|mut d| d.next().is_none()).unwrap_or(true));
+        // No sidecar files created beside the reference database.
+        let mut after_files: Vec<String> = fs::read_dir(&source)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        after_files.sort();
+        assert_eq!(after_files, before_files, "Sweep must not create files beside the reference database");
     }
 }

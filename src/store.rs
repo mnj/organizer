@@ -1,6 +1,6 @@
 use crate::config::{default_actions, validate_actions, Action, ValidationError};
 use crate::dedup::{is_valid_hash, FileHash};
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +13,17 @@ const DB_ARTIFACT_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal"];
 /// Returns the database path for a Source Folder.
 pub fn db_path_for(source_folder: &Path) -> PathBuf {
     source_folder.join(DB_FILENAME)
+}
+
+/// Single constructor for the missing-reference-database message, shared by
+/// `Store::open_reference_file` and Sweep's `MissingDatabase` display so the
+/// two wordings cannot drift apart (Duplicated Code fix).
+pub fn missing_reference_message(db_path: &Path) -> String {
+    format!(
+        "reference database not found: {} (default ./{} in current folder; override with --db PATH)",
+        db_path.display(),
+        DB_FILENAME
+    )
 }
 
 /// Returns true if `path` is the Organizer Database or one of its WAL artifacts.
@@ -150,6 +161,10 @@ impl FileRecord {
 pub struct Store {
     source_folder: PathBuf,
     db_path: PathBuf,
+    /// True for Sweep reference handles (#26): every connection opens
+    /// `SQLITE_OPEN_READ_ONLY`, so cleaning a target can never write rows
+    /// or create `-wal`/`-shm` sidecars on the reference database.
+    read_only: bool,
 }
 
 /// True for transient lock contention that is safe to retry.
@@ -196,28 +211,26 @@ impl Store {
             Ok(Self {
                 source_folder: source_folder.to_path_buf(),
                 db_path: db_path_for(source_folder),
+                read_only: false,
             })
         })
     }
 
     /// Open an existing reference database for Sweep (#26) without creating,
     /// seeding, or writing rows. `db_path` is the exact `organizer.db` file
-    /// (resolved by `sweep::resolve_db_path` from `--db` or its default).
+    /// (resolved by `sweep::resolve_reference_db_path` from `--db` or its default).
     /// Errors clearly when the file is missing so callers can hint `--db`.
-    /// Only `SELECT` reads are used afterwards; Sweep never calls
-    /// `insert_file`/`set_actions`/`remove` on this handle.
+    /// The handle is read-only at the SQLite level (`SQLITE_OPEN_READ_ONLY`
+    /// on every connection): Sweep never calls `insert_file`/`set_actions`/
+    /// `remove`, and the open itself cannot create `-wal`/`-shm` sidecars.
     pub fn open_reference_file(db_path: &Path) -> Result<Self, StoreError> {
         if !db_path.is_file() {
             return Err(StoreError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!(
-                    "reference database not found: {} (default ./{} in current folder; override with --db PATH)",
-                    db_path.display(),
-                    DB_FILENAME
-                ),
+                missing_reference_message(db_path),
             )));
         }
-        let conn = Self::connect_file(db_path)?;
+        let conn = Self::connect_reference_file(db_path)?;
         Self::check_schema_version(&conn)?;
         let source_folder = db_path
             .parent()
@@ -232,6 +245,7 @@ impl Store {
         Ok(Self {
             source_folder,
             db_path: db_path.to_path_buf(),
+            read_only: true,
         })
     }
 
@@ -255,8 +269,22 @@ impl Store {
         Ok(conn)
     }
 
+    /// Read-only connection for Sweep reference handles: no WAL promotion,
+    /// no synchronous change, only a per-connection busy timeout. Combined
+    /// with `SQLITE_OPEN_READ_ONLY` the reference database cannot gain rows
+    /// or `-wal`/`-shm` sidecars while a target is cleaned.
+    fn connect_reference_file(db_path: &Path) -> Result<Connection, StoreError> {
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+        Ok(conn)
+    }
+
     fn connection(&self) -> Result<Connection, StoreError> {
-        Self::connect_file(&self.db_path)
+        if self.read_only {
+            Self::connect_reference_file(&self.db_path)
+        } else {
+            Self::connect_file(&self.db_path)
+        }
     }
 
     fn ensure_schema(conn: &Connection) -> Result<(), StoreError> {
@@ -682,6 +710,48 @@ mod tests {
         let source = dir.path().join("source");
         let store = Store::open(&source).unwrap();
         assert_eq!(store.journal_mode().unwrap().to_ascii_lowercase(), "wal");
+    }
+
+    #[test]
+    fn open_reference_file_rejects_writes_as_readonly() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        let store = Store::open(&source).unwrap();
+        let db = store.db_path();
+        let reference = Store::open_reference_file(&db).unwrap();
+        // Reads work on the reference handle.
+        assert_eq!(reference.actions().unwrap().len(), 3);
+        // Every write path goes through the read-only connection, so SQLite
+        // refuses with SQLITE_READONLY instead of touching the database.
+        let rec = FileRecord::new(
+            &"aa".repeat(32),
+            "a.jpg",
+            "keep/a.jpg",
+            "keep",
+            1,
+            0,
+            0,
+        )
+        .unwrap();
+        let err = reference.insert_file(&rec).unwrap_err().to_string();
+        assert!(
+            err.contains("readonly"),
+            "reference insert must fail SQLITE_READONLY, got: {err}"
+        );
+        assert!(
+            reference
+                .set_actions(&[Action {
+                    display_name: "A".into(),
+                    folder_name: "a".into(),
+                    shortcut: "1".into(),
+                }])
+                .unwrap_err()
+                .to_string()
+                .contains("readonly"),
+            "reference set_actions must fail SQLITE_READONLY"
+        );
+        // The refused writes left no rows behind.
+        assert!(Store::open(&source).unwrap().all_hashes().unwrap().is_empty());
     }
 
     #[test]

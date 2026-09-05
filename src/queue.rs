@@ -26,7 +26,7 @@ fn is_supported(path: &Path) -> bool {
 }
 
 /// Build a flat, natural case-insensitive sorted Snapshot of Supported Formats
-/// from `source_folder`. Non-supported files (including internal `.toml`/`.txt`
+/// from `source_folder`. Unsupported files (including internal `.toml`/`.txt`
 /// and the Organizer Database `organizer.db` + WAL artifacts) are
 /// silently excluded and never enter the Queue. No recursion, no live watch.
 pub fn build_snapshot(source_folder: &Path) -> std::io::Result<Vec<PathBuf>> {

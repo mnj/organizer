@@ -16,7 +16,7 @@ pub fn db_path_for(source_folder: &Path) -> PathBuf {
 }
 
 /// Returns true if `path` is the Organizer Database or one of its WAL artifacts.
-/// Used to keep internal files out of Queue Snapshots (future Classification/Sweep).
+/// Used to keep internal files out of the Queue Snapshot (future Classification/Sweep).
 pub fn is_internal_db_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
@@ -41,6 +41,7 @@ pub enum StoreError {
     Validation(Vec<ValidationError>),
     InvalidHash(String),
     InvalidPath(String),
+    UnsupportedSchema { found: String },
 }
 
 impl std::fmt::Display for StoreError {
@@ -54,6 +55,10 @@ impl std::fmt::Display for StoreError {
             }
             StoreError::InvalidHash(h) => write!(f, "invalid hash: {h}"),
             StoreError::InvalidPath(p) => write!(f, "invalid relative path: {p}"),
+            StoreError::UnsupportedSchema { found } => write!(
+                f,
+                "unsupported organizer.db schema_version {found:?} (expected \"1\"); move the Source Folder aside or delete organizer.db to reseed"
+            ),
         }
     }
 }
@@ -138,22 +143,58 @@ impl FileRecord {
 /// or writes legacy files. Each operation opens a short-lived SQLite connection
 /// in WAL mode with `busy_timeout` so concurrent openers serialize via
 /// `BEGIN IMMEDIATE` instead of corrupting the database.
+///
+/// Record layer only: filesystem moves stay in `mover` (Classification #24
+/// combines move + insert and rolls the row back if the rename fails).
 #[derive(Debug, Clone)]
 pub struct Store {
     source_folder: PathBuf,
 }
 
+/// True for transient lock contention that is safe to retry.
+fn is_busy(err: &StoreError) -> bool {
+    matches!(
+        err,
+        StoreError::Sql(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::DatabaseBusy
+                || e.code == rusqlite::ErrorCode::DatabaseLocked
+    )
+}
+
+/// Run a write operation, retrying transient `BUSY`/`LOCKED` with backoff so
+/// callers serialize instead of seeing spurious lock errors under contention.
+/// `busy_timeout=5000` already covers most waits; this covers the residual race.
+fn retry_on_busy<T>(mut op: impl FnMut() -> Result<T, StoreError>) -> Result<T, StoreError> {
+    const ATTEMPTS: usize = 50;
+    let mut last: Option<StoreError> = None;
+    for attempt in 0..ATTEMPTS {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) if is_busy(&e) && attempt + 1 < ATTEMPTS => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.expect("retry loop must have attempted"))
+}
+
 impl Store {
     /// Open (or seed) the Organizer Database in `source_folder`.
-    /// Creates the folder if missing, enables WAL, creates schema, seeds defaults.
+    /// Creates the folder if missing, enables WAL, creates schema, checks the
+    /// schema version, seeds defaults.
     /// Never touches `organizer.toml` or `*.txt`.
     pub fn open(source_folder: &Path) -> Result<Self, StoreError> {
-        std::fs::create_dir_all(source_folder)?;
-        let mut conn = Self::connect(source_folder)?;
-        Self::ensure_schema(&conn)?;
-        Self::seed_if_empty(&mut conn)?;
-        Ok(Self {
-            source_folder: source_folder.to_path_buf(),
+        retry_on_busy(|| {
+            std::fs::create_dir_all(source_folder)?;
+            let mut conn = Self::connect(source_folder)?;
+            Self::ensure_schema(&conn)?;
+            Self::check_schema_version(&conn)?;
+            Self::seed_if_empty(&mut conn)?;
+            Ok(Self {
+                source_folder: source_folder.to_path_buf(),
+            })
         })
     }
 
@@ -192,7 +233,7 @@ impl Store {
                 position INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS files (
-                hash TEXT PRIMARY KEY,
+                hash TEXT PRIMARY KEY CHECK (length(hash) = 64 AND hash = lower(hash)),
                 original_rel TEXT NOT NULL,
                 final_rel TEXT NOT NULL,
                 action_folder TEXT NOT NULL,
@@ -204,6 +245,19 @@ impl Store {
             INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1');
             INSERT OR IGNORE INTO meta (key, value) VALUES ('config_version', '1');",
         )?;
+        Ok(())
+    }
+
+    /// Fail clearly on a database from a newer (or older) schema instead of
+    /// silently accepting rows we cannot interpret.
+    fn check_schema_version(conn: &Connection) -> Result<(), StoreError> {
+        let found: String =
+            conn.query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| {
+                r.get(0)
+            })?;
+        if found != "1" {
+            return Err(StoreError::UnsupportedSchema { found });
+        }
         Ok(())
     }
 
@@ -282,14 +336,16 @@ impl Store {
     /// On validation failure the database is left unchanged.
     pub fn set_actions(&self, actions: &[Action]) -> Result<(), StoreError> {
         validate_actions(actions).map_err(StoreError::Validation)?;
-        let mut conn = self.connection()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute("DELETE FROM actions", [])?;
-        for (pos, a) in actions.iter().enumerate() {
-            Self::insert_action_row(&tx, a, pos)?;
-        }
-        tx.commit()?;
-        Ok(())
+        retry_on_busy(|| {
+            let mut conn = self.connection()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute("DELETE FROM actions", [])?;
+            for (pos, a) in actions.iter().enumerate() {
+                Self::insert_action_row(&tx, a, pos)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// True if `hash` (any case) is already known.
@@ -320,39 +376,49 @@ impl Store {
     /// so concurrent openers serialize instead of corrupting.
     pub fn insert_file(&self, record: &FileRecord) -> Result<bool, StoreError> {
         // Re-validate to enforce lower-case + hex even if caller built the struct manually.
+        // The DB CHECK(length(hash) = 64 AND hash = lower(hash)) is defense-in-depth.
         let validated = FileHash::new(&record.hash).map_err(|_| StoreError::InvalidHash(record.hash.clone()))?;
-        let mut conn = self.connection()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = tx.execute(
-            "INSERT OR IGNORE INTO files (hash, original_rel, final_rel, action_folder, size, mtime, triaged_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                validated.as_str(),
-                record.original_rel,
-                record.final_rel,
-                record.action_folder,
-                record.size,
-                record.mtime,
-                record.triaged_at
-            ],
-        )?;
-        tx.commit()?;
-        Ok(changed == 1)
+        let hash = validated.as_str().to_string();
+        let original_rel = record.original_rel.clone();
+        let final_rel = record.final_rel.clone();
+        let action_folder = record.action_folder.clone();
+        let (size, mtime, triaged_at) = (record.size, record.mtime, record.triaged_at);
+        retry_on_busy(|| {
+            let mut conn = self.connection()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
+                "INSERT OR IGNORE INTO files (hash, original_rel, final_rel, action_folder, size, mtime, triaged_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    hash,
+                    original_rel,
+                    final_rel,
+                    action_folder,
+                    size,
+                    mtime,
+                    triaged_at
+                ],
+            )?;
+            tx.commit()?;
+            Ok(changed == 1)
+        })
     }
 
-    /// Remove a hash row (for Undo). Returns true if a row was removed.
+    /// Remove a hash row (Undo #24 seam). Returns true if a row was removed.
     pub fn remove(&self, hash: &str) -> Result<bool, StoreError> {
         let lower = hash.to_ascii_lowercase();
         if !is_valid_hash(&lower) {
             return Err(StoreError::InvalidHash(hash.to_string()));
         }
-        let mut conn = self.connection()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = tx.execute("DELETE FROM files WHERE hash = ?1", params![lower])?;
-        tx.commit()?;
-        Ok(changed == 1)
+        retry_on_busy(|| {
+            let mut conn = self.connection()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute("DELETE FROM files WHERE hash = ?1", params![lower])?;
+            tx.commit()?;
+            Ok(changed == 1)
+        })
     }
 
-    /// Union of all known lower-case hashes.
+    /// Union of all known lower-case hashes (Sweep #26-28 match seam).
     pub fn all_hashes(&self) -> Result<HashSet<String>, StoreError> {
         let conn = self.connection()?;
         let mut stmt = conn.prepare("SELECT hash FROM files")?;
@@ -364,12 +430,12 @@ impl Store {
         Ok(set)
     }
 
-    /// Origin Action folder for a known hash, if any.
+    /// Origin Action folder for a known hash, if any (Sweep report + Classification toast seam).
     pub fn origin(&self, hash: &str) -> Result<Option<String>, StoreError> {
         Ok(self.lookup(hash)?.map(|r| r.action_folder))
     }
 
-    /// All file rows ordered by hash (for Sweep reporting).
+    /// All file rows ordered by hash (Sweep report seam).
     pub fn list_files(&self) -> Result<Vec<FileRecord>, StoreError> {
         let conn = self.connection()?;
         let mut stmt = conn.prepare(
@@ -586,19 +652,8 @@ mod tests {
                     let byte = t.wrapping_mul(16).wrapping_add(i);
                     let h = format!("{:02x}", byte).repeat(32);
                     let rec = FileRecord::new(&h, "a.jpg", "keep/a.jpg", "keep", 1, 1, 1).unwrap();
-                    // Retry on busy — busy_timeout usually suffices, but be robust.
-                    for _ in 0..20 {
-                        match store.insert_file(&rec) {
-                            Ok(_) => break,
-                            Err(StoreError::Sql(rusqlite::Error::SqliteFailure(e, _)))
-                                if e.code == rusqlite::ErrorCode::DatabaseBusy =>
-                            {
-                                std::thread::sleep(std::time::Duration::from_millis(5));
-                                continue;
-                            }
-                            Err(e) => panic!("insert failed: {e:?}"),
-                        }
-                    }
+                    // No caller retry: Store retries transient BUSY internally.
+                    store.insert_file(&rec).unwrap();
                 }
             }));
         }
@@ -621,24 +676,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let source = dir.path().join("fresh");
         // Do not pre-seed: all threads race Store::open on an empty folder.
+        // No caller retry: Store::open retries transient BUSY internally.
         let mut handles = Vec::new();
         for _ in 0..8 {
             let path = source.clone();
             handles.push(std::thread::spawn(move || {
-                // Retry on busy during the seeding race.
-                for _ in 0..20 {
-                    match Store::open(&path) {
-                        Ok(_) => break,
-                        Err(StoreError::Sql(rusqlite::Error::SqliteFailure(e, _)))
-                            if e.code == rusqlite::ErrorCode::DatabaseBusy =>
-                        {
-                            std::thread::sleep(std::time::Duration::from_millis(5));
-                            continue;
-                        }
-                        Err(e) => panic!("fresh open failed: {e:?}"),
-                    }
-                    break;
-                }
+                Store::open(&path).unwrap();
             }));
         }
         for h in handles {
@@ -675,5 +718,73 @@ mod tests {
         assert!(!is_internal_db_file(Path::new("photo.jpg")));
         assert!(!is_internal_db_file(Path::new("organizer.toml")));
         assert!(!is_internal_db_file(Path::new("keep.txt")));
+    }
+
+    #[test]
+    fn fresh_schema_enforces_lowercase_hash_defense_in_depth() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        Store::open(&source).unwrap();
+        let conn = Connection::open(db_path_for(&source)).unwrap();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'files'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("lower(hash)"),
+            "files table must carry a lower-case CHECK, got: {sql}"
+        );
+        // Raw upper-case SQL bypassing FileRecord::new must fail at the DB level.
+        let upper = test_hash(0xAB).to_ascii_uppercase();
+        let res = conn.execute(
+            "INSERT INTO files (hash, original_rel, final_rel, action_folder, size, mtime, triaged_at) VALUES (?1, 'a.jpg', 'keep/a.jpg', 'keep', 1, 1, 1)",
+            rusqlite::params![upper],
+        );
+        assert!(res.is_err(), "upper-case hash must violate CHECK");
+    }
+
+    #[test]
+    fn unsupported_schema_version_errors_clearly() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        Store::open(&source).unwrap();
+        // Simulate a newer schema by bumping the version row.
+        let conn = Connection::open(db_path_for(&source)).unwrap();
+        conn.execute(
+            "UPDATE meta SET value = '999' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        match Store::open(&source) {
+            Err(StoreError::UnsupportedSchema { found }) => assert_eq!(found, "999"),
+            other => panic!("expected UnsupportedSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn store_level_rollback_on_validation_failure_leaves_db_unchanged() {
+        // Store-seam half of "transactional rollback on move failure": a rejected
+        // write must not leave a partial row. The filesystem half (rename + row
+        // insert + row revert) belongs to Classification (#24).
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        let store = Store::open(&source).unwrap();
+        let before_actions = store.actions().unwrap();
+        let before_hashes = store.all_hashes().unwrap();
+        // Invalid actions + invalid hash both fail before touching the DB.
+        assert!(store
+            .set_actions(&[Action {
+                display_name: "Dup".into(),
+                folder_name: "duplicate".into(),
+                shortcut: "1".into(),
+            }])
+            .is_err());
+        assert!(FileRecord::new("bad", "a.jpg", "keep/a.jpg", "keep", 0, 0, 0).is_err());
+        assert_eq!(store.actions().unwrap(), before_actions);
+        assert_eq!(store.all_hashes().unwrap(), before_hashes);
     }
 }

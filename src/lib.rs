@@ -4,5 +4,6 @@ pub mod mover;
 pub mod preview;
 pub mod queue;
 pub mod settings;
+pub mod store;
 pub mod undo;
 pub mod video;

@@ -26,7 +26,8 @@ fn is_supported(path: &Path) -> bool {
 }
 
 /// Build a flat, natural case-insensitive sorted Snapshot of Supported Formats
-/// from `source_folder`. Non-supported files (including internal `.toml`/`.txt`) are
+/// from `source_folder`. Non-supported files (including internal `.toml`/`.txt`
+/// and the Organizer Database `organizer.db` + WAL artifacts) are
 /// silently excluded and never enter the Queue. No recursion, no live watch.
 pub fn build_snapshot(source_folder: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut entries: Vec<PathBuf> = Vec::new();
@@ -37,6 +38,11 @@ pub fn build_snapshot(source_folder: &Path) -> std::io::Result<Vec<PathBuf>> {
         // Only regular files, flat only — no recursion, skip directories
         // (action/duplicate subfolders live inside the Source Folder)
         if !path.is_file() {
+            continue;
+        }
+        // Portable Organizer Database never enters the Queue, even though `.db`
+        // is already unsupported — explicit so future format changes cannot regress.
+        if crate::store::is_internal_db_file(&path) {
             continue;
         }
         if is_supported(&path) {
@@ -143,5 +149,22 @@ mod tests {
         touch(p, "keep.txt");
         let snap = build_snapshot(p).unwrap();
         assert!(snap.is_empty(), "only unsupported should give empty queue, not placeholder");
+    }
+
+    #[test]
+    fn organizer_database_never_enters_queue() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        touch(p, "a.jpg");
+        touch(p, "organizer.db");
+        touch(p, "organizer.db-wal");
+        touch(p, "organizer.db-shm");
+        touch(p, "organizer.db-journal");
+        let snap = build_snapshot(p).unwrap();
+        let names: Vec<String> = snap
+            .iter()
+            .map(|x| x.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["a.jpg"]);
     }
 }

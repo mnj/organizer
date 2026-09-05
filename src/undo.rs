@@ -264,6 +264,38 @@ pub fn undo_move(
     Ok(restored)
 }
 
+/// Undo a Classification stored in the Organizer Database (#24).
+///
+/// Moves the file back from its Action/`duplicate/` destination to the Source
+/// Folder (suffixing `_undo_1` on clash) and, for non-duplicates, reverts the
+/// database row via `Store::remove`. Duplicate undos touch no rows.
+///
+/// If the row revert fails the filesystem rename is rolled forward again
+/// (file moved back to its destination) so filesystem and database cannot
+/// drift apart.
+pub fn undo_classification(
+    store: &crate::store::Store,
+    source_folder: &Path,
+    entry: &UndoEntry,
+) -> std::io::Result<PathBuf> {
+    let restored = undo_rename(source_folder, &entry.dest_path, &entry.src_name)?;
+    if entry.was_duplicate {
+        return Ok(restored);
+    }
+    match store.remove(&entry.hash) {
+        Ok(_) => Ok(restored),
+        Err(e) => {
+            // Roll forward: put the file back where it was so a DB failure
+            // does not leave filesystem restored but row present.
+            let _ = std::fs::rename(&restored, &entry.dest_path);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("database undo failed: {e}"),
+            ))
+        }
+    }
+}
+
 
 
 #[cfg(test)]
@@ -539,5 +571,95 @@ mod tests {
         assert_eq!(union.len(), 2);
         assert_eq!(undo_stack.len(), 2);
         assert!(redo_stack.is_empty());
+    }
+
+    mod classification_on_store {
+        use super::*;
+        use crate::dedup::compute_sha256;
+        use crate::mover::classify_file;
+        use crate::store::Store;
+        use std::fs;
+        use tempfile::TempDir;
+
+        fn setup_source() -> (TempDir, std::path::PathBuf, Store) {
+            let dir = TempDir::new().unwrap();
+            let source = dir.path().join("source");
+            fs::create_dir_all(&source).unwrap();
+            let store = Store::open(&source).unwrap();
+            (dir, source, store)
+        }
+
+        #[test]
+        fn undo_nonduplicate_restores_file_and_reverts_row() {
+            let (_dir, source, store) = setup_source();
+            let foo = source.join("foo.jpg");
+            fs::write(&foo, b"hello undo").unwrap();
+            let hash = compute_sha256(&foo).unwrap();
+            let dest = classify_file(&store, &foo, "keep", &hash).unwrap();
+            assert!(store.contains(&hash).unwrap());
+
+            let entry = UndoEntry::new(&hash, "foo.jpg", dest.clone(), false, "keep", "Keep");
+            let restored = undo_classification(&store, &source, &entry).unwrap();
+            assert_eq!(restored, source.join("foo.jpg"));
+            assert!(restored.exists());
+            assert!(!dest.exists());
+            assert!(!store.contains(&hash).unwrap());
+            assert!(store.all_hashes().unwrap().is_empty());
+        }
+
+        #[test]
+        fn undo_duplicate_restores_file_and_keeps_row() {
+            let (_dir, source, store) = setup_source();
+            let a = source.join("a.jpg");
+            fs::write(&a, b"same").unwrap();
+            let ha = compute_sha256(&a).unwrap();
+            classify_file(&store, &a, "keep", &ha).unwrap();
+
+            let b = source.join("b.jpg");
+            fs::write(&b, b"same").unwrap();
+            let hb = compute_sha256(&b).unwrap();
+            let dest_b = classify_file(&store, &b, "keep", &hb).unwrap();
+            assert_eq!(dest_b, source.join("duplicate").join("b.jpg"));
+
+            let entry = UndoEntry::new(&hb, "b.jpg", dest_b.clone(), true, "keep", "Keep");
+            let restored = undo_classification(&store, &source, &entry).unwrap();
+            assert_eq!(restored, source.join("b.jpg"));
+            assert!(restored.exists());
+            // Original row untouched.
+            assert!(store.contains(&ha).unwrap());
+            assert_eq!(store.all_hashes().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn redo_reapplies_classification_and_row() {
+            let (_dir, source, store) = setup_source();
+            let foo = source.join("foo.jpg");
+            fs::write(&foo, b"hello redo db").unwrap();
+            let hash = compute_sha256(&foo).unwrap();
+            let dest = classify_file(&store, &foo, "keep", &hash).unwrap();
+            let entry = UndoEntry::new(&hash, "foo.jpg", dest.clone(), false, "keep", "Keep");
+            let restored = undo_classification(&store, &source, &entry).unwrap();
+            assert!(!store.contains(&hash).unwrap());
+            // Redo is a fresh Classification of the restored file.
+            let dest2 = classify_file(&store, &restored, "keep", &hash).unwrap();
+            assert!(dest2.exists());
+            assert!(!restored.exists());
+            assert!(store.contains(&hash).unwrap());
+        }
+
+        #[test]
+        fn undo_fails_if_dest_missing_and_keeps_row() {
+            let (_dir, source, store) = setup_source();
+            let foo = source.join("foo.jpg");
+            fs::write(&foo, b"data").unwrap();
+            let hash = compute_sha256(&foo).unwrap();
+            let dest = classify_file(&store, &foo, "keep", &hash).unwrap();
+            // Externally delete the destination.
+            fs::remove_file(&dest).unwrap();
+            let entry = UndoEntry::new(&hash, "foo.jpg", dest.clone(), false, "keep", "Keep");
+            assert!(undo_classification(&store, &source, &entry).is_err());
+            // Row must still be present since the file could not be restored.
+            assert!(store.contains(&hash).unwrap());
+        }
     }
 }

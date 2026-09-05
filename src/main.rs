@@ -6,15 +6,16 @@ use gtk4::{
     gdk, gio, glib, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, Entry,
     Label, Orientation, Paned, Stack,
 };
-use organizer_lib::config::{load_or_create, Action};
-use organizer_lib::dedup::{compute_sha256, find_duplicate_origin, load_union};
-use organizer_lib::mover::{move_to_action, MoverError};
+use organizer_lib::config::Action;
+use organizer_lib::dedup::compute_sha256;
+use organizer_lib::mover::{classify_file, MoverError};
 use organizer_lib::preview::{ensure_sandbox_bwrap, is_glycin_supported, load_texture};
 use organizer_lib::queue::build_snapshot;
-use organizer_lib::undo::{push_undo_capped, undo_move, UndoEntry};
+use organizer_lib::store::Store;
+use organizer_lib::undo::{push_undo_capped, undo_classification, UndoEntry};
 use organizer_lib::video;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -393,33 +394,42 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         return;
     }
 
-    // Load or create config
-    let config = match load_or_create(&source_folder) {
-        Ok(c) => c,
+    // Open or seed the portable Organizer Database (#24 Classification source).
+    let store = match Store::open(&source_folder) {
+        Ok(s) => s,
         Err(e) => {
             let window = ApplicationWindow::builder()
                 .application(app)
-                .title("Organizer — config error")
+                .title("Organizer — database error")
                 .default_width(500)
                 .default_height(120)
                 .build();
             window.maximize();
-            let lbl = Label::new(Some(&format!("Failed to load {}: {}", source_folder.join("organizer.toml").display(), e)));
+            let lbl = Label::new(Some(&format!("Failed to open {}: {}", source_folder.join("organizer.db").display(), e)));
             window.set_child(Some(&lbl));
             window.present();
             return;
         }
     };
-    let config_version = config.config_version;
-    let live_actions: Rc<RefCell<Vec<Action>>> = Rc::new(RefCell::new(config.actions.clone()));
-    let disk_actions: Rc<RefCell<Vec<Action>>> = Rc::new(RefCell::new(config.actions.clone()));
+    let initial_actions = match store.actions() {
+        Ok(a) => a,
+        Err(e) => {
+            let window = ApplicationWindow::builder()
+                .application(app)
+                .title("Organizer — database error")
+                .default_width(500)
+                .default_height(120)
+                .build();
+            window.maximize();
+            let lbl = Label::new(Some(&format!("Failed to load Actions: {e}")));
+            window.set_child(Some(&lbl));
+            window.present();
+            return;
+        }
+    };
+    let live_actions: Rc<RefCell<Vec<Action>>> = Rc::new(RefCell::new(initial_actions.clone()));
+    let disk_actions: Rc<RefCell<Vec<Action>>> = Rc::new(RefCell::new(initial_actions));
 
-    // Load union HashSet and warn count (ADR 0003/0004) : inside SourceFolder *.txt
-    let (union_initial, warning_count) = load_union(&source_folder);
-    if warning_count > 0 {
-        tracing::warn!("{} corrupted log lines skipped at startup in {}", warning_count, source_folder.display());
-    }
-    let union_set: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(union_initial));
     let hash_cache: Arc<Mutex<HashMap<PathBuf, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let busy: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
     let undo_stack: Rc<RefCell<Vec<UndoEntry>>> = Rc::new(RefCell::new(Vec::new()));
@@ -626,15 +636,6 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
             });
         }
     };
-
-    // Toast warning about corrupted logs if any (after window shown)
-    if warning_count > 0 {
-        let toast_clone = show_toast.clone();
-        let wc = warning_count;
-        glib::idle_add_local_once(move || {
-            toast_clone(format!("{} corrupted log lines skipped (see warnings)", wc));
-        });
-    }
 
     // Video Preview state (spec #20): the currently playing video, if any.
     // Clearing the slot stops playback and removes the bus watch, so file
@@ -988,8 +989,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
     let trigger_move: Rc<dyn Fn(Action)> = {
         let idx_c = idx.clone();
         let snap_c = snapshot_rc.clone();
-        let source_c = source_folder.clone();
-        let union_c = union_set.clone();
+        let store_c = store.clone();
         let hash_service_c = hash_service.clone();
         let busy_c = busy.clone();
         let spinner_c = spinner.clone();
@@ -1041,8 +1041,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
             let do_move: Rc<dyn Fn(String)> = {
                 let idx_c = idx_c.clone();
                 let snap_c = snap_c.clone();
-                let source_c = source_c.clone();
-                let union_c = union_c.clone();
+                let store_c = store_c.clone();
                 let live_actions_c = live_actions_c.clone();
                 let busy_c = busy_c.clone();
                 let spinner_c = spinner_c.clone();
@@ -1061,17 +1060,13 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 let current = current.clone();
                 Rc::new(move |hash: String| {
                     let hash_lower = hash.to_ascii_lowercase();
-                    let is_duplicate = union_c.borrow().contains(&hash_lower);
+                    let is_duplicate = store_c.contains(&hash_lower).unwrap_or(false);
                     let duplicate_origin_folder = if is_duplicate {
-                        find_duplicate_origin(&source_c, &hash_lower)
+                        store_c.origin(&hash_lower).unwrap_or(None)
                     } else {
                         None
                     };
-                    let duplicate_origin_display = duplicate_origin_folder.as_ref().and_then(|folder| {
-                        live_actions_c.borrow().iter().find(|a| &a.folder_name == folder).map(|a| a.display_name.clone())
-                    }).or(duplicate_origin_folder.clone());
-                    let mut union = union_c.borrow_mut();
-                    match move_to_action(&source_c, &current, &folder_name, &hash, &mut union) {
+                    match classify_file(&store_c, &current, &folder_name, &hash) {
                         Ok(dest) => {
                             let is_dup_dest = dest.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("duplicate");
                             let was_duplicate = is_dup_dest || is_duplicate;
@@ -1084,10 +1079,16 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                             }
                             // clear any suffix override on normal move
                             *override_c.borrow_mut() = None;
-                            drop(union);
                             if is_dup_dest || is_duplicate {
-                                let origin = duplicate_origin_display.unwrap_or_else(|| display_name.clone());
-                                show_toast_c(format!("Duplicate — already in ‘{}’ — moved to duplicate/{}", origin, dest.file_name().and_then(|n| n.to_str()).unwrap_or(&file_name)));
+                                // Re-lookup origin post-move so a concurrent race that
+                                // routed to duplicate/ still toasts the true origin.
+                                let origin_folder = duplicate_origin_folder.or_else(|| {
+                                    store_c.origin(&hash_lower).unwrap_or(None)
+                                });
+                                let origin_display = origin_folder.as_ref().and_then(|folder| {
+                                    live_actions_c.borrow().iter().find(|a| &a.folder_name == folder).map(|a| a.display_name.clone())
+                                }).or(origin_folder).unwrap_or_else(|| display_name.clone());
+                                show_toast_c(format!("Duplicate — already in ‘{}’ — moved to duplicate/{}", origin_display, dest.file_name().and_then(|n| n.to_str()).unwrap_or(&file_name)));
                             } else {
                                 show_toast_c(format!("Moved {} → {}/{} ", file_name, display_name, dest.file_name().and_then(|n| n.to_str()).unwrap_or("")));
                             }
@@ -1097,11 +1098,14 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                             prehash_c();
                         }
                         Err(e) => {
-                            drop(union);
                             let msg = match e {
                                 MoverError::Exdev(_) => "Cross-device move not supported — move reverted".to_string(),
+                                MoverError::Db(ref dbe) => {
+                                    tracing::warn!("database failure for {}: {}", file_name, dbe);
+                                    "Database error — move reverted".to_string()
+                                }
                                 MoverError::Io(ref ioe) => {
-                                    tracing::warn!("move log failure for {}: {}", file_name, ioe);
+                                    tracing::warn!("move failure for {}: {}", file_name, ioe);
                                     "Disk full / I/O error — move reverted".to_string()
                                 }
                             };
@@ -1158,10 +1162,10 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         })
     };
 
-    // Undo / Redo handlers (ADR 0005)
+    // Undo / Redo handlers (ADR 0005) on the Organizer Database (#24)
     let perform_undo: Rc<dyn Fn()> = {
         let source_c = source_folder.clone();
-        let union_c = union_set.clone();
+        let store_c = store.clone();
         let undo_c = undo_stack.clone();
         let redo_c = redo_stack.clone();
         let idx_c = idx.clone();
@@ -1183,11 +1187,9 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                     return;
                 }
             };
-            // do the filesystem undo
-            let mut union = union_c.borrow_mut();
-            match undo_move(&source_c, &entry, &mut union) {
+            // do the filesystem undo + database row revert
+            match undo_classification(&store_c, &source_c, &entry) {
                 Ok(restored_path) => {
-                    drop(union);
                     // push to redo with adjusted src_name (actual restored file name)
                     let restored_name = restored_path.file_name().and_then(|n| n.to_str()).unwrap_or(&entry.src_name).to_string();
                     let redo_entry = UndoEntry::new(&entry.hash, &restored_name, entry.dest_path.clone(), entry.was_duplicate, &entry.folder_name, &entry.display_name);
@@ -1220,7 +1222,6 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                     prehash_c();
                 }
                 Err(e) => {
-                    drop(union);
                     // push back onto undo_stack since it failed? ADR says stay, but we popped. Put it back.
                     undo_c.borrow_mut().push(entry);
                     tracing::warn!("undo failed: {}", e);
@@ -1233,7 +1234,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
 
     let perform_redo: Rc<dyn Fn()> = {
         let source_c = source_folder.clone();
-        let union_c = union_set.clone();
+        let store_c = store.clone();
         let undo_c = undo_stack.clone();
         let redo_c = redo_stack.clone();
         let idx_c = idx.clone();
@@ -1264,10 +1265,8 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                 redo_c.borrow_mut().push(entry);
                 return;
             }
-            let mut union = union_c.borrow_mut();
-            match move_to_action(&source_c, &current_file, &entry.folder_name, &entry.hash, &mut union) {
+            match classify_file(&store_c, &current_file, &entry.folder_name, &entry.hash) {
                 Ok(dest) => {
-                    drop(union);
                     // push back onto undo stack; was_duplicate is determined by actual redo destination, not carried from prior
                     let redo_was_duplicate = dest.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("duplicate");
                     let new_undo = UndoEntry::new(&entry.hash, &entry.src_name, dest.clone(), redo_was_duplicate, &entry.folder_name, &entry.display_name);
@@ -1285,12 +1284,15 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
                     prehash_c();
                 }
                 Err(e) => {
-                    drop(union);
                     redo_c.borrow_mut().push(entry);
                     let msg = match e {
                         MoverError::Exdev(_) => "Cross-device move not supported".to_string(),
+                        MoverError::Db(ref dbe) => {
+                            tracing::warn!("redo database failure: {}", dbe);
+                            "Database error — move reverted".to_string()
+                        }
                         MoverError::Io(ref ioe) => {
-                            tracing::warn!("redo log failure: {}", ioe);
+                            tracing::warn!("redo failure: {}", ioe);
                             "Disk full / I/O error — move reverted".to_string()
                         }
                     };
@@ -1429,9 +1431,9 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let live_c = live_actions.clone();
         let disk_c = disk_actions.clone();
         let rebuild_c = rebuild_action_bar.clone();
-        let source_c = source_folder.clone();
+        let store_c = store.clone();
         btn_settings.connect_clicked(move |_| {
-            open_settings(&win_c, SettingsContext { source_folder: source_c.clone(), live_actions: live_c.clone(), disk_actions: disk_c.clone(), rebuild_action_bar: rebuild_c.clone(), config_version });
+            open_settings(&win_c, SettingsContext { store: store_c.clone(), live_actions: live_c.clone(), disk_actions: disk_c.clone(), rebuild_action_bar: rebuild_c.clone() });
         });
     }
 
@@ -1446,7 +1448,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let live_for_settings = live_actions.clone();
         let disk_for_settings = disk_actions.clone();
         let rebuild_for_settings = rebuild_action_bar.clone();
-        let source_for_settings = source_folder.clone();
+        let store_for_settings = store.clone();
         let trigger_k = trigger_move.clone();
         let busy_k = busy.clone();
         let undo_k = perform_undo.clone();
@@ -1458,7 +1460,7 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
             // Ctrl+, opens settings (comma)
             if is_ctrl && (key == gdk::Key::comma || key == gdk::Key::less) {
                 if let Some(win) = window_weak.upgrade() {
-                    open_settings(&win, SettingsContext { source_folder: source_for_settings.clone(), live_actions: live_for_settings.clone(), disk_actions: disk_for_settings.clone(), rebuild_action_bar: rebuild_for_settings.clone(), config_version });
+                    open_settings(&win, SettingsContext { store: store_for_settings.clone(), live_actions: live_for_settings.clone(), disk_actions: disk_for_settings.clone(), rebuild_action_bar: rebuild_for_settings.clone() });
                     return glib::Propagation::Stop;
                 }
             }
@@ -1564,10 +1566,10 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
         let live_c = live_actions.clone();
         let disk_c = disk_actions.clone();
         let rebuild_c = rebuild_action_bar.clone();
-        let source_c = source_folder.clone();
+        let store_c = store.clone();
         let action = gio::SimpleAction::new("preferences", None);
         action.connect_activate(move |_, _| {
-            open_settings(&win_c, SettingsContext { source_folder: source_c.clone(), live_actions: live_c.clone(), disk_actions: disk_c.clone(), rebuild_action_bar: rebuild_c.clone(), config_version });
+            open_settings(&win_c, SettingsContext { store: store_c.clone(), live_actions: live_c.clone(), disk_actions: disk_c.clone(), rebuild_action_bar: rebuild_c.clone() });
         });
         window.add_action(&action);
     }

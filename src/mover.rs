@@ -1,4 +1,5 @@
 use crate::dedup::{append_hash_log, FileHash};
+use crate::store::{FileRecord, Store};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -49,6 +50,7 @@ fn split_filename(name: &str) -> (&str, Option<&str>) {
 pub enum MoverError {
     Io(std::io::Error),
     Exdev(PathBuf),
+    Db(String),
 }
 
 impl From<std::io::Error> for MoverError {
@@ -57,11 +59,18 @@ impl From<std::io::Error> for MoverError {
     }
 }
 
+impl From<crate::store::StoreError> for MoverError {
+    fn from(e: crate::store::StoreError) -> Self {
+        MoverError::Db(e.to_string())
+    }
+}
+
 impl std::fmt::Display for MoverError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MoverError::Io(e) => write!(f, "io: {}", e),
             MoverError::Exdev(p) => write!(f, "cross-device move not supported: {}", p.display()),
+            MoverError::Db(msg) => write!(f, "database: {}", msg),
         }
     }
 }
@@ -168,6 +177,134 @@ pub fn move_to_action(
     let validated = FileHash::new(hash).map_err(|e| MoverError::Io(e))?;
     let target = ActionTarget { source_folder, folder_name };
     move_to_action_with_target(target, current_file, &validated, union_set)
+}
+
+/// Roll a Classification rename back to the Source Folder on DB failure.
+/// Suffixes on clash so rollback never overwrites.
+fn rollback_to_source(source_folder: &Path, dest_path: &Path, file_name: &str) {
+    let target = {
+        let candidate = source_folder.join(file_name);
+        if !candidate.exists() {
+            candidate
+        } else {
+            next_available_path(source_folder, file_name)
+        }
+    };
+    let _ = std::fs::rename(dest_path, &target);
+}
+
+/// GUI Classification on the Organizer Database (#24).
+///
+/// Moves Current File to the chosen Action subfolder inside the Source Folder
+/// and records its sha256 with Source Folder-relative paths. Duplicate hashes
+/// (already known to the database) route to the fixed `duplicate/` subfolder
+/// with no extra record growth. On DB failure the rename is rolled back.
+///
+/// Relative layout: `original_rel` is the flat file name, `final_rel` is
+/// `<action>/<dest file name>` (suffix-aware on collision).
+pub fn classify_file(
+    store: &Store,
+    current_file: &Path,
+    folder_name: &str,
+    hash: &str,
+) -> Result<PathBuf, MoverError> {
+    let validated = FileHash::new(hash).map_err(MoverError::Io)?;
+    let hash_lower = validated.as_str().to_ascii_lowercase();
+    let source_folder = store.source_folder().to_path_buf();
+    if folder_name.is_empty() {
+        return Err(MoverError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid action folder",
+        )));
+    }
+    let file_name = current_file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            MoverError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid filename",
+            ))
+        })?
+        .to_string();
+
+    // Duplicate union read from the database: already-known hash routes to
+    // duplicate/ with no record growth (origin lookup via Store::origin for toast).
+    let is_duplicate = store.contains(&hash_lower).map_err(MoverError::from)?;
+    if is_duplicate {
+        return move_to_duplicate_inner(&source_folder, current_file, &file_name);
+    }
+
+    // Capture filesystem metadata before the rename for the file row.
+    let (size, mtime) = match std::fs::metadata(current_file) {
+        Ok(md) => {
+            let size = md.len() as i64;
+            let mtime = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            (size, mtime)
+        }
+        Err(e) => return Err(MoverError::Io(e)),
+    };
+    let triaged_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let dest_dir = dest_subdir(&source_folder, folder_name);
+    let dest_path = atomic_rename_with_suffix(&dest_dir, current_file, &file_name)?;
+
+    let dest_file_name = dest_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&file_name)
+        .to_string();
+    let original_rel = file_name.clone();
+    let final_rel = format!("{folder_name}/{dest_file_name}");
+
+    let record = match FileRecord::new(
+        &hash_lower,
+        &original_rel,
+        &final_rel,
+        folder_name,
+        size,
+        mtime,
+        triaged_at,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            rollback_to_source(&source_folder, &dest_path, &file_name);
+            return Err(MoverError::Db(e.to_string()));
+        }
+    };
+
+    match store.insert_file(&record) {
+        Ok(true) => Ok(dest_path),
+        Ok(false) => {
+            // Lost a concurrent race: another writer inserted the same hash
+            // between our contains-check and insert. Route the already-moved
+            // file on to duplicate/ so Action folders never gain duplicates
+            // and the database gains no extra row.
+            if folder_name == "duplicate" {
+                return Ok(dest_path);
+            }
+            let dup_dir = dest_subdir(&source_folder, "duplicate");
+            match atomic_rename_with_suffix(&dup_dir, &dest_path, &dest_file_name) {
+                Ok(dup_path) => Ok(dup_path),
+                Err(e) => {
+                    rollback_to_source(&source_folder, &dest_path, &file_name);
+                    Err(e)
+                }
+            }
+        }
+        Err(e) => {
+            rollback_to_source(&source_folder, &dest_path, &file_name);
+            Err(MoverError::from(e))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -464,5 +601,123 @@ mod tests {
         assert!(keep_log.contains(&ha.to_ascii_lowercase()));
         assert!(keep_log.contains(&hc.to_ascii_lowercase()));
         assert!(!source.join("duplicate.txt").exists());
+    }
+
+    mod classify_on_store {
+        use super::*;
+        use crate::dedup::compute_sha256;
+        use crate::store::Store;
+        use std::fs;
+        use tempfile::TempDir;
+
+        fn setup_source() -> (TempDir, std::path::PathBuf, Store) {
+            let dir = TempDir::new().unwrap();
+            let source = dir.path().join("source");
+            fs::create_dir_all(&source).unwrap();
+            let store = Store::open(&source).unwrap();
+            (dir, source, store)
+        }
+
+        #[test]
+        fn classify_moves_to_action_and_records_relative_paths() {
+            let (_dir, source, store) = setup_source();
+            let foo = source.join("foo.jpg");
+            fs::write(&foo, b"hello classify").unwrap();
+            let hash = compute_sha256(&foo).unwrap();
+            let meta_before = fs::metadata(&foo).unwrap();
+
+            let dest = classify_file(&store, &foo, "keep", &hash).unwrap();
+
+            assert!(!foo.exists());
+            assert_eq!(dest, source.join("keep").join("foo.jpg"));
+            assert!(dest.exists());
+            // Database row present with Source Folder-relative paths.
+            let rec = store.lookup(&hash).unwrap().expect("row must exist");
+            assert_eq!(rec.original_rel, "foo.jpg");
+            assert_eq!(rec.final_rel, "keep/foo.jpg");
+            assert_eq!(rec.action_folder, "keep");
+            assert_eq!(rec.size, meta_before.len() as i64);
+            // No legacy txt logs created by the database path.
+            assert!(!source.join("keep.txt").exists());
+        }
+
+        #[test]
+        fn duplicate_routes_to_duplicate_with_origin_and_no_growth() {
+            let (_dir, source, store) = setup_source();
+            let a = source.join("a.jpg");
+            fs::write(&a, b"same content").unwrap();
+            let hash = compute_sha256(&a).unwrap();
+            let dest_a = classify_file(&store, &a, "keep", &hash).unwrap();
+            assert_eq!(dest_a, source.join("keep").join("a.jpg"));
+            assert_eq!(store.all_hashes().unwrap().len(), 1);
+            assert_eq!(store.origin(&hash).unwrap().as_deref(), Some("keep"));
+
+            let b = source.join("b.jpg");
+            fs::write(&b, b"same content").unwrap();
+            let hash_b = compute_sha256(&b).unwrap();
+            assert_eq!(hash, hash_b);
+            let dest_b = classify_file(&store, &b, "keep", &hash_b).unwrap();
+            assert_eq!(
+                dest_b,
+                source.join("duplicate").join("b.jpg"),
+                "duplicate hash must route to duplicate/"
+            );
+            assert!(dest_b.exists());
+            assert!(!source.join("b.jpg").exists());
+            // No extra record growth.
+            assert_eq!(store.all_hashes().unwrap().len(), 1);
+            let rec = store.lookup(&hash).unwrap().unwrap();
+            assert_eq!(rec.original_rel, "a.jpg");
+            assert_eq!(rec.action_folder, "keep");
+            // Origin still keep for toast.
+            assert_eq!(store.origin(&hash_b).unwrap().as_deref(), Some("keep"));
+        }
+
+        #[test]
+        fn classify_suffix_on_clash_records_suffixed_final_rel() {
+            let (_dir, source, store) = setup_source();
+            let dest_dir = source.join("keep");
+            fs::create_dir_all(&dest_dir).unwrap();
+            fs::write(dest_dir.join("foo.jpg"), b"existing").unwrap();
+
+            let foo = source.join("foo.jpg");
+            fs::write(&foo, b"new content").unwrap();
+            let hash = compute_sha256(&foo).unwrap();
+            let dest = classify_file(&store, &foo, "keep", &hash).unwrap();
+            assert_eq!(dest, dest_dir.join("foo_1.jpg"));
+            let rec = store.lookup(&hash).unwrap().unwrap();
+            assert_eq!(rec.final_rel, "keep/foo_1.jpg");
+        }
+
+        #[test]
+        fn classify_invalid_hash_leaves_file_in_place() {
+            let (_dir, source, store) = setup_source();
+            let foo = source.join("foo.jpg");
+            fs::write(&foo, b"data").unwrap();
+            let res = classify_file(&store, &foo, "keep", "not-a-hash");
+            assert!(res.is_err());
+            assert!(foo.exists());
+            assert!(store.all_hashes().unwrap().is_empty());
+        }
+
+        #[test]
+        fn classify_relative_paths_survive_folder_move() {
+            let dir = TempDir::new().unwrap();
+            let source = dir.path().join("source");
+            fs::create_dir_all(&source).unwrap();
+            let store = Store::open(&source).unwrap();
+            let foo = source.join("foo.jpg");
+            fs::write(&foo, b"portable").unwrap();
+            let hash = compute_sha256(&foo).unwrap();
+            classify_file(&store, &foo, "keep", &hash).unwrap();
+            drop(store);
+            let moved = dir.path().join("moved");
+            fs::rename(&source, &moved).unwrap();
+            let reopened = Store::open(&moved).unwrap();
+            let rec = reopened.lookup(&hash).unwrap().unwrap();
+            assert_eq!(rec.original_rel, "foo.jpg");
+            assert_eq!(rec.final_rel, "keep/foo.jpg");
+            assert!(moved.join(&rec.final_rel).exists());
+        }
     }
 }

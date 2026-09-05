@@ -2,19 +2,18 @@ use gtk4::prelude::*;
 use gtk4::{gio, glib, ApplicationWindow, Box as GtkBox, Button, Entry, Label, Orientation};
 use libadwaita as adw;
 use adw::prelude::*;
-use crate::config::{save_config, slugify, validate_actions, Action, Config};
+use crate::config::{slugify, validate_actions, Action};
+use crate::store::Store;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::rc::Rc;
 
 /// Bundled context for settings dialog — avoids Data Clumps
 pub struct SettingsContext {
-    pub source_folder: PathBuf,
+    pub store: Store,
     pub live_actions: Rc<RefCell<Vec<Action>>>,
     pub disk_actions: Rc<RefCell<Vec<Action>>>,
     pub rebuild_action_bar: Rc<dyn Fn()>,
-    pub config_version: u32,
 }
 
 #[allow(dead_code)]
@@ -129,7 +128,7 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
     // PreferencesWindow content: single page + group containing our custom rows
     let page = adw::PreferencesPage::new();
     page.set_title("Actions");
-    page.set_description("Per-folder organizer.toml — copied with the folder, slug a-z0-9_-");
+    page.set_description("Organizer Database inside the Source Folder — copied with the folder, slug a-z0-9_-");
     adw_win.add(&page);
 
     let group = adw::PreferencesGroup::new();
@@ -471,17 +470,15 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
     // Save
     {
         let win_c = adw_win.clone();
-        let source_c = ctx.source_folder.clone();
+        let store_c = ctx.store.clone();
         let ui_c = ui_actions.clone();
         let live_c = ctx.live_actions.clone();
         let disk_c = ctx.disk_actions.clone();
         let rebuild_c = ctx.rebuild_action_bar.clone();
-        let version = ctx.config_version;
         btn_save.connect_clicked(move |_| {
             let collected = ui_c.borrow().clone();
             if validate_actions(&collected).is_err() { return; }
-            let cfg = Config { config_version: version, actions: collected.clone() };
-            match save_config(&source_c, &cfg) {
+            match store_c.set_actions(&collected) {
                 Ok(()) => {
                     *live_c.borrow_mut() = collected.clone();
                     *disk_c.borrow_mut() = collected.clone();
@@ -513,9 +510,8 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
         let ui_c = ui_actions.clone();
         let live_c = ctx.live_actions.clone();
         let disk_c = ctx.disk_actions.clone();
-        let source_c = ctx.source_folder.clone();
+        let store_c = ctx.store.clone();
         let rebuild_c = ctx.rebuild_action_bar.clone();
-        let version = ctx.config_version;
         adw_win.connect_close_request(move |w| {
             let collected = ui_c.borrow().clone();
             let disk = disk_c.borrow().clone();
@@ -530,7 +526,7 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
                 .cancel_button(2)
                 .build();
             let win_clone = w.clone();
-            let source_clone = source_c.clone();
+            let store_clone = store_c.clone();
             let live_clone = live_c.clone();
             let disk_clone = disk_c.clone();
             let rebuild_clone = rebuild_c.clone();
@@ -539,8 +535,7 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
                 if let Ok(idx) = res {
                     match idx {
                         0 => {
-                            let cfg = Config { config_version: version, actions: collected_clone.clone() };
-                            let _ = save_config(&source_clone, &cfg);
+                            let _ = store_clone.set_actions(&collected_clone);
                             *live_clone.borrow_mut() = collected_clone.clone();
                             *disk_clone.borrow_mut() = collected_clone.clone();
                             rebuild_clone();

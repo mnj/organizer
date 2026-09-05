@@ -13,7 +13,7 @@ The immutable, alphabetically sorted list of supported files captured at launch 
 _Avoid_: File list, directory listing
 
 **Current File**:
-The file at the queue index currently shown in preview; the target of the next action or duplicate check.
+The file at the queue index currently shown in preview; the target of Classification or the next duplicate check.
 _Avoid_: Selected file, active file
 
 **Supported Format**:
@@ -24,24 +24,28 @@ _Avoid_: Image type, valid file
 A file with an extension outside Supported Format; shown as a placeholder card with filename and “Unsupported” badge, skippable via Next/Prev but never moved or hashed.
 _Avoid_: Invalid file, skipped file
 
-**Action**:
+**Category**:
 A user-configured triage destination with a display name, folder name (subfolder of Source Folder), and shortcut; moving Current File to it records its sha256 in the Organizer Database.
-_Avoid_: Category, label, classification
+_Avoid_: Action (as destination), label
+
+**Action**:
+A Sweep operation applied to matched files (`report`, `trash`, or `perm-delete`); chosen after Category toggles, never a triage destination.
+_Avoid_: Disposition, print, cleanup action
 
 **Organizer Database**:
-The single `organizer.db` sqlite file inside the Source Folder that stores Actions and triaged file hashes with Source Folder-relative paths; it replaces `organizer.toml` and `*.txt` logs.
+The single `organizer.db` sqlite file inside the Source Folder that stores Categories and triaged file hashes with Source Folder-relative paths; it replaces `organizer.toml` and `*.txt` logs.
 _Avoid_: txt log, config file
 
 **Classification**:
-The GUI manual triage that assigns Current File to an Action.
+The GUI manual triage that assigns Current File to a Category.
 _Avoid_: categorization, cleanup
 
 **Sweep**:
-The CLI operation that checks a Target Folder against a reference Organizer Database and applies a disposition (`report`, `trash`, `perm-delete`) to files whose sha256 is already known; it never classifies or moves to Action subfolders.
+The CLI operation that checks a Target Folder against a reference Organizer Database and applies an Action (`report`, `trash`, `perm-delete`) to files whose sha256 is already known; it never classifies or moves to Category subfolders.
 _Avoid_: cleanup action, categorize
 
 **Duplicate**:
-A file whose sha256 already exists in the Organizer Database; in Classification routed to the `duplicate/` subfolder instead of the chosen Action, in Sweep matched for its disposition.
+A file whose sha256 already exists in the Organizer Database; in Classification routed to the `duplicate/` subfolder instead of the chosen Category, in Sweep matched for its Action.
 _Avoid_: Copy, clone
 
 **Preview**:
@@ -49,7 +53,7 @@ The top split-view area that renders Current File via `gtk::Picture`/`Paintable`
 _Avoid_: Viewer, canvas
 
 **Action Bar**:
-The bottom split-view area with Action buttons, Prev/Next, index counter, and Undo.
+The bottom split-view area with Category buttons, Prev/Next, index counter, and Undo.
 _Avoid_: Toolbar, bottom panel
 
 **Snapshot**:

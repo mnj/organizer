@@ -28,12 +28,22 @@ jobs:
           # that surfaces as "held broken packages" for libgstreamer1.0-dev.
           sudo apt-mark showhold || true
           sudo apt full-upgrade -y
+          sudo apt-cache policy libunwind8 libunwind-dev
           sudo apt install -y libgtk-4-dev libadwaita-1-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
             liblcms2-dev libfontconfig1-dev libseccomp-dev bubblewrap \
             pkg-config build-essential curl xvfb \
-            desktop-file-utils appstream
+            desktop-file-utils appstream || {
+            echo "apt resolver stuck; retrying via aptitude (may downgrade libunwind8)"
+            sudo apt install -y aptitude
+            sudo aptitude install -y libgtk-4-dev libadwaita-1-dev \
+              libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+              gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
+              liblcms2-dev libfontconfig1-dev libseccomp-dev bubblewrap \
+              pkg-config build-essential curl xvfb \
+              desktop-file-utils appstream
+          }
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -111,8 +121,13 @@ jobs:
             gst-plugins-good gst-plugins-bad gst-libav lcms2 fontconfig libseccomp \
             bubblewrap pkgconf base-devel meson ninja git curl tar gzip
 
+      # Rust toolchain BEFORE the glycin build: its image-rs loader is Rust
+      # and meson fails with "Unknown compiler(s): rustc" without one.
+      - uses: dtolnay/rust-toolchain@stable
+
       - name: Build glycin-loaders from source (no distro package)
         run: |
+          rustc --version
           git clone --depth 1 https://gitlab.gnome.org/GNOME/glycin.git /tmp/glycin
           meson setup /tmp/glycin/builddir /tmp/glycin -Dglycin-loaders=true \
             -Dloaders=glycin-image-rs,glycin-svg \
@@ -120,8 +135,6 @@ jobs:
             -Dintrospection=false -Dprefix=/usr -Dtests=false
           meson compile -C /tmp/glycin/builddir
           meson install -C /tmp/glycin/builddir
-
-      - uses: dtolnay/rust-toolchain@stable
 
       - name: Raw release binary + headless probe
         # Headless-safe equivalent of `organizer /tmp/src` (GUI launch is
@@ -147,7 +160,8 @@ jobs:
           # Same runner-image skew healing as `raw` (libunwind-dev holds).
           sudo apt-mark showhold || true
           sudo apt full-upgrade -y
-          sudo apt install -y libgtk-4-dev libadwaita-1-dev \
+          sudo apt-cache policy libunwind8 libunwind-dev
+          DEPS="libgtk-4-dev libadwaita-1-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
             liblcms2-dev libfontconfig1-dev libseccomp-dev bubblewrap \
@@ -160,7 +174,14 @@ jobs:
             libvulkan-dev libx11-dev libxrandr-dev libxi-dev libxinerama-dev \
             libxcursor-dev libxdamage-dev libxfixes-dev libxcomposite-dev libxext-dev \
             libappstream-dev desktop-file-utils appstream librsvg2-dev xvfb patchelf file \
-            gstreamer1.0-tools
+            gstreamer1.0-tools"
+          # shellcheck disable=SC2086
+          sudo apt install -y $DEPS || {
+            echo "apt resolver stuck; retrying via aptitude (may downgrade libunwind8)"
+            sudo apt install -y aptitude
+            # shellcheck disable=SC2086
+            sudo aptitude install -y $DEPS
+          }
 
       - uses: dtolnay/rust-toolchain@stable
 

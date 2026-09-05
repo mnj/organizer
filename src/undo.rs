@@ -170,24 +170,23 @@ pub fn undo_classification(
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::fs;
-    use tempfile::TempDir;
 
-
+    fn make_entry(i: usize) -> UndoEntry {
+        UndoEntry::new(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &format!("f{i}.jpg"),
+            PathBuf::from(format!("/tmp/dest/f{i}.jpg")),
+            false,
+            "keep",
+            "Keep",
+        )
+    }
 
     #[test]
     fn push_undo_caps_at_50() {
         let mut stack = Vec::new();
         for i in 0..55 {
-            let entry = UndoEntry::new(
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                &format!("f{}.jpg", i),
-                PathBuf::from(format!("/tmp/dest/f{}.jpg", i)),
-                false,
-                "keep",
-                "Keep",
-            );
-            push_undo(&mut stack, entry);
+            push_undo(&mut stack, make_entry(i));
         }
         assert_eq!(stack.len(), 50);
         // oldest 5 should be evicted, so first is f5
@@ -199,15 +198,7 @@ mod tests {
     fn push_undo_capped_respects_queue_len() {
         let mut stack = Vec::new();
         for i in 0..10 {
-            let entry = UndoEntry::new(
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                &format!("f{}.jpg", i),
-                PathBuf::from(format!("/tmp/dest/f{}.jpg", i)),
-                false,
-                "keep",
-                "Keep",
-            );
-            push_undo_capped(&mut stack, entry, 3);
+            push_undo_capped(&mut stack, make_entry(i), 3);
         }
         assert_eq!(stack.len(), 3);
         assert_eq!(stack[0].src_name, "f7.jpg");

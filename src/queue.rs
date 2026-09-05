@@ -74,6 +74,14 @@ mod tests {
         File::create(dir.join(name)).unwrap();
     }
 
+    fn snapshot_names(dir: &Path) -> Vec<String> {
+        build_snapshot(dir)
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect()
+    }
+
     #[test]
     fn empty_folder_yields_empty_snapshot() {
         let dir = TempDir::new().unwrap();
@@ -103,11 +111,7 @@ mod tests {
         std::fs::create_dir(p.join("subdir")).unwrap();
         touch(&p.join("subdir"), "inside.jpg");
 
-        let snap = build_snapshot(p).unwrap();
-        let names: Vec<String> = snap
-            .iter()
-            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
-            .collect();
+        let names = snapshot_names(p);
 
         // Expected: only supported, natural sorted case-insensitive
         // Natural order: 2.jpg, 10.jpg, a.png, b.JPG, clip.webm, photo.TIFF
@@ -151,12 +155,7 @@ mod tests {
         touch(p, "organizer.toml");
         touch(p, "keep.txt");
         touch(p, "maybe.txt");
-        let snap = build_snapshot(p).unwrap();
-        let names: Vec<String> = snap
-            .iter()
-            .map(|x| x.file_name().unwrap().to_str().unwrap().to_string())
-            .collect();
-        assert_eq!(names, vec!["photo.jpg"], "legacy files must never enter the Queue (#25)");
+        assert_eq!(snapshot_names(p), vec!["photo.jpg"], "legacy files must never enter the Queue (#25)");
     }
 
     #[test]
@@ -168,11 +167,6 @@ mod tests {
         touch(p, "organizer.db-wal");
         touch(p, "organizer.db-shm");
         touch(p, "organizer.db-journal");
-        let snap = build_snapshot(p).unwrap();
-        let names: Vec<String> = snap
-            .iter()
-            .map(|x| x.file_name().unwrap().to_str().unwrap().to_string())
-            .collect();
-        assert_eq!(names, vec!["a.jpg"]);
+        assert_eq!(snapshot_names(p), vec!["a.jpg"]);
     }
 }

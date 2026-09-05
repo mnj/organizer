@@ -43,7 +43,7 @@ Organizer links (via `gtk4-sys`, `gstreamer-sys`, `libglycin`) against host shar
 |---|---|---|
 | **Ubuntu 22.04 jammy** (build baseline; `glibc 2.35`, `gtk 4.6`) | `sudo apt update && sudo apt install -y libgtk-4-dev libadwaita-1-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav libgstreamer-plugins-bad1.0-dev liblcms2-dev libfontconfig1-dev libseccomp-dev bubblewrap pkg-config build-essential curl` — plus `glycin-loaders` via `ppa:gnome` or built from source (`meson -Dglycin-loaders=true`); `gstreamer1.0-plugins-bad` pulls VA-API deps | Jammy has no `glycin-loaders` package; build from `GNOME/glycin` tag `3.x`. `glycin-loaders` needs `meson ≥0.60`. |
 | **Ubuntu 24.04 noble** (`gtk 4.14`, `glibc 2.39`) | Same apt line — `glycin-loaders` available via `universe` as `glycin-loaders` `2.2` on `noble` after GNOME 47 | Preferred dev host; matches `linuxdeploy` build image libs. |
-| **Fedora 41** | `sudo dnf install -y gtk4-devel libadwaita-devel gstreamer1-devel gstreamer1-plugins-base-devel gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugin-libav liblcms2-devel fontconfig-devel libseccomp-devel bubblewrap pkgconf-pkg-config gcc` + `glycin` via `dnf install glycin glycin-loaders` (if packaged) or source | Fedora `libadwaita` is `libadwaita-devel`. |
+| **Fedora 41** | `sudo dnf install -y gtk4-devel libadwaita-devel gstreamer1-devel gstreamer1-plugins-base-devel gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugin-libav lcms2-devel fontconfig-devel libseccomp-devel bubblewrap pkgconf-pkg-config gcc` + `glycin` via `dnf install glycin glycin-loaders` (if packaged) or source | Fedora `libadwaita` is `libadwaita-devel`. |
 | **Arch** | `sudo pacman -S --needed gtk4 libadwaita gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav lcms2 fontconfig libseccomp bubblewrap pkgconf base-devel` + `glycin` from AUR `glycin` or source | Arch `glycin` is AUR; CI uses `archlinux/archlinux` container with `pacman -Syu --noconfirm`. |
 | **Debian trixie** | Similar to Ubuntu apt line — `libgtk-4-dev >=4.14` from trixie, `libadwaita-1-dev`, `gstreamer1.0*`, `bubblewrap` | Trixie `glycin` not yet in archive; build from source. |
 | **NixOS** | `nix-shell -p gtk4 libadwaita gstreamer gst_all_1.gst-plugins-base gst_all_1.gst-plugins-good gst_all_1.gst-plugins-bad gst_all_1.gst-libav lcms2 fontconfig libseccomp bubblewrap pkg-config` + wrap `LD_LIBRARY_PATH`/`XDG_DATA_DIRS` via `nix-ld` | `glycin` handles `/nix/store` via `--ro-bind-try /nix/store` (see #11 §1.1). |
@@ -542,7 +542,7 @@ jobs:
         if: matrix.os == 'fedora'
         run: dnf install -y gtk4-devel libadwaita-devel gstreamer1-devel gstreamer1-plugins-base-devel \
                 gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugin-libav \
-                liblcms2-devel fontconfig-devel libseccomp-devel bubblewrap pkgconf-pkg-config gcc
+                lcms2-devel fontconfig-devel libseccomp-devel bubblewrap pkgconf-pkg-config gcc
       - name: install deps (arch)
         if: matrix.os == 'arch'
         run: pacman -Syu --noconfirm gtk4 libadwaita gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav lcms2 fontconfig libseccomp bubblewrap pkgconf base-devel && pacman -Scc --noconfirm

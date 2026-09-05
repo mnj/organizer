@@ -19,11 +19,15 @@ jobs:
     name: raw (test + release binary)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install sys-deps (apt one-liner, see docs/packaging.md)
         run: |
           sudo apt update
+          # Heal runner-image/archive skew (e.g. libunwind8 vs libunwind-dev)
+          # that surfaces as "held broken packages" for libgstreamer1.0-dev.
+          sudo apt-mark showhold || true
+          sudo apt full-upgrade -y
           sudo apt install -y libgtk-4-dev libadwaita-1-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
@@ -78,6 +82,7 @@ jobs:
     name: raw build (${{ matrix.id }})
     runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         include:
           - id: fedora-41
@@ -87,7 +92,7 @@ jobs:
     container:
       image: ${{ matrix.image }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install sys-deps (fedora one-liner, see docs/packaging.md)
         if: matrix.id == 'fedora-41'
@@ -95,7 +100,7 @@ jobs:
           dnf install -y gtk4-devel libadwaita-devel \
             gstreamer1-devel gstreamer1-plugins-base-devel gstreamer1-plugins-good \
             gstreamer1-plugins-bad-free gstreamer1-plugin-libav \
-            gstreamer1-plugins-good-extras liblcms2-devel fontconfig-devel \
+            gstreamer1-plugins-good-extras lcms2-devel fontconfig-devel \
             libseccomp-devel bubblewrap pkgconf-pkg-config gcc \
             meson ninja-build git curl tar gzip findutils procps-ng
 
@@ -134,11 +139,14 @@ jobs:
     runs-on: ubuntu-22.04
     needs: raw
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install build deps
         run: |
           sudo apt update
+          # Same runner-image skew healing as `raw` (libunwind-dev holds).
+          sudo apt-mark showhold || true
+          sudo apt full-upgrade -y
           sudo apt install -y libgtk-4-dev libadwaita-1-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \

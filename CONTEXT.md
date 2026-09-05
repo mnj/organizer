@@ -25,11 +25,23 @@ A file with an extension outside Supported Format; shown as a placeholder card w
 _Avoid_: Invalid file, skipped file
 
 **Action**:
-A user-configured triage destination with a display name, folder name (subfolder of Source Folder), and shortcut; moving Current File to it appends its sha256 to that Action’s log.
-_Avoid_: Category, label
+A user-configured triage destination with a display name, folder name (subfolder of Source Folder), and shortcut; moving Current File to it records its sha256 in the Organizer Database.
+_Avoid_: Category, label, classification
+
+**Organizer Database**:
+The single `organizer.db` sqlite file inside the Source Folder that stores Actions and triaged file hashes with Source Folder-relative paths; it replaces `organizer.toml` and `*.txt` logs.
+_Avoid_: txt log, config file
+
+**Classification**:
+The GUI manual triage that assigns Current File to an Action.
+_Avoid_: categorization, cleanup
+
+**Sweep**:
+The CLI operation that checks a Target Folder against a reference Organizer Database and applies a disposition (`report`, `trash`, `perm-delete`) to files whose sha256 is already known; it never classifies or moves to Action subfolders.
+_Avoid_: cleanup action, categorize
 
 **Duplicate**:
-A file whose sha256 already exists in any Action log; routed to the `duplicate/` subfolder instead of the chosen Action.
+A file whose sha256 already exists in the Organizer Database; in Classification routed to the `duplicate/` subfolder instead of the chosen Action, in Sweep matched for its disposition.
 _Avoid_: Copy, clone
 
 **Preview**:

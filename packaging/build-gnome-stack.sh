@@ -64,3 +64,7 @@ meson setup /tmp/glycin/builddir /tmp/glycin -Dglycin-loaders=true \
   -Dintrospection=false -Dprefix=/usr -Dtests=false
 meson compile -C /tmp/glycin/builddir
 meson install -C /tmp/glycin/builddir
+# Hand the trees back to the invoking user: later steps run unprivileged
+# (e.g. build-appimage.sh reinstalls glycin into the AppDir) and must be able
+# to write ninja/cargo locks. Without sudo the fallback is the current user.
+chown -R "${SUDO_UID:-0}:${SUDO_GID:-0}" /tmp/dist-src /tmp/glycin

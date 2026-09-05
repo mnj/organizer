@@ -1,21 +1,11 @@
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs::OpenOptions;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
 
-/// Action as persisted per-folder in `SourceFolder/organizer.toml`
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Action as persisted in the Organizer Database (`Source Folder/organizer.db`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Action {
     pub display_name: String,
     pub folder_name: String,
     pub shortcut: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
-    pub config_version: u32,
-    pub actions: Vec<Action>,
 }
 
 /// Slugify: lower, spaces → `_`, strip `[^a-z0-9_-]`
@@ -139,111 +129,31 @@ pub fn validate_actions(actions: &[Action]) -> Result<(), Vec<ValidationError>> 
     }
 }
 
-pub fn default_config() -> Config {
-    Config {
-        config_version: 1,
-        actions: vec![
-            Action {
-                display_name: "Keep".into(),
-                folder_name: "keep".into(),
-                shortcut: "1".into(),
-            },
-            Action {
-                display_name: "Maybe".into(),
-                folder_name: "maybe".into(),
-                shortcut: "2".into(),
-            },
-            Action {
-                display_name: "Reject".into(),
-                folder_name: "reject".into(),
-                shortcut: "3".into(),
-            },
-        ],
-    }
-}
-
-fn config_path(source_folder: &Path) -> PathBuf {
-    source_folder.join("organizer.toml")
-}
-
-/// Load or auto-create config for source_folder.
-/// Uses flock shared lock for reading, validates after parse.
-/// Legacy `organizer.toml` path (pre-#24); GUI Actions (#24) live in the
-/// Organizer Database via `Store::actions`/`set_actions`. Removal in #25.
-pub fn load_or_create(source_folder: &Path) -> std::io::Result<Config> {
-    let path = config_path(source_folder);
-    if !path.exists() {
-        let cfg = default_config();
-        save_config(source_folder, &cfg)?;
-        return Ok(cfg);
-    }
-    // read with shared lock
-    let mut file = OpenOptions::new().read(true).open(&path)?;
-    #[cfg(unix)]
-    {
-        let _ = fs2::FileExt::lock_shared(&file);
-    }
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)?;
-    #[cfg(unix)]
-    {
-        let _ = fs2::FileExt::unlock(&file);
-    }
-    let cfg: Config = toml::from_str(&buf).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("invalid organizer.toml: {e}"),
-        )
-    })?;
-    // validate but don't fail hard - caller can handle; we return cfg even if invalid for UI to fix?
-    // For load, we just return; validation is for settings.
-    Ok(cfg)
-}
-
-/// Save config atomically: write temp + fsync + rename + flock+fsync parent.
-/// Pattern: write temp in same dir, fsync temp, rename atomic, then open dest,
-/// flock exclusive, fsync, unlock, then fsync parent dir.
-pub fn save_config(source_folder: &Path, config: &Config) -> std::io::Result<()> {
-    let toml_str = toml::to_string(config).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("toml serialize: {e}"))
-    })?;
-    let dir = source_folder;
-    std::fs::create_dir_all(dir)?;
-    let path = config_path(dir);
-    // write to temp file in same dir
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(toml_str.as_bytes())?;
-    tmp.flush()?;
-    tmp.as_file().sync_all()?;
-    // atomic rename - this is the critical section; temp file is fsynced before rename
-    tmp.persist(&path)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("persist: {e}")))?;
-    // flock exclusive + fsync on the final file (holds lock across fsync, per ADR 0001/0006)
-    {
-        let f = OpenOptions::new().read(true).write(true).open(&path)?;
-        #[cfg(unix)]
-        {
-            use fs2::FileExt;
-            f.lock_exclusive()?;
-            f.sync_all()?;
-            f.unlock()?;
-        }
-        #[cfg(not(unix))]
-        {
-            f.sync_all()?;
-        }
-    }
-    // fsync parent dir to persist rename
-    if let Ok(dir_file) = OpenOptions::new().read(true).open(dir) {
-        let _ = dir_file.sync_all();
-    }
-    Ok(())
+/// Default Actions seeded into a fresh Organizer Database.
+/// Sole source of defaults now that `organizer.toml` is gone (#25).
+pub fn default_actions() -> Vec<Action> {
+    vec![
+        Action {
+            display_name: "Keep".into(),
+            folder_name: "keep".into(),
+            shortcut: "1".into(),
+        },
+        Action {
+            display_name: "Maybe".into(),
+            folder_name: "maybe".into(),
+            shortcut: "2".into(),
+        },
+        Action {
+            display_name: "Reject".into(),
+            folder_name: "reject".into(),
+            shortcut: "3".into(),
+        },
+    ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
     #[test]
     fn slugify_spaces_to_underscore_and_strips_and_lowers() {
@@ -338,51 +248,14 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_write_reload() {
-        let dir = TempDir::new().unwrap();
-        let cfg = Config {
-            config_version: 1,
-            actions: vec![
-                Action { display_name: "Keep".into(), folder_name: "keep".into(), shortcut: "1".into() },
-                Action { display_name: "Top Picks".into(), folder_name: "top_picks".into(), shortcut: "2".into() },
-            ],
-        };
-        save_config(dir.path(), &cfg).unwrap();
-        let loaded = load_or_create(dir.path()).unwrap();
-        assert_eq!(loaded.config_version, 1);
-        assert_eq!(loaded.actions, cfg.actions);
-    }
-
-    #[test]
-    fn auto_creates_defaults() {
-        let dir = TempDir::new().unwrap();
-        let cfg = load_or_create(dir.path()).unwrap();
-        assert_eq!(cfg.actions.len(), 3);
-        assert_eq!(cfg.actions[0].display_name, "Keep");
-        assert_eq!(cfg.actions[1].shortcut, "2");
-        assert!(dir.path().join("organizer.toml").exists());
-        // reload preserves
-        let cfg2 = load_or_create(dir.path()).unwrap();
-        assert_eq!(cfg2.actions, cfg.actions);
-    }
-
-    #[test]
-    fn switching_source_folder_loads_own_config() {
-        let dir1 = TempDir::new().unwrap();
-        let dir2 = TempDir::new().unwrap();
-        let cfg1 = Config {
-            config_version: 1,
-            actions: vec![Action { display_name: "A".into(), folder_name: "a".into(), shortcut: "1".into() }],
-        };
-        let cfg2 = Config {
-            config_version: 1,
-            actions: vec![Action { display_name: "B".into(), folder_name: "b".into(), shortcut: "9".into() }],
-        };
-        save_config(dir1.path(), &cfg1).unwrap();
-        save_config(dir2.path(), &cfg2).unwrap();
-        let l1 = load_or_create(dir1.path()).unwrap();
-        let l2 = load_or_create(dir2.path()).unwrap();
-        assert_eq!(l1.actions[0].display_name, "A");
-        assert_eq!(l2.actions[0].display_name, "B");
+    fn default_actions_seed_keep_maybe_reject() {
+        let defaults = default_actions();
+        assert_eq!(defaults.len(), 3);
+        assert_eq!(defaults[0].display_name, "Keep");
+        assert_eq!(defaults[0].folder_name, "keep");
+        assert_eq!(defaults[0].shortcut, "1");
+        assert_eq!(defaults[1].shortcut, "2");
+        assert_eq!(defaults[2].shortcut, "3");
+        assert!(validate_actions(&defaults).is_ok());
     }
 }

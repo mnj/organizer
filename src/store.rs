@@ -1,4 +1,4 @@
-use crate::config::{default_config, validate_actions, Action, ValidationError};
+use crate::config::{default_actions, validate_actions, Action, ValidationError};
 use crate::dedup::{is_valid_hash, FileHash};
 use rusqlite::{params, Connection, TransactionBehavior};
 use std::collections::HashSet;
@@ -139,12 +139,12 @@ impl FileRecord {
 
 /// Portable Organizer Database inside the Source Folder.
 ///
-/// Beside legacy storage (organizer.toml + *.txt): opening a Store never reads
-/// or writes legacy files. Each operation opens a short-lived SQLite connection
-/// in WAL mode with `busy_timeout` so concurrent openers serialize via
-/// `BEGIN IMMEDIATE` instead of corrupting the database.
+/// Sole store since #25: opening a Store never reads or writes legacy
+/// `organizer.toml` or `*.txt` files. Each operation opens a short-lived
+/// SQLite connection in WAL mode with `busy_timeout` so concurrent openers
+/// serialize via `BEGIN IMMEDIATE` instead of corrupting the database.
 ///
-/// Record layer only: filesystem moves stay in `mover` (Classification #24
+/// Record layer only: filesystem moves stay in `mover` (Classification
 /// combines move + insert and rolls the row back if the rename fails).
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -184,7 +184,7 @@ impl Store {
     /// Open (or seed) the Organizer Database in `source_folder`.
     /// Creates the folder if missing, enables WAL, creates schema, checks the
     /// schema version, seeds defaults.
-    /// Never touches `organizer.toml` or `*.txt`.
+    /// Never reads or writes legacy `organizer.toml` or `*.txt` (#25).
     pub fn open(source_folder: &Path) -> Result<Self, StoreError> {
         retry_on_busy(|| {
             std::fs::create_dir_all(source_folder)?;
@@ -267,10 +267,10 @@ impl Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let count: i64 = tx.query_row("SELECT COUNT(*) FROM actions", [], |r| r.get(0))?;
         if count == 0 {
-            let defaults = default_config();
+            let defaults = default_actions();
             // Defaults are known-valid; validation here guards against regressions.
-            validate_actions(&defaults.actions).map_err(StoreError::Validation)?;
-            for (pos, a) in defaults.actions.iter().enumerate() {
+            validate_actions(&defaults).map_err(StoreError::Validation)?;
+            for (pos, a) in defaults.iter().enumerate() {
                 // OR IGNORE keeps a lost race (both saw 0 before locks existed)
                 // from corrupting: second opener becomes a no-op reopen.
                 tx.execute(
@@ -474,11 +474,11 @@ mod tests {
     }
 
     #[test]
-    fn fresh_seeds_defaults_and_touches_no_legacy() {
+    fn fresh_seeds_defaults_and_ignores_legacy() {
         let dir = TempDir::new().unwrap();
         let source = dir.path().join("source");
         fs::create_dir_all(&source).unwrap();
-        // Pre-existing legacy files must be left alone.
+        // Pre-existing legacy files must be left alone and never read.
         fs::write(source.join("organizer.toml"), b"legacy").unwrap();
         fs::write(
             source.join("keep.txt"),
@@ -493,10 +493,16 @@ mod tests {
         assert_eq!(actions[0].folder_name, "keep");
         assert_eq!(actions[0].shortcut, "1");
 
-        // Database exists, legacy untouched.
+        // Database exists, legacy untouched and unread: the txt hash is NOT known.
         assert!(store.db_path().exists());
         assert_eq!(fs::read(source.join("organizer.toml")).unwrap(), b"legacy");
         assert!(fs::read_to_string(source.join("keep.txt")).unwrap().contains("aaaa"));
+        assert!(
+            !store
+                .contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap(),
+            "legacy txt hashes must be ignored by Duplicate checks (#25)"
+        );
         // No new legacy files created.
         let entries: Vec<String> = fs::read_dir(&source)
             .unwrap()

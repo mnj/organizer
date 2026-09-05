@@ -1,10 +1,6 @@
-use std::collections::HashSet;
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use crate::dedup::{is_valid_hash, FileHash};
-use crate::mover::move_to_action;
+use crate::dedup::FileHash;
 
 /// Undo entry stores enough to reverse one move.
 /// In-memory only, LIFO, capped at 50 (ADR 0005).
@@ -14,7 +10,7 @@ pub struct UndoEntry {
     pub src_name: String,    // e.g. "foo.jpg"
     pub dest_path: PathBuf,  // absolute subfolder destination that file was moved to
     pub was_duplicate: bool, // true if routed to duplicate/ subfolder
-    pub folder_name: String, // Action folder_name for the log `SourceFolder/<folder>.txt` (empty if was_duplicate)
+    pub folder_name: String, // Action folder_name for the database row
     pub display_name: String, // Action display_name for toast
 }
 
@@ -122,155 +118,12 @@ fn split_filename(name: &str) -> (&str, Option<&str>) {
     (name, None)
 }
 
-/// Helper: write lines with newline, flush + fsync (caller holds exclusive lock if unix).
-fn write_lines(file: &mut std::fs::File, lines: &[String]) -> std::io::Result<()> {
-    for line in lines {
-        file.write_all(line.as_bytes())?;
-        file.write_all(b"\n")?;
-    }
-    file.flush()?;
-    file.sync_all()?;
-    Ok(())
-}
-
-/// Check if any `*.txt` inside `source_folder` contains `lower` (case-insensitive trimmed equality).
-/// Uses shared lock per file.
-fn contains_hash_in_logs(source_folder: &Path, lower: &str) -> bool {
-    let Ok(dir) = std::fs::read_dir(source_folder) else {
-        return false;
-    };
-    for e in dir.flatten() {
-        let p = e.path();
-        if !p.is_file() {
-            continue;
-        }
-        if !matches!(p.extension().and_then(|x| x.to_str()), Some(ext) if ext.eq_ignore_ascii_case("txt")) {
-            continue;
-        }
-        if let Ok(f) = OpenOptions::new().read(true).open(&p) {
-            #[cfg(unix)]
-            {
-                let _ = fs2::FileExt::lock_shared(&f);
-            }
-            let reader = BufReader::new(&f);
-            for line in reader.lines().flatten() {
-                if line.trim().to_ascii_lowercase() == lower {
-                    #[cfg(unix)]
-                    {
-                        let _ = fs2::FileExt::unlock(&f);
-                    }
-                    return true;
-                }
-            }
-            #[cfg(unix)]
-            {
-                let _ = fs2::FileExt::unlock(&f);
-            }
-        }
-    }
-    false
-}
-
-/// Remove last occurrence of `hash` (case-insensitive) from `SourceFolder/<folder_name>.txt`.
-/// Returns true if a line was removed. Holds exclusive `flock` across read+rewrite for atomicity,
-/// then `fsync` file and parent dir. If file does not exist, returns Ok(false).
-pub fn remove_last_hash_occurrence(
-    source_folder: &Path,
-    folder_name: &str,
-    hash: &str,
-) -> std::io::Result<bool> {
-    if !is_valid_hash(hash) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("invalid hash: {}", hash),
-        ));
-    }
-    let lower = hash.to_ascii_lowercase();
-    let log_path = source_folder.join(format!("{}.txt", folder_name));
-    if !log_path.exists() {
-        return Ok(false);
-    }
-    // Open read+write and hold exclusive lock across read and rewrite (no unlock window)
-    let mut file = OpenOptions::new().read(true).write(true).open(&log_path)?;
-    #[cfg(unix)]
-    {
-        use fs2::FileExt;
-        file.lock_exclusive()?;
-    }
-    // Read all lines while holding exclusive lock
-    let mut lines: Vec<String> = Vec::new();
-    {
-        use std::io::Seek;
-        file.seek(std::io::SeekFrom::Start(0))?;
-        let reader = BufReader::new(&file);
-        for line in reader.lines().flatten() {
-            lines.push(line);
-        }
-    }
-    // Find last index where trimmed lower == lower
-    let mut last_idx: Option<usize> = None;
-    for (i, line) in lines.iter().enumerate() {
-        if line.trim().to_ascii_lowercase() == lower {
-            last_idx = Some(i);
-        }
-    }
-    let idx = match last_idx {
-        Some(i) => i,
-        None => {
-            #[cfg(unix)]
-            {
-                use fs2::FileExt;
-                let _ = file.unlock();
-            }
-            return Ok(false);
-        }
-    };
-    lines.remove(idx);
-    // Truncate and rewrite while still holding exclusive lock
-    {
-        use std::io::Seek;
-        file.set_len(0)?;
-        file.seek(std::io::SeekFrom::Start(0))?;
-        write_lines(&mut file, &lines)?;
-        #[cfg(unix)]
-        {
-            use fs2::FileExt;
-            file.unlock()?;
-        }
-    }
-    if let Ok(dir_file) = OpenOptions::new().read(true).open(source_folder) {
-        let _ = dir_file.sync_all();
-    }
-    Ok(true)
-}
-
-/// Perform undo: move file back from dest_path to source_folder (with _undo suffix on clash),
-/// and if not was_duplicate, remove last hash occurrence from `folder_name.txt` and
-/// remove from union HashSet (only if hash no longer present in any txt after removal).
-/// Returns the restored path on success.
-/// Legacy txt-log path (pre-#24); GUI Undo (#24) uses `undo_classification`.
-/// Removal tracked in #25 (ADR 0007 sqlite-only).
-pub fn undo_move(
-    source_folder: &Path,
-    entry: &UndoEntry,
-    union_set: &mut HashSet<String>,
-) -> std::io::Result<PathBuf> {
-    let restored = undo_rename(source_folder, &entry.dest_path, &entry.src_name)?;
-    if !entry.was_duplicate && !entry.folder_name.is_empty() {
-        let _removed = remove_last_hash_occurrence(source_folder, &entry.folder_name, &entry.hash)?;
-        let lower = entry.hash.to_ascii_lowercase();
-        if !contains_hash_in_logs(source_folder, &lower) {
-            union_set.remove(&lower);
-        }
-    }
-    Ok(restored)
-}
-
-/// Undo a Classification stored in the Organizer Database (#24).
+/// Undo a Classification stored in the Organizer Database.
 ///
 /// Moves the file back from its Action/`duplicate/` destination to the Source
 /// Folder (suffixing `_undo_1` on clash) and, for non-duplicates, reverts the
-/// database row via `Store::remove`. Duplicate undos touch no rows.
+/// database row via `Store::remove`. Duplicate undos touch no rows. Never
+/// reads or writes legacy `*.txt` logs (#25).
 ///
 /// If the row revert fails we attempt to roll the filesystem rename forward
 /// again (file back to its destination) so a bare DB failure does not leave
@@ -316,153 +169,11 @@ pub fn undo_classification(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dedup::compute_sha256;
-    use std::collections::HashSet;
+    use std::path::PathBuf;
     use std::fs;
     use tempfile::TempDir;
 
 
-
-    #[test]
-    fn undo_nonduplicate_moves_back_removes_log_and_union() {
-        let tmp = TempDir::new().unwrap();
-        let base = tmp.path();
-        let source = base.join("source");
-        fs::create_dir_all(&source).unwrap();
-        let foo = source.join("foo.jpg");
-        fs::write(&foo, b"hello").unwrap();
-        let hash = compute_sha256(&foo).unwrap();
-        let mut union = HashSet::new();
-        let dest = move_to_action(&source, &foo, "keep", &hash, &mut union).unwrap();
-        assert!(dest.exists());
-        assert_eq!(union.len(), 1);
-        assert!(source.join("keep.txt").exists());
-        let entry = UndoEntry::new(&hash, "foo.jpg", dest.clone(), false, "keep", "Keep");
-        let restored = undo_move(&source, &entry, &mut union).unwrap();
-        assert_eq!(restored, source.join("foo.jpg"));
-        assert!(restored.exists());
-        assert!(!dest.exists());
-        // log should be empty now (removed last occurrence)
-        let log = fs::read_to_string(source.join("keep.txt")).unwrap();
-        assert!(log.trim().is_empty(), "log should be empty after undo, got {:?}", log);
-        assert!(!union.contains(&hash.to_ascii_lowercase()));
-        // toast message would be "Undid Keep: foo.jpg → Source" - not tested here
-    }
-
-    #[test]
-    fn undo_duplicate_skip_log_and_union() {
-        let tmp = TempDir::new().unwrap();
-        let base = tmp.path();
-        let source = base.join("source");
-        fs::create_dir_all(&source).unwrap();
-        // first file to create union entry
-        let a = source.join("a.jpg");
-        fs::write(&a, b"same").unwrap();
-        let ha = compute_sha256(&a).unwrap();
-        let mut union = HashSet::new();
-        let _da = move_to_action(&source, &a, "keep", &ha, &mut union).unwrap();
-        assert_eq!(union.len(), 1);
-        let log_before = fs::read_to_string(source.join("keep.txt")).unwrap();
-        assert_eq!(log_before.lines().count(), 1);
-        // second file same hash -> duplicate
-        let b = source.join("b.jpg");
-        fs::write(&b, b"same").unwrap();
-        let hb = compute_sha256(&b).unwrap();
-        assert_eq!(ha, hb);
-        let db = move_to_action(&source, &b, "keep", &hb, &mut union).unwrap();
-        assert_eq!(db, source.join("duplicate").join("b.jpg"));
-        assert_eq!(union.len(), 1);
-        let log_mid = fs::read_to_string(source.join("keep.txt")).unwrap();
-        assert_eq!(log_mid.lines().count(), 1);
-        let entry = UndoEntry::new(&hb, "b.jpg", db.clone(), true, "keep", "Keep");
-        let restored = undo_move(&source, &entry, &mut union).unwrap();
-        assert_eq!(restored, source.join("b.jpg"));
-        assert!(restored.exists());
-        // union unchanged, log unchanged
-        assert_eq!(union.len(), 1);
-        let log_after = fs::read_to_string(source.join("keep.txt")).unwrap();
-        assert_eq!(log_after.lines().count(), 1);
-        assert!(!source.join("duplicate").join("b.jpg").exists());
-        // no duplicate.txt
-        assert!(!source.join("duplicate.txt").exists());
-    }
-
-    #[test]
-    fn undo_suffix_on_clash_never_overwrites() {
-        let tmp = TempDir::new().unwrap();
-        let base = tmp.path();
-        let source = base.join("source");
-        fs::create_dir_all(&source).unwrap();
-        let a = source.join("a.jpg");
-        fs::write(&a, b"content a").unwrap();
-        let ha = compute_sha256(&a).unwrap();
-        let mut union = HashSet::new();
-        let da = move_to_action(&source, &a, "keep", &ha, &mut union).unwrap();
-        // create a new file with same name in source to cause clash on undo
-        let clash = source.join("a.jpg");
-        fs::write(&clash, b"clash").unwrap();
-        let entry = UndoEntry::new(&ha, "a.jpg", da.clone(), false, "keep", "Keep");
-        let restored = undo_move(&source, &entry, &mut union).unwrap();
-        // should be a_undo_1.jpg
-        assert_eq!(restored, source.join("a_undo_1.jpg"));
-        assert!(restored.exists());
-        assert!(source.join("a.jpg").exists()); // clash still there
-        // second undo with same name should create _undo_2
-        // need another entry pointing to same dest? Simulate another file
-        let b = source.join("b.jpg");
-        fs::write(&b, b"content b").unwrap();
-        let hb = compute_sha256(&b).unwrap();
-        let _db = move_to_action(&source, &b, "keep", &hb, &mut union).unwrap();
-        // create clash again: a_undo_1 exists, a.jpg exists => next undo for a.jpg would be _undo_1 but already exists, so _undo_2
-        // Let's test suffix directly by creating a_undo_1 already, then undo a.jpg with clash -> _undo_2
-        // Actually we need to undo a file named a.jpg again but source already has a.jpg and a_undo_1.jpg
-        // Create a new dest file named a.jpg in keep
-        let a2 = source.join("a2.jpg");
-        fs::write(&a2, b"another a").unwrap();
-        let ha2 = compute_sha256(&a2).unwrap();
-        // Move a2 to keep as a.jpg? Need to control file name: move will preserve file name a2.jpg, not a.jpg
-        // Instead test suffix logic directly: create a file a.jpg in source, try undo that would restore a.jpg but clash
-        // We already have a_undo_1, so next suffix should be _undo_2
-        // Create a new dest: use a different keep file but restore as "a.jpg" again
-        let fake_dest = source.join("keep").join("a_fake.jpg");
-        fs::write(&fake_dest, b"fake").unwrap();
-        let entry2 = UndoEntry::new(&ha2, "a.jpg", fake_dest.clone(), false, "keep", "Keep");
-        let restored2 = undo_move(&source, &entry2, &mut union).unwrap();
-        assert_eq!(restored2, source.join("a_undo_2.jpg"));
-    }
-
-    #[test]
-    fn undo_remove_last_occurrence_only() {
-        let tmp = TempDir::new().unwrap();
-        let source = tmp.path().join("source");
-        fs::create_dir_all(&source).unwrap();
-        // Create keep.txt with duplicate lines and corrupted lines
-        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let log_path = source.join("keep.txt");
-        // write 3 lines: hash, other, hash (second occurrence)
-        fs::write(&log_path, format!("{}\n{}\n{}\n", hash, other, hash)).unwrap();
-        let mut union = HashSet::new();
-        union.insert(hash.to_string());
-        union.insert(other.to_string());
-        // remove last occurrence of hash -> should keep first hash and other
-        let removed = remove_last_hash_occurrence(&source, "keep", hash).unwrap();
-        assert!(removed);
-        let content = fs::read_to_string(&log_path).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines, vec![hash, other]);
-        // union still contains hash because it still appears once
-        // But undo_move would check still_present and not remove. Here we test low-level still removes line.
-        // Now remove again -> should remove remaining hash
-        let removed2 = remove_last_hash_occurrence(&source, "keep", hash).unwrap();
-        assert!(removed2);
-        let content2 = fs::read_to_string(&log_path).unwrap();
-        let lines2: Vec<&str> = content2.lines().collect();
-        assert_eq!(lines2, vec![other]);
-        // remove when not found returns false
-        let removed3 = remove_last_hash_occurrence(&source, "keep", hash).unwrap();
-        assert!(!removed3);
-    }
 
     #[test]
     fn push_undo_caps_at_50() {
@@ -485,107 +196,21 @@ mod tests {
     }
 
     #[test]
-    fn redo_reapplies_move_and_log() {
-        let tmp = TempDir::new().unwrap();
-        let base = tmp.path();
-        let source = base.join("source");
-        fs::create_dir_all(&source).unwrap();
-        let foo = source.join("foo.jpg");
-        fs::write(&foo, b"hello redo").unwrap();
-        let hash = compute_sha256(&foo).unwrap();
-        let mut union = HashSet::new();
-        let dest = move_to_action(&source, &foo, "keep", &hash, &mut union).unwrap();
-        assert!(dest.exists());
-        let entry = UndoEntry::new(&hash, "foo.jpg", dest.clone(), false, "keep", "Keep");
-        // undo
-        let restored = undo_move(&source, &entry, &mut union).unwrap();
-        assert!(restored.exists());
-        assert_eq!(union.len(), 0);
-        // redo: move restored file back (same as original move)
-        let dest2 = move_to_action(&source, &restored, "keep", &hash, &mut union).unwrap();
-        assert!(dest2.exists());
-        assert!(!restored.exists());
-        assert_eq!(union.len(), 1);
-        let log = fs::read_to_string(source.join("keep.txt")).unwrap();
-        assert!(log.contains(&hash.to_ascii_lowercase()));
-    }
-
-    #[test]
-    fn undo_fails_if_dest_missing() {
-        let tmp = TempDir::new().unwrap();
-        let source = tmp.path().join("source");
-        fs::create_dir_all(&source).unwrap();
-        let entry = UndoEntry::new(
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "missing.jpg",
-            source.join("../keep/missing.jpg"),
-            false,
-            "keep",
-            "Keep",
-        );
-        let mut union = HashSet::new();
-        let res = undo_move(&source, &entry, &mut union);
-        assert!(res.is_err());
-    }
-
-    #[test]
-    fn headless_multistep_undo_redo_lifo() {
-        let tmp = TempDir::new().unwrap();
-        let base = tmp.path();
-        let source = base.join("source");
-        fs::create_dir_all(&source).unwrap();
-        let mut union = HashSet::new();
-        let mut undo_stack: Vec<UndoEntry> = Vec::new();
-        let mut redo_stack: Vec<UndoEntry> = Vec::new();
-
-        // move a.jpg -> keep
-        let a = source.join("a.jpg");
-        fs::write(&a, b"a").unwrap();
-        let ha = compute_sha256(&a).unwrap();
-        let da = move_to_action(&source, &a, "keep", &ha, &mut union).unwrap();
-        push_undo(&mut undo_stack, UndoEntry::new(&ha, "a.jpg", da.clone(), false, "keep", "Keep"));
-        // move b.jpg -> maybe
-        let b = source.join("b.jpg");
-        fs::write(&b, b"b").unwrap();
-        let hb = compute_sha256(&b).unwrap();
-        let db = move_to_action(&source, &b, "maybe", &hb, &mut union).unwrap();
-        push_undo(&mut undo_stack, UndoEntry::new(&hb, "b.jpg", db.clone(), false, "maybe", "Maybe"));
-        assert_eq!(undo_stack.len(), 2);
-
-        // undo last (b.jpg)
-        let entry_b = undo_stack.pop().unwrap();
-        let restored_b = undo_move(&source, &entry_b, &mut union).unwrap();
-        redo_stack.push(entry_b.clone());
-        assert!(restored_b.exists());
-        assert!(!db.exists());
-        assert!(!union.contains(&hb.to_ascii_lowercase()));
-        assert!(union.contains(&ha.to_ascii_lowercase()));
-
-        // undo next (a.jpg)
-        let entry_a = undo_stack.pop().unwrap();
-        let restored_a = undo_move(&source, &entry_a, &mut union).unwrap();
-        redo_stack.push(entry_a);
-        assert!(restored_a.exists());
-        assert!(union.is_empty());
-
-        // redo a.jpg
-        let redo_a = redo_stack.pop().unwrap();
-        let restored_a_path = source.join(&redo_a.src_name);
-        // find actual restored file (may be suffix but here no clash)
-        let dest_a2 = move_to_action(&source, &restored_a_path, &redo_a.folder_name, &redo_a.hash, &mut union).unwrap();
-        push_undo(&mut undo_stack, UndoEntry::new(&redo_a.hash, &redo_a.src_name, dest_a2.clone(), false, &redo_a.folder_name, &redo_a.display_name));
-        assert!(dest_a2.exists());
-        assert_eq!(union.len(), 1);
-
-        // redo b.jpg
-        let redo_b = redo_stack.pop().unwrap();
-        let restored_b_path = source.join(&redo_b.src_name);
-        let dest_b2 = move_to_action(&source, &restored_b_path, &redo_b.folder_name, &redo_b.hash, &mut union).unwrap();
-        push_undo(&mut undo_stack, UndoEntry::new(&redo_b.hash, &redo_b.src_name, dest_b2.clone(), false, &redo_b.folder_name, &redo_b.display_name));
-        assert!(dest_b2.exists());
-        assert_eq!(union.len(), 2);
-        assert_eq!(undo_stack.len(), 2);
-        assert!(redo_stack.is_empty());
+    fn push_undo_capped_respects_queue_len() {
+        let mut stack = Vec::new();
+        for i in 0..10 {
+            let entry = UndoEntry::new(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &format!("f{}.jpg", i),
+                PathBuf::from(format!("/tmp/dest/f{}.jpg", i)),
+                false,
+                "keep",
+                "Keep",
+            );
+            push_undo_capped(&mut stack, entry, 3);
+        }
+        assert_eq!(stack.len(), 3);
+        assert_eq!(stack[0].src_name, "f7.jpg");
     }
 
     mod classification_on_store {
@@ -650,6 +275,24 @@ mod tests {
             // Original row untouched.
             assert!(store.contains(ha.as_str()).unwrap());
             assert_eq!(store.all_hashes().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn undo_suffix_on_clash_never_overwrites() {
+            let (_dir, source, store) = setup_source();
+            let foo = source.join("foo.jpg");
+            fs::write(&foo, b"undo clash").unwrap();
+            let hash = hash_of(&foo);
+            let outcome = classify_file(&store, &foo, "keep", &hash).unwrap();
+            let dest = outcome.into_dest();
+            // Clash file appears before undo.
+            fs::write(source.join("foo.jpg"), b"clash").unwrap();
+            let entry = UndoEntry::new(hash.as_str(), "foo.jpg", dest.clone(), false, "keep", "Keep");
+            let restored = undo_classification(&store, &source, &entry).unwrap();
+            assert_eq!(restored, source.join("foo_undo_1.jpg"));
+            assert!(restored.exists());
+            assert!(source.join("foo.jpg").exists());
+            assert!(!store.contains(hash.as_str()).unwrap());
         }
 
         #[test]

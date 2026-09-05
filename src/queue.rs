@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 /// Supported extensions for the Queue Snapshot.
 /// Stills via glycin and video via GStreamer, case-insensitive.
-/// Internal `.toml`/`.txt` are *not* supported and are silently skipped.
+/// Legacy `organizer.toml` / `*.txt` are unsupported and ignored like any
+/// other non-media file (#25); they never enter the Queue.
 const SUPPORTED_EXTS: &[&str] = &[
     // stills / animated stills via glycin
     "png", "jpg", "jpeg", "bmp", "tiff", "tif", "webp", "gif", "avif", "heic", "heif", "svg",
@@ -12,22 +13,16 @@ const SUPPORTED_EXTS: &[&str] = &[
 ];
 
 fn is_supported(path: &Path) -> bool {
-    // Silently skip .toml and .txt entirely (internal config/logs) — they are not Supported
-    // even though .txt would otherwise be unsupported.
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        let lower = ext.to_ascii_lowercase();
-        if lower == "toml" || lower == "txt" {
-            return false;
-        }
-        SUPPORTED_EXTS.contains(&lower.as_str())
+        SUPPORTED_EXTS.contains(&ext.to_ascii_lowercase().as_str())
     } else {
         false
     }
 }
 
 /// Build a flat, natural case-insensitive sorted Snapshot of Supported Formats
-/// from `source_folder`. Unsupported files (including internal `.toml`/`.txt`
-/// and the Organizer Database `organizer.db` + WAL artifacts) are
+/// from `source_folder`. Unsupported files (including legacy `organizer.toml`/
+/// `*.txt` and the Organizer Database `organizer.db` + WAL artifacts) are
 /// silently excluded and never enter the Queue. No recursion, no live watch.
 pub fn build_snapshot(source_folder: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut entries: Vec<PathBuf> = Vec::new();
@@ -48,9 +43,7 @@ pub fn build_snapshot(source_folder: &Path) -> std::io::Result<Vec<PathBuf>> {
         if is_supported(&path) {
             entries.push(path);
         } else {
-            // Silently skip: internal .toml/.txt and other unsupported (e.g. .pdf, .zip)
-            // For scaffold ticket, unsupported placeholder is not entered into the Queue;
-            // UI will show empty-state or skip.
+            // Silently skip: legacy .toml/.txt and other unsupported (e.g. .pdf, .zip)
             continue;
         }
     }
@@ -99,11 +92,10 @@ mod tests {
         touch(p, "2.jpg");
         touch(p, "clip.webm");
         touch(p, "photo.TIFF");
-        // Internal silently skipped
+        // Legacy + other unsupported silently skipped (#25)
         touch(p, "organizer.toml");
         touch(p, "keep.txt");
         touch(p, "maybe.TXT");
-        // Other unsupported never enters Queue
         touch(p, "notes.pdf");
         touch(p, "archive.zip");
         touch(p, "README");
@@ -124,7 +116,7 @@ mod tests {
             vec!["2.jpg", "10.jpg", "a.png", "b.JPG", "clip.webm", "photo.TIFF"],
             "snapshot must be filtered and natural sorted: got {names:?}"
         );
-        // Ensure internal and other unsupported not present
+        // Ensure legacy and other unsupported not present
         assert!(!names.iter().any(|n| n.ends_with(".toml") || n.ends_with(".txt") || n.ends_with(".pdf")));
     }
 
@@ -149,6 +141,22 @@ mod tests {
         touch(p, "keep.txt");
         let snap = build_snapshot(p).unwrap();
         assert!(snap.is_empty(), "only unsupported should give empty queue, not placeholder");
+    }
+
+    #[test]
+    fn legacy_files_ignored_by_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        touch(p, "photo.jpg");
+        touch(p, "organizer.toml");
+        touch(p, "keep.txt");
+        touch(p, "maybe.txt");
+        let snap = build_snapshot(p).unwrap();
+        let names: Vec<String> = snap
+            .iter()
+            .map(|x| x.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["photo.jpg"], "legacy files must never enter the Queue (#25)");
     }
 
     #[test]

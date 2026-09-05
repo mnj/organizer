@@ -33,7 +33,7 @@ jobs:
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
             liblcms2-dev libfontconfig1-dev libseccomp-dev bubblewrap \
-            pkg-config build-essential curl xvfb librsvg2-dev sassc \
+            pkg-config build-essential curl xvfb librsvg2-dev sassc gettext \
             libappstream-dev desktop-file-utils appstream || {
             echo "apt resolver stuck; retrying via aptitude (may downgrade libunwind8)"
             sudo apt install -y aptitude
@@ -41,7 +41,7 @@ jobs:
               libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
               gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
               liblcms2-dev libfontconfig1-dev libseccomp-dev bubblewrap \
-              pkg-config build-essential curl xvfb librsvg2-dev sassc \
+              pkg-config build-essential curl xvfb librsvg2-dev sassc gettext \
               libappstream-dev desktop-file-utils appstream
           }
 

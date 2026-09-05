@@ -6,5 +6,6 @@ pub mod queue;
 pub mod settings;
 pub mod store;
 pub mod sweep;
+pub mod sweep_tui;
 pub mod undo;
 pub mod video;

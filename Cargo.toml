@@ -21,6 +21,8 @@ gio = "0.22"
 glycin = { version = "4.0.0-beta.1", features = ["gdk4"] }
 gstreamer = "0.25"
 clap = { version = "4.5", features = ["derive"] }
+ratatui = { version = "0.29", features = ["crossterm"] }
+crossterm = "0.28"
 natord = "1.0"
 tempfile = "3.10"
 sha2 = "0.10"

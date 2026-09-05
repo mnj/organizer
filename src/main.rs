@@ -12,7 +12,13 @@ use organizer_lib::mover::{classify_file, mover_error_message};
 use organizer_lib::preview::{ensure_sandbox_bwrap, is_glycin_supported, load_texture};
 use organizer_lib::queue::build_snapshot;
 use organizer_lib::store::Store;
-use organizer_lib::sweep::{format_report, resolve_reference_db_path, run_sweep_report, OutputFormat};
+use organizer_lib::sweep::{
+    format_report, resolve_include_filter, resolve_reference_db_path,
+    run_sweep_report_with_filter, OutputFormat, SweepError,
+};
+use organizer_lib::sweep_tui::{
+    action_options, count_hashes_per_action, run_include_tui, TuiOutcome,
+};
 use organizer_lib::undo::{push_undo_capped, undo_classification, UndoEntry};
 use organizer_lib::video;
 use std::cell::RefCell;
@@ -63,16 +69,98 @@ enum Commands {
         /// Output format: human table or machine-readable json.
         #[arg(long, value_enum, default_value = "table")]
         format: OutputFormat,
+
+        /// Only include hashes from these origin Actions (folder or display
+        /// name, repeatable and comma-separated, case-insensitive).
+        /// Skips the interactive toggle screen; scripting escape hatch with
+        /// identical semantics to TUI toggles.
+        #[arg(long, value_name = "ACTION")]
+        include: Vec<String>,
+
+        /// Skip the interactive toggle screen and match all origin Actions.
+        /// For scripts; non-TTY runs already skip the TUI by default.
+        #[arg(long)]
+        non_interactive: bool,
     },
 }
 
-/// CLI Sweep report entry point (#26 dry-run). Resolves `--db` (defaulting to
-/// the current folder), runs the read-only report, prints table/json.
-/// Returns a process exit code: 0 on success, 1 on error (missing database,
-/// bad target, hash/database failure). Never modifies files or the database.
-fn run_sweep_cli(target: PathBuf, db_raw: Option<PathBuf>, format: OutputFormat) -> i32 {
+/// CLI Sweep report entry point (#26 dry-run, #27 include filter). Resolves
+/// `--db` (defaulting to the current folder), then picks the include filter:
+/// `--include` wins (no TUI), else the fullscreen ratatui checklist when
+/// interactive, else default-all for scripts/non-TTY. Runs the read-only
+/// report and prints table/json.
+/// Returns a process exit code: 0 on success (including empty matches),
+/// 1 on error (missing database, bad target, hash/database failure) or
+/// TUI cancellation. Never modifies files or the database.
+fn run_sweep_cli(
+    target: PathBuf,
+    db_raw: Option<PathBuf>,
+    include_raw: Vec<String>,
+    non_interactive: bool,
+    format: OutputFormat,
+) -> i32 {
+    use std::io::IsTerminal;
     let db_path = resolve_reference_db_path(db_raw.as_deref());
-    match run_sweep_report(&target, &db_path) {
+    // Load reference Actions first: missing database errors clearly before any TUI.
+    let reference = match Store::open_reference_file(&db_path) {
+        Ok(s) => s,
+        Err(e) => {
+            // Same clear wording as the runner seam (#26): name the missing
+            // path and hint --db, never create the file.
+            let msg = match &e {
+                organizer_lib::store::StoreError::Io(ioe)
+                    if ioe.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    SweepError::MissingDatabase(db_path.clone()).to_string()
+                }
+                other => SweepError::Database(other.to_string()).to_string(),
+            };
+            eprintln!("organizer: {msg}");
+            return 1;
+        }
+    };
+    let db_actions = match reference.actions() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("organizer: database error: {e}");
+            return 1;
+        }
+    };
+    // Filter selection: --include bypasses the TUI entirely.
+    let include_filter: Option<std::collections::HashSet<String>> =
+        if !include_raw.is_empty() {
+            Some(resolve_include_filter(&include_raw, &db_actions))
+        } else if non_interactive {
+            None
+        } else if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            if db_actions.is_empty() {
+                None
+            } else {
+                // Per-row known-hash badges, grouped from the reference union.
+                let counts = match reference.list_files() {
+                    Ok(rows) => count_hashes_per_action(&rows),
+                    Err(_) => Default::default(),
+                };
+                let options = action_options(&db_actions, &counts);
+                match run_include_tui(&options, &target, &db_path) {
+                    Ok(TuiOutcome::Confirmed(filter)) => filter,
+                    Ok(TuiOutcome::Cancelled) => {
+                        eprintln!("organizer: sweep cancelled — no files touched.");
+                        return 1;
+                    }
+                    Err(e) => {
+                        // Unconfirmed selection must not widen to all origins:
+                        // abort without touching files or the database.
+                        eprintln!("organizer: toggle screen failed ({e}) — sweep aborted, no files touched.");
+                        return 1;
+                    }
+                }
+            }
+        } else {
+            // Scripts / piped output: no prompt, default-all.
+            None
+        };
+    match run_sweep_report_with_filter(&target, &db_path, include_filter.as_ref()) {
         Ok(report) => {
             print!("{}", format_report(&report, format));
             0
@@ -1652,8 +1740,8 @@ fn main() -> glib::ExitCode {
     if args.self_test_sandbox {
         std::process::exit(run_self_test_sandbox());
     }
-    if let Some(Commands::Sweep { target, db, format }) = args.command {
-        std::process::exit(run_sweep_cli(target, db, format));
+    if let Some(Commands::Sweep { target, db, format, include, non_interactive }) = args.command {
+        std::process::exit(run_sweep_cli(target, db, include, non_interactive, format));
     }
     let app = Application::builder()
         .application_id("com.example.organizer")

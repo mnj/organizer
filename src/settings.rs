@@ -2,10 +2,10 @@ use gtk4::prelude::*;
 use gtk4::{gio, glib, ApplicationWindow, Box as GtkBox, Button, Entry, Label, Orientation};
 use libadwaita as adw;
 use adw::prelude::*;
-use crate::config::{slugify, validate_categories, Category};
+use crate::config::{first_free_shortcut, slugify, suggest_unique_category, validate_categories, Category};
 use crate::store::Store;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 /// Bundled context for settings dialog — avoids Data Clumps
@@ -446,22 +446,18 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
     // Initial build
     rebuild_rows();
 
-    // Add button: push new category and rebuild
+    // Add button: push a uniquely-named category and rebuild, so repeated
+    // Adds stay valid (suffixed "New Category 2", …) instead of piling up
+    // duplicates the validator would reject.
     {
         let draft = draft_categories.clone();
         let rerender = rebuild_rows.clone();
         btn_add.connect_clicked(move |_| {
             if draft.borrow().len() >= 9 { return; }
-            let used: HashSet<String> = draft.borrow().iter().map(|c| c.shortcut.clone()).collect();
-            let mut new_short = "1".to_string();
-            for n in 1..=9 {
-                let s = format!("{n}");
-                if !used.contains(&s) {
-                    new_short = s;
-                    break;
-                }
-            }
-            let new_cat = Category { display_name: "New Category".into(), folder_name: "new_category".into(), shortcut: new_short };
+            let current = draft.borrow().clone();
+            let Some(mut new_cat) = suggest_unique_category(&current, "New Category") else { return };
+            let Some(short) = first_free_shortcut(&current) else { return };
+            new_cat.shortcut = short;
             draft.borrow_mut().push(new_cat);
             rerender();
         });

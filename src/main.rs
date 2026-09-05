@@ -1471,13 +1471,10 @@ fn build_shell(app: &Application, snapshot: Vec<PathBuf>, source_folder: PathBuf
             }
             let categories = live.borrow().clone();
             for cat in categories.iter() {
+                // Every Category renders identically: no per-name accent or
+                // danger styling, so no destination looks preferred or warned.
                 let btn = Button::new();
                 btn.add_css_class("category-btn");
-                if cat.display_name == "Keep" {
-                    btn.add_css_class("suggested-action");
-                } else if cat.display_name == "Reject" {
-                    btn.add_css_class("destructive-action");
-                }
                 let inner = GtkBox::new(Orientation::Horizontal, 6);
                 inner.set_halign(gtk4::Align::Center);
                 let lbl = Label::new(Some(&cat.display_name));
@@ -1865,5 +1862,8 @@ fn main() -> glib::ExitCode {
         }
     });
 
-    app.run()
+    // clap already consumed argv: hide the real command line from GApplication,
+    // which would otherwise treat SOURCE_FOLDER as a file-to-open and exit
+    // with "This application can not open files."
+    app.run_with_args(&["organizer"])
 }

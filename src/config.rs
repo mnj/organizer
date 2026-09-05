@@ -151,6 +151,57 @@ pub fn default_categories() -> Vec<Category> {
     ]
 }
 
+/// First unused shortcut `1`-`9`, or `None` when all are taken.
+/// Pure helper for the Settings Add flow so it never invents a duplicate.
+pub fn first_free_shortcut(categories: &[Category]) -> Option<String> {
+    let used: HashSet<String> = categories.iter().map(|c| c.shortcut.clone()).collect();
+    for n in 1..=9 {
+        let s = format!("{n}");
+        if !used.contains(&s) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Suggest display/folder/shortcut for a freshly added Category that validates
+/// cleanly against `categories`: tries `base`, then `base 2`, `base 3`, ...
+/// Display compares case-insensitively and folder by slug (mirroring
+/// `validate_categories`); reserved slugs such as `duplicate` are skipped.
+/// The folder derives from the display via `slugify` so both stay in sync,
+/// and the shortcut is the first free `1`-`9` (empty when exhausted — the
+/// dialog caps at 9 rows, so the Add flow checks that first).
+/// Returns `None` past a sane bound (only fires on pathological input).
+pub fn suggest_unique_category(categories: &[Category], base_display: &str) -> Option<Category> {
+    let base = base_display.trim();
+    let base = if base.is_empty() { "New Category" } else { base };
+    for n in 1..=100u32 {
+        let display = if n == 1 {
+            base.to_string()
+        } else {
+            format!("{base} {n}")
+        };
+        let folder = slugify(&display);
+        if folder.is_empty() || folder == "duplicate" {
+            continue;
+        }
+        let display_taken = categories
+            .iter()
+            .any(|c| c.display_name.trim().eq_ignore_ascii_case(&display));
+        let slug_taken = categories
+            .iter()
+            .any(|c| slugify(&c.folder_name) == folder);
+        if !display_taken && !slug_taken {
+            return Some(Category {
+                display_name: display,
+                folder_name: folder,
+                shortcut: first_free_shortcut(categories).unwrap_or_default(),
+            });
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +308,67 @@ mod tests {
         assert_eq!(defaults[1].shortcut, "2");
         assert_eq!(defaults[2].shortcut, "3");
         assert!(validate_categories(&defaults).is_ok());
+    }
+
+    #[test]
+    fn suggest_unique_category_names_suffix_number_on_clash() {
+        // Empty list takes the base names verbatim.
+        let none: Vec<Category> = vec![];
+        let first = suggest_unique_category(&none, "New Category").unwrap();
+        assert_eq!(first.display_name, "New Category");
+        assert_eq!(first.folder_name, "new_category");
+
+        // Taken display (case-insensitive) moves to suffix 2, then 3.
+        let taken = vec![
+            Category { display_name: "New Category".into(), folder_name: "new_category".into(), shortcut: "4".into() },
+        ];
+        let second = suggest_unique_category(&taken, "New Category").unwrap();
+        assert_eq!(second.display_name, "New Category 2");
+        assert_eq!(second.folder_name, "new_category_2");
+        let mut taken2 = taken.clone();
+        taken2.push(Category { display_name: second.display_name.clone(), folder_name: second.folder_name.clone(), shortcut: "5".into() });
+        let third = suggest_unique_category(&taken2, "New Category").unwrap();
+        assert_eq!(third.display_name, "New Category 3");
+        assert_eq!(third.folder_name, "new_category_3");
+
+        // Display free but folder slug taken still advances.
+        let slug_taken = vec![
+            Category { display_name: "Other".into(), folder_name: "new_category".into(), shortcut: "4".into() },
+        ];
+        let advanced = suggest_unique_category(&slug_taken, "New Category").unwrap();
+        assert_eq!(advanced.display_name, "New Category 2");
+
+        // Reserved slug is skipped, never suggested.
+        let dup = suggest_unique_category(&none, "Duplicate").unwrap();
+        assert_ne!(slugify(&dup.folder_name), "duplicate");
+
+        // Every suggestion keeps its input list fully valid when appended.
+        let mut check = none.clone();
+        check.push(first);
+        assert!(validate_categories(&check).is_ok());
+        let mut check2 = taken.clone();
+        check2.push(second);
+        assert!(validate_categories(&check2).is_ok());
+        taken2.push(third);
+        assert!(validate_categories(&taken2).is_ok());
+        let mut check3 = slug_taken.clone();
+        check3.push(advanced);
+        assert!(validate_categories(&check3).is_ok());
+    }
+
+    #[test]
+    fn first_free_shortcut_skips_used_and_reports_exhaustion() {
+        let none: Vec<Category> = vec![];
+        assert_eq!(first_free_shortcut(&none).as_deref(), Some("1"));
+        let some = vec![
+            Category { display_name: "A".into(), folder_name: "a".into(), shortcut: "1".into() },
+            Category { display_name: "B".into(), folder_name: "b".into(), shortcut: "3".into() },
+        ];
+        assert_eq!(first_free_shortcut(&some).as_deref(), Some("2"));
+        let mut full = Vec::new();
+        for i in 1..=9 {
+            full.push(Category { display_name: format!("A{i}"), folder_name: format!("a{i}"), shortcut: format!("{i}") });
+        }
+        assert_eq!(first_free_shortcut(&full), None);
     }
 }

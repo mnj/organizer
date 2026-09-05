@@ -13,8 +13,8 @@ use organizer_lib::preview::{ensure_sandbox_bwrap, is_glycin_supported, load_tex
 use organizer_lib::queue::build_snapshot;
 use organizer_lib::store::Store;
 use organizer_lib::sweep::{
-    format_report, resolve_include_filter, resolve_reference_db_path,
-    run_sweep_report_with_filter, OutputFormat, SweepError,
+    format_outcome, resolve_include_filter, resolve_reference_db_path,
+    run_sweep_with_disposition, Disposition, OutputFormat, SweepError,
 };
 use organizer_lib::sweep_tui::{
     action_options, count_hashes_per_action, run_include_tui, TuiOutcome,
@@ -47,10 +47,13 @@ struct Args {
 
 #[derive(clap::Subcommand, Debug)]
 enum Commands {
-    /// Sweep a Target Folder against a reference Organizer Database (dry-run report).
+    /// Sweep a Target Folder against a reference Organizer Database.
     /// Scans a flat Supported-Format Snapshot, matches sha256, reports matched
-    /// path, hash, origin Action and triage time. Read-only: never modifies
-    /// files or the database; unmatched files are untouched and unlisted.
+    /// path, hash, origin Action and triage time. Default is a read-only
+    /// dry-run report; `--on-match trash|perm-delete` with `--execute` applies
+    /// the disposition to matched Target Folder files only. The reference
+    /// database is never modified; unmatched files are untouched and unlisted,
+    /// and no Classification or moves to Action subfolders occur.
     // Canonical name follows the domain vocabulary (Sweep); `cleanup` stays a
     // visible alias for the ADR 0007 contract (`organizer cleanup <TARGET>`).
     #[command(visible_alias = "cleanup")]
@@ -81,23 +84,43 @@ enum Commands {
         /// For scripts; non-TTY runs already skip the TUI by default.
         #[arg(long)]
         non_interactive: bool,
+
+        /// What to do with matched Target Folder files: `report` (default)
+        /// only lists them, `trash` moves them to OS trash (restorable),
+        /// `perm-delete` removes them irreversibly. Without `--execute` the
+        /// run only reports and changes nothing, whatever is selected here.
+        #[arg(long = "on-match", value_enum, default_value = "report", alias = "disposition")]
+        on_match: Disposition,
+
+        /// Actually apply `--on-match trash|perm-delete` to matched files.
+        /// Without it the run is a dry-run report and changes nothing.
+        #[arg(long)]
+        execute: bool,
     },
 }
 
-/// CLI Sweep report entry point (#26 dry-run, #27 include filter). Resolves
-/// `--db` (defaulting to the current folder), then picks the include filter:
-/// `--include` wins (no TUI), else the fullscreen ratatui checklist when
-/// interactive, else default-all for scripts/non-TTY. Runs the read-only
-/// report and prints table/json.
+/// CLI Sweep entry point (#26 dry-run, #27 include filter, #28 apply).
+/// Resolves `--db` (defaulting to the current folder), then picks the include
+/// filter: `--include` wins (no TUI), else the fullscreen ratatui checklist
+/// when interactive, else default-all for scripts/non-TTY. Runs the Sweep
+/// with the `--on-match` disposition: without `--execute` every disposition
+/// only reports and changes nothing; with `--execute`, `trash` moves matched
+/// Target Folder files to OS trash (restorable) and `perm-delete` removes
+/// them irreversibly. Prints table/json plus the restorable/irreversible
+/// outcome summary.
 /// Returns a process exit code: 0 on success (including empty matches),
-/// 1 on error (missing database, bad target, hash/database failure) or
-/// TUI cancellation. Never modifies files or the database.
+/// 1 on error (missing database, bad target, hash/database failure, any
+/// per-file apply failure) or TUI cancellation. The reference database is
+/// never modified; unmatched files are untouched; no Classification or moves
+/// to Action subfolders occur.
 fn run_sweep_cli(
     target: PathBuf,
     db_raw: Option<PathBuf>,
     include_raw: Vec<String>,
     non_interactive: bool,
     format: OutputFormat,
+    on_match: Disposition,
+    execute: bool,
 ) -> i32 {
     use std::io::IsTerminal;
     let db_path = resolve_reference_db_path(db_raw.as_deref());
@@ -160,10 +183,18 @@ fn run_sweep_cli(
             // Scripts / piped output: no prompt, default-all.
             None
         };
-    match run_sweep_report_with_filter(&target, &db_path, include_filter.as_ref()) {
-        Ok(report) => {
-            print!("{}", format_report(&report, format));
-            0
+    match run_sweep_with_disposition(&target, &db_path, include_filter.as_ref(), on_match, execute) {
+        Ok(outcome) => {
+            print!("{}", format_outcome(&outcome, format));
+            if outcome.errors.is_empty() {
+                0
+            } else {
+                eprintln!(
+                    "organizer: sweep applied with {} error(s) — report above lists failures.",
+                    outcome.errors.len()
+                );
+                1
+            }
         }
         Err(e) => {
             eprintln!("organizer: {e}");
@@ -1740,8 +1771,8 @@ fn main() -> glib::ExitCode {
     if args.self_test_sandbox {
         std::process::exit(run_self_test_sandbox());
     }
-    if let Some(Commands::Sweep { target, db, format, include, non_interactive }) = args.command {
-        std::process::exit(run_sweep_cli(target, db, include, non_interactive, format));
+    if let Some(Commands::Sweep { target, db, format, include, non_interactive, on_match, execute }) = args.command {
+        std::process::exit(run_sweep_cli(target, db, include, non_interactive, format, on_match, execute));
     }
     let app = Application::builder()
         .application_id("com.example.organizer")

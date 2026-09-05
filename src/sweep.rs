@@ -263,6 +263,149 @@ pub fn run_sweep_report_with_filter(
     })
 }
 
+/// Destructive disposition for Sweep apply (#28): restorable OS trash and
+/// irreversible permanent delete, both gated behind an explicit execute flag.
+/// `Report` (default) never touches the filesystem beyond hashing/reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Disposition {
+    Report,
+    Trash,
+    PermDelete,
+}
+
+/// One per-file apply failure: the run continues with remaining matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyError {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+/// Outcome of a Sweep run with a disposition: the read-only match report plus
+/// what the execute gate did. `executed` is true only when a destructive
+/// disposition ran with `execute == true`; otherwise `removed`/`errors` are
+/// empty and every Target Folder file is untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweepOutcome {
+    pub report: SweepReport,
+    pub disposition: Disposition,
+    pub executed: bool,
+    pub removed: Vec<PathBuf>,
+    pub errors: Vec<ApplyError>,
+}
+
+impl SweepOutcome {
+    /// True when a destructive disposition was selected but not executed:
+    /// the report lists what `--execute` would apply.
+    pub fn is_dry_run(&self) -> bool {
+        !self.executed && self.disposition != Disposition::Report
+    }
+}
+
+impl Disposition {
+    /// Machine/CLI spelling: `report`, `trash`, `perm-delete`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Disposition::Report => "report",
+            Disposition::Trash => "trash",
+            Disposition::PermDelete => "perm-delete",
+        }
+    }
+}
+
+/// One-line outcome headline (#28): dry-runs name the `--execute` gate,
+/// trash outcomes say restorable, perm-delete says irreversible. Executed
+/// counts read "done of matched" so partial failures never pose as full
+/// success; per-file failures list after the headline in `apply_summary`
+/// and under `errors` in outcome JSON.
+fn outcome_headline(outcome: &SweepOutcome) -> String {
+    let matched = outcome.report.matches.len();
+    if outcome.disposition == Disposition::Report {
+        return "Report only — nothing modified.".to_string();
+    }
+    if outcome.is_dry_run() {
+        if outcome.disposition == Disposition::Trash {
+            return format!(
+                "Dry-run: would move {matched} file(s) to OS trash (restorable) — pass --execute to apply."
+            );
+        }
+        debug_assert_eq!(outcome.disposition, Disposition::PermDelete);
+        return format!(
+            "Dry-run: would permanently delete {matched} file(s) (irreversible) — pass --execute to apply."
+        );
+    }
+    let done = outcome.removed.len();
+    if outcome.disposition == Disposition::Trash {
+        format!("Trashed {done} of {matched} file(s) — restorable from OS trash.")
+    } else {
+        debug_assert_eq!(outcome.disposition, Disposition::PermDelete);
+        format!("Permanently deleted {done} of {matched} file(s) — irreversible.")
+    }
+}
+
+/// Human outcome text appended after the match table: the headline plus any
+/// per-file apply failures.
+fn apply_summary(outcome: &SweepOutcome) -> String {
+    let mut out = outcome_headline(outcome);
+    out.push('\n');
+    if !outcome.errors.is_empty() {
+        out.push_str(&format!(
+            "Errors: {} file(s) could not be applied:\n",
+            outcome.errors.len()
+        ));
+        for e in &outcome.errors {
+            out.push_str(&format!("  {}: {}\n", e.path.display(), e.message));
+        }
+    }
+    out
+}
+
+/// Sweep with a disposition and an explicit execute gate (#28).
+/// Always scans and matches exactly like `run_sweep_report_with_filter`;
+/// without `execute`, destructive dispositions only report and change nothing.
+/// The reference database is only ever opened read-only; no Classification
+/// or moves to Action subfolders occur.
+pub fn run_sweep_with_disposition(
+    target: &Path,
+    db_path: &Path,
+    include: Option<&HashSet<String>>,
+    disposition: Disposition,
+    execute: bool,
+) -> Result<SweepOutcome, SweepError> {
+    let report = run_sweep_report_with_filter(target, db_path, include)?;
+    if disposition == Disposition::Report || !execute {
+        return Ok(SweepOutcome {
+            report,
+            disposition,
+            executed: false,
+            removed: Vec::new(),
+            errors: Vec::new(),
+        });
+    }
+    // Destructive execute path lands in the next slice (trash/perm-delete).
+    let mut removed = Vec::new();
+    let mut errors = Vec::new();
+    for m in &report.matches {
+        let res = match disposition {
+            Disposition::Trash => trash::delete(&m.path).map_err(|e| e.to_string()),
+            Disposition::PermDelete => {
+                std::fs::remove_file(&m.path).map_err(|e| e.to_string())
+            }
+            Disposition::Report => Ok(()),
+        };
+        match res {
+            Ok(()) => removed.push(m.path.clone()),
+            Err(message) => errors.push(ApplyError { path: m.path.clone(), message }),
+        }
+    }
+    Ok(SweepOutcome {
+        report,
+        disposition,
+        executed: true,
+        removed,
+        errors,
+    })
+}
+
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     for c in s.chars() {
@@ -277,6 +420,33 @@ fn json_escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// Shared `matches` array serializer for report and outcome JSON so the
+/// machine-readable match shape cannot drift between the two.
+fn push_matches_json(out: &mut String, matches: &[SweepMatch]) {
+    out.push_str("  \"matches\": [");
+    if matches.is_empty() {
+        out.push_str("]\n");
+    } else {
+        out.push('\n');
+        for (i, m) in matches.iter().enumerate() {
+            out.push_str("    {\n");
+            out.push_str(&format!(
+                "      \"path\": \"{}\",\n",
+                json_escape(&m.path.to_string_lossy())
+            ));
+            out.push_str(&format!("      \"hash\": \"{}\",\n", json_escape(&m.hash)));
+            out.push_str(&format!("      \"action\": \"{}\",\n", json_escape(&m.action)));
+            out.push_str(&format!("      \"triaged_at\": {}\n", m.triaged_at));
+            if i + 1 == matches.len() {
+                out.push_str("    }\n");
+            } else {
+                out.push_str("    },\n");
+            }
+        }
+        out.push_str("  ]\n");
+    }
 }
 
 fn format_table(report: &SweepReport) -> String {
@@ -318,28 +488,7 @@ fn format_json(report: &SweepReport) -> String {
     ));
     out.push_str(&format!("  \"scanned\": {},\n", report.scanned));
     out.push_str(&format!("  \"matched\": {},\n", report.matches.len()));
-    out.push_str("  \"matches\": [");
-    if report.matches.is_empty() {
-        out.push_str("]\n");
-    } else {
-        out.push('\n');
-        for (i, m) in report.matches.iter().enumerate() {
-            out.push_str("    {\n");
-            out.push_str(&format!(
-                "      \"path\": \"{}\",\n",
-                json_escape(&m.path.to_string_lossy())
-            ));
-            out.push_str(&format!("      \"hash\": \"{}\",\n", json_escape(&m.hash)));
-            out.push_str(&format!("      \"action\": \"{}\",\n", json_escape(&m.action)));
-            out.push_str(&format!("      \"triaged_at\": {}\n", m.triaged_at));
-            if i + 1 == report.matches.len() {
-                out.push_str("    }\n");
-            } else {
-                out.push_str("    },\n");
-            }
-        }
-        out.push_str("  ]\n");
-    }
+    push_matches_json(&mut out, &report.matches);
     out.push_str("}\n");
     out
 }
@@ -349,6 +498,72 @@ pub fn format_report(report: &SweepReport, format: OutputFormat) -> String {
     match format {
         OutputFormat::Table => format_table(report),
         OutputFormat::Json => format_json(report),
+    }
+}
+
+/// Format a Sweep outcome (report plus disposition result) as human table or
+/// machine-readable json. Table appends the restorable/irreversible summary;
+/// json carries `disposition`, `executed`, `summary` (the same
+/// restorable/irreversible headline), `removed` and `errors` alongside the
+/// report fields so scripts can follow up.
+pub fn format_outcome(outcome: &SweepOutcome, format: OutputFormat) -> String {
+    match format {
+        OutputFormat::Table => format!("{}{}", format_table(&outcome.report), apply_summary(outcome)),
+        OutputFormat::Json => {
+            let mut out = String::new();
+            out.push_str("{\n");
+            out.push_str(&format!(
+                "  \"target\": \"{}\",\n",
+                json_escape(&outcome.report.target.to_string_lossy())
+            ));
+            out.push_str(&format!(
+                "  \"reference\": \"{}\",\n",
+                json_escape(&outcome.report.reference_db.to_string_lossy())
+            ));
+            out.push_str(&format!("  \"scanned\": {},\n", outcome.report.scanned));
+            out.push_str(&format!("  \"matched\": {},\n", outcome.report.matches.len()));
+            out.push_str(&format!(
+                "  \"disposition\": \"{}\",\n",
+                outcome.disposition.as_str()
+            ));
+            out.push_str(&format!("  \"executed\": {},\n", outcome.executed));
+            out.push_str(&format!(
+                "  \"summary\": \"{}\",\n",
+                json_escape(&outcome_headline(outcome))
+            ));
+            out.push_str("  \"removed\": [");
+            if outcome.removed.is_empty() {
+                out.push_str("],\n");
+            } else {
+                out.push('\n');
+                for (i, p) in outcome.removed.iter().enumerate() {
+                    out.push_str(&format!(
+                        "    \"{}\"{}",
+                        json_escape(&p.to_string_lossy()),
+                        if i + 1 == outcome.removed.len() { "\n" } else { ",\n" }
+                    ));
+                }
+                out.push_str("  ],\n");
+            }
+            out.push_str("  \"errors\": [");
+            if outcome.errors.is_empty() {
+                out.push_str("],\n");
+            } else {
+                out.push('\n');
+                for (i, e) in outcome.errors.iter().enumerate() {
+                    out.push_str(&format!(
+                        "    {{\"path\": \"{}\", \"message\": \"{}\"}}{}\n",
+                        json_escape(&e.path.to_string_lossy()),
+                        json_escape(&e.message),
+                        if i + 1 == outcome.errors.len() { "" } else { "," }
+                    ));
+                }
+                out.push_str("  ],\n");
+            }
+            push_matches_json(&mut out, &outcome.report.matches);
+            out.push_str("}\n");
+            out
+        }
     }
 }
 
@@ -783,5 +998,229 @@ mod tests {
         assert_eq!(from_toggle.matches, from_flag.matches);
         assert_eq!(from_toggle.matches.len(), 1);
         assert_eq!(from_toggle.matches[0].action, "keep");
+    }
+
+    #[test]
+    fn dry_run_with_trash_or_delete_changes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let store = Store::open(&source).unwrap();
+
+        let target = tmp.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        let known = write_target(&target, "known.jpg", b"known content");
+        let unknown = write_target(&target, "unknown.jpg", b"brand new");
+        insert_known(&store, &known, "known.jpg", "keep", 11);
+
+        for disposition in [Disposition::Trash, Disposition::PermDelete] {
+            let outcome =
+                run_sweep_with_disposition(&target, &store.db_path(), None, disposition, false)
+                    .unwrap();
+            assert_eq!(outcome.report.matches.len(), 1);
+            assert!(!outcome.executed, "dry-run must not execute {disposition:?}");
+            assert!(outcome.removed.is_empty());
+            assert!(outcome.errors.is_empty());
+            assert!(known.exists(), "dry-run must leave matched file: {disposition:?}");
+            assert!(unknown.exists());
+            assert_eq!(fs::read(&known).unwrap(), b"known content");
+            assert_eq!(store.all_hashes().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn trash_execute_removes_only_matched_and_keeps_database() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let store = Store::open(&source).unwrap();
+
+        let target = tmp.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        let known = write_target(&target, "known.jpg", b"known content");
+        let unknown = write_target(&target, "unknown.jpg", b"brand new");
+        insert_known(&store, &known, "known.jpg", "keep", 11);
+        let before_hashes = store.all_hashes().unwrap();
+
+        let outcome =
+            run_sweep_with_disposition(&target, &store.db_path(), None, Disposition::Trash, true)
+                .unwrap();
+        assert!(outcome.executed);
+        assert_eq!(outcome.report.matches.len(), 1);
+        assert_eq!(outcome.removed, vec![known.clone()]);
+        assert!(outcome.errors.is_empty());
+        assert!(!known.exists(), "trash must remove matched file from target");
+        assert!(unknown.exists(), "unmatched files are never modified");
+        assert_eq!(fs::read(&unknown).unwrap(), b"brand new");
+        // Reference database gains no rows, loses none; no Action moves.
+        assert_eq!(store.all_hashes().unwrap(), before_hashes);
+        assert!(!target.join("duplicate").exists());
+        for entry in fs::read_dir(&target).unwrap().flatten() {
+            assert_ne!(entry.path(), target.join("keep"));
+        }
+    }
+
+    #[test]
+    fn perm_delete_execute_honors_include_filter_and_removes_irreversibly() {
+        use std::collections::HashSet;
+
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let store = Store::open(&source).unwrap();
+
+        let target = tmp.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        let keep_file = write_target(&target, "keep.jpg", b"keep content");
+        let maybe_file = write_target(&target, "maybe.jpg", b"maybe content");
+        let unknown = write_target(&target, "unknown.jpg", b"brand new");
+        insert_known(&store, &keep_file, "keep.jpg", "keep", 11);
+        insert_known(&store, &maybe_file, "maybe.jpg", "maybe", 12);
+        let before_hashes = store.all_hashes().unwrap();
+
+        let mut only_keep = HashSet::new();
+        only_keep.insert("keep".to_string());
+        let outcome = run_sweep_with_disposition(
+            &target,
+            &store.db_path(),
+            Some(&only_keep),
+            Disposition::PermDelete,
+            true,
+        )
+        .unwrap();
+        assert!(outcome.executed);
+        assert_eq!(outcome.report.matches.len(), 1);
+        assert_eq!(outcome.report.matches[0].action, "keep");
+        assert_eq!(outcome.removed, vec![keep_file.clone()]);
+        assert!(outcome.errors.is_empty());
+        assert!(!keep_file.exists(), "perm-delete removes matched file irreversibly");
+        assert!(maybe_file.exists(), "filtered-out origins are left alone");
+        assert!(unknown.exists(), "unknown-hash files are never modified");
+        assert_eq!(store.all_hashes().unwrap(), before_hashes);
+    }
+
+    #[test]
+    fn outcome_messaging_states_restorable_vs_irreversible_and_execute_gate() {
+        use std::collections::HashSet;
+
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let store = Store::open(&source).unwrap();
+
+        let target = tmp.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        let known = write_target(&target, "known.jpg", b"known content");
+        insert_known(&store, &known, "known.jpg", "keep", 11);
+
+        // Dry-run trash: restorable wording plus the execute hint, files untouched.
+        let dry_trash =
+            run_sweep_with_disposition(&target, &store.db_path(), None, Disposition::Trash, false)
+                .unwrap();
+        assert!(dry_trash.is_dry_run());
+        let dry_table = format_outcome(&dry_trash, OutputFormat::Table);
+        assert!(dry_table.contains("known.jpg"), "dry-run still lists matches:\n{dry_table}");
+        for needle in ["Dry-run", "--execute", "trash", "restorable"] {
+            assert!(dry_table.contains(needle), "dry-run trash must say {needle:?}:\n{dry_table}");
+        }
+        assert!(known.exists());
+
+        // Dry-run perm-delete: irreversible wording plus the execute hint.
+        let dry_del = run_sweep_with_disposition(
+            &target,
+            &store.db_path(),
+            None,
+            Disposition::PermDelete,
+            false,
+        )
+        .unwrap();
+        let dry_del_table = format_outcome(&dry_del, OutputFormat::Table);
+        for needle in ["Dry-run", "--execute", "irreversible"] {
+            assert!(
+                dry_del_table.contains(needle),
+                "dry-run perm-delete must say {needle:?}:\n{dry_del_table}"
+            );
+        }
+        assert!(known.exists());
+
+        // Executed trash: restorable outcome, never irreversible wording.
+        let done_trash =
+            run_sweep_with_disposition(&target, &store.db_path(), None, Disposition::Trash, true)
+                .unwrap();
+        assert!(!done_trash.is_dry_run());
+        let done_table = format_outcome(&done_trash, OutputFormat::Table);
+        assert!(done_table.contains("Trashed 1 of 1"), "trash outcome counts done of matched:\n{done_table}");
+        assert!(done_table.contains("restorable"), "trash outcome is restorable:\n{done_table}");
+        assert!(!done_table.to_ascii_lowercase().contains("irreversible"));
+        assert!(!known.exists());
+
+        // Executed perm-delete on a fresh match: irreversible outcome.
+        let known2 = write_target(&target, "known2.jpg", b"known content");
+        let done_del = run_sweep_with_disposition(
+            &target,
+            &store.db_path(),
+            Some(&HashSet::from(["keep".to_string()])),
+            Disposition::PermDelete,
+            true,
+        )
+        .unwrap();
+        assert_eq!(done_del.removed, vec![known2.clone()]);
+        let done_del_table = format_outcome(&done_del, OutputFormat::Table);
+        for needle in ["Permanently deleted 1 of 1", "irreversible"] {
+            assert!(
+                done_del_table.contains(needle),
+                "perm-delete outcome must say {needle:?}:\n{done_del_table}"
+            );
+        }
+        assert!(!known2.exists());
+
+        // Machine-readable outcome carries disposition and execute state.
+        let json = format_outcome(&done_del, OutputFormat::Json);
+        for needle in ["\"disposition\"", "\"executed\"", "\"summary\"", "perm-delete", "known2.jpg", "irreversible"] {
+            assert!(json.contains(needle), "json outcome must carry {needle:?}:\n{json}");
+        }
+    }
+
+    #[test]
+    fn partial_apply_headline_reports_done_of_matched_and_lists_failures() {
+        let target = PathBuf::from("/tmp/target");
+        let made = |name: &str| SweepMatch {
+            path: target.join(name),
+            hash: "ab".repeat(32),
+            action: "keep".to_string(),
+            triaged_at: 7,
+        };
+        let first = made("a.jpg");
+        let second = made("b.jpg");
+        let outcome = SweepOutcome {
+            report: SweepReport {
+                target: target.clone(),
+                reference_db: PathBuf::from("/tmp/source/organizer.db"),
+                scanned: 2,
+                matches: vec![first.clone(), second.clone()],
+            },
+            disposition: Disposition::Trash,
+            executed: true,
+            removed: vec![first.path.clone()],
+            errors: vec![ApplyError {
+                path: second.path.clone(),
+                message: "busy".to_string(),
+            }],
+        };
+        let table = format_outcome(&outcome, OutputFormat::Table);
+        assert!(
+            table.contains("Trashed 1 of 2 file(s) — restorable from OS trash."),
+            "headline must not pose a partial apply as full success:\n{table}"
+        );
+        assert!(
+            table.contains("Errors: 1 file(s) could not be applied:"),
+            "failures must list after the headline:\n{table}"
+        );
+        assert!(table.contains("b.jpg"), "failed path must be named:\n{table}");
+        let json = format_outcome(&outcome, OutputFormat::Json);
+        assert!(
+            json.contains("Trashed 1 of 2 file(s) — restorable from OS trash."),
+            "json summary must carry the same headline:\n{json}"
+        );
     }
 }

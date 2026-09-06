@@ -3,7 +3,7 @@
 File-triaging desktop app — shows one image at a time and moves it to a
 chosen action folder with shortcuts, while tracking duplicates by content
 hash. Native GTK4 Rust, maximized split-view: **Preview** on top,
-**Action Bar** below.
+**Action Bar** below. This is mostly done with Muse Spark 1.3 and Grok 4.6.
 
 ## Quick start
 

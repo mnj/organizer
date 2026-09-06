@@ -176,34 +176,67 @@ fn sys_deps_docs_cover_all_distros_and_raw_flow() {
 }
 
 #[test]
-fn ci_workflow_builds_both_artifacts_and_smokes() {
-    let ci = read_repo(".github/workflows/ci.yml");
+fn appimage_workflow_builds_and_releases_appimage_only() {
+    // CI is deliberately minimal: build the AppImage, publish it, deploy
+    // the download page. Tests/matrix/tarball run locally before push.
+    let ci = read_repo(".github/workflows/appimage.yml");
     assert_contains_all(
         &ci,
-        ".github/workflows/ci.yml",
+        ".github/workflows/appimage.yml",
         &[
-            "cargo test",
-            "cargo build --release --locked",
-            "xvfb",
+            "build-appimage.sh",
             "linuxdeploy",
             "appimagetool",
             "upload-artifact",
             "Organizer",
             ".AppImage",
-            "organizer",
-            // Review locks: FUSE-free smoke, checksummed canonical tarball,
-            // zsync delta-update verification, fedora/arch matrix.
-            "appimage-extract",
-            "SHA256SUMS",
-            "gh-releases-zsync",
-            "distro-matrix",
-            "fedora",
-            "arch",
+            ".zsync",
+            "softprops/action-gh-release",
+            "generate_release_notes",
+            "deploy-pages",
         ],
     );
+    for banned in [
+        "cargo test",
+        "cargo check",
+        "xvfb",
+        "distro-matrix",
+        "matrix:",
+        "fedora",
+        "archlinux",
+        "pacman",
+        "SHA256SUMS",
+        ".tar.gz",
+        "appimage-extract",
+    ] {
+        assert!(
+            !ci.contains(banned),
+            ".github/workflows/appimage.yml must not contain {banned} (AppImage only)"
+        );
+    }
     assert!(
         !ci.contains("uses: flatpak/") && !ci.contains("uses: flathub"),
-        "CI must not use flatpak actions (spec #21: raw + AppImage only)"
+        "CI must not use flatpak actions (raw + AppImage only)"
+    );
+    assert!(
+        !manifest_dir().join(".github/workflows/ci.yml").exists()
+            && !manifest_dir()
+                .join(".github/workflows/ci.yml.disabled")
+                .exists(),
+        "old ci.yml (enabled or disabled) must be gone — appimage.yml is the only workflow"
+    );
+}
+
+#[test]
+fn pages_download_links_to_latest_release() {
+    let page = read_repo("pages/index.html");
+    assert_contains_all(
+        &page,
+        "pages/index.html",
+        &[
+            "releases/latest/download/Organizer-x86_64.AppImage",
+            "mnj.github.io",
+        ],
     );
 }
 

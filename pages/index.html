@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Organizer — download</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #1e1e2e; color: #cdd6f4;
+         max-width: 640px; margin: 10vh auto; padding: 0 1.5rem; text-align: center; }
+  h1 { color: #fff; }
+  p { color: #a6adc8; line-height: 1.5; }
+  .btn { display: inline-block; margin: 1.5rem 0; padding: 0.9rem 2rem;
+         background: #89b4fa; color: #11111b; font-weight: 700; font-size: 1.1rem;
+         border-radius: 10px; text-decoration: none; }
+  .btn:hover { background: #b4befe; }
+  code { background: #313244; padding: 0.15rem 0.45rem; border-radius: 6px; }
+  pre { background: #313244; padding: 1rem; border-radius: 10px; text-align: left;
+        overflow-x: auto; }
+  a { color: #89b4fa; }
+</style>
+</head>
+<body>
+  <h1>Organizer</h1>
+  <p>File-triaging desktop app — one image at a time, shortcuts, duplicate
+  tracking. Single-file AppImage, no system gtk/gstreamer install needed.</p>
+  <a class="btn" href="https://github.com/mnj/organizer/releases/latest/download/Organizer-x86_64.AppImage">Download Organizer-x86_64.AppImage</a>
+  <pre>chmod +x Organizer-x86_64.AppImage
+./Organizer-x86_64.AppImage /tmp/src</pre>
+  <p>No GPU? Run with <code>GSK_RENDERER=cairo</code>.
+  Delta updates via <a href="https://github.com/mnj/organizer/releases/latest/download/Organizer-x86_64.AppImage.zsync">AppImage.zsync</a>
+  (<code>AppImageUpdate</code>). All versions: <a href="https://github.com/mnj/organizer/releases">releases</a>.
+  This page lives at <a href="https://mnj.github.io/organizer/">mnj.github.io/organizer</a>.</p>
+</body>
+</html>

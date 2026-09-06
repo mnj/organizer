@@ -7,8 +7,8 @@
 #
 # Run the WHOLE script as root (sudo sh packaging/build-gnome-stack.sh):
 # mixing a runner-owned checkout with `sudo meson install` breaks ninja's
-# build-log writes during install-time regeneration. Used by .github/workflows/ci.yml
-# (`raw` and `appimage` jobs); mirrors packaging/build-appimage-container.sh.
+# build-log writes during install-time regeneration. Used by .github/workflows/appimage.yml
+# (`build` job); mirrors packaging/build-appimage-container.sh.
 set -eu
 
 pip3 install -U meson tomli

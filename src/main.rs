@@ -16,11 +16,11 @@ struct Args {
     #[arg(value_name = "SOURCE_FOLDER")]
     source_folder: Option<PathBuf>,
 
-    /// Headless bundling probe for CI smoke (no window): prints
+    /// Headless bundling probe for local smoke (no window): prints
     /// GLYCIN_DATA_DIR/XDG_DATA_DIRS/GST_PLUGIN_SYSTEM_PATH, bwrap version,
     /// sandbox status and gtk4paintablesink availability, then exits.
-    /// Used by packaging/smoke.sh and .github/workflows/ci.yml inside the
-    /// dep-stripped ubuntu:22.04 container.
+    /// Used by packaging/smoke.sh (local pre-push checks; CI builds the
+    /// AppImage only — see .github/workflows/appimage.yml).
     #[arg(long = "self-test-sandbox", hide = true)]
     self_test_sandbox: bool,
 

@@ -46,6 +46,15 @@ cargo build --release --locked
 
 ## AppImage
 
+Download the latest release (also at <https://mnj.github.io/organizer/>):
+
+```sh
+curl -fSL -o Organizer-x86_64.AppImage \
+  https://github.com/mnj/organizer/releases/latest/download/Organizer-x86_64.AppImage
+chmod +x Organizer-x86_64.AppImage
+./Organizer-x86_64.AppImage /tmp/src
+```
+
 Single-file download, runs on any ext4/btrfs host with no system
 gtk/gstreamer/glycin installed:
 
@@ -55,6 +64,12 @@ gtk/gstreamer/glycin installed:
 ```
 
 `AppImageUpdate` applies zsync deltas from GitHub Releases.
+
+No GPU (VM/container with software GL)? Force the CPU renderer:
+
+```sh
+GSK_RENDERER=cairo ./Organizer-x86_64.AppImage /tmp/src
+```
 
 ## Docs
 

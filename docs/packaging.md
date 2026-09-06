@@ -56,8 +56,7 @@ runs on newer hosts. If `bubblewrap` is missing or unprivileged user
 namespaces are locked down, Organizer refuses sandboxed decode with a dialog
 (use the AppImage instead, which bundles `bwrap`).
 
-Release tarball (maintainers, manual — zero extra tooling; canonical recipe,
-kept identical in `.github/workflows/ci.yml`):
+Release tarball (maintainers, manual only — CI does not build it):
 
 ```sh
 cargo build --release --locked
@@ -97,6 +96,25 @@ Bundled inside the AppDir: `gtk4`/`libadwaita`, GStreamer plugins +
 `bwrap` + `libseccomp.so.2`, schemas/icon caches. Host-assumed (not bundled):
 `glibc`, `libfuse2`, Wayland/X11 + GL stack, GPU drivers.
 
+### GPU-less hosts (software rendering)
+
+On hosts without a GPU (llvmpipe/lavapipe software GL — typical VMs and
+containers), the default GSK Vulkan renderer can run out of host memory and
+kill the app. Symptoms in the terminal:
+
+```text
+Gsk-WARNING: func_vkImportSemaphoreFdKHR(): ... VK_ERROR_OUT_OF_HOST_MEMORY
+Gdk-Message: Error 22 (Invalid argument) dispatching to Wayland display.
+```
+
+This is a renderer/environment failure, not an Organizer bug. Workaround —
+force the CPU renderer (or the X11 backend) for the session:
+
+```sh
+GSK_RENDERER=cairo ./Organizer-x86_64.AppImage /tmp/src
+# or: GDK_BACKEND=x11 ./Organizer-x86_64.AppImage /tmp/src
+```
+
 The `packaging/AppRun` hook derives every path from `$HERE` at launch:
 `LD_LIBRARY_PATH`, `PATH` (bundled `bwrap` first), `GLYCIN_DATA_DIR` /
 `XDG_DATA_DIRS` (bundled loader discovery), `GST_PLUGIN_SYSTEM_PATH` /
@@ -126,6 +144,8 @@ xvfb-run -a ./target/release/organizer --self-test-sandbox
 (spec estimate): ~55–95 MB compressed squashfs, ~120–200 MB uncompressed —
 `packaging/smoke.sh` warns when an artifact falls outside that range.
 
-CI (`.github/workflows/ci.yml`) runs all of the above on push/tag and
-uploads `Organizer-x86_64.AppImage` (+ `.zsync`) and the raw
-`organizer` binary.
+CI (`.github/workflows/appimage.yml`) does one thing: build
+`Organizer-x86_64.AppImage` (+ `.zsync`) on push to `main` (workflow
+artifact) and attach both to a GitHub Release on `v*` tags. No tests, no
+matrix, no raw tarball — local `cargo test` and `./packaging/smoke.sh` cover
+that before push.

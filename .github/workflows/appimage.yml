@@ -1,0 +1,130 @@
+name: appimage
+
+# Single purpose: build Organizer-x86_64.AppImage and publish it.
+# No test/matrix/tarball jobs here — run the test suite and
+# ./packaging/smoke.sh locally before push (see docs/packaging.md).
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: build AppImage
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install build deps
+        run: |
+          sudo apt update
+          # Heal runner-image/archive skew (e.g. libunwind8 vs libunwind-dev)
+          # that surfaces as "held broken packages" for libgstreamer1.0-dev.
+          sudo apt-mark showhold || true
+          sudo apt full-upgrade -y
+          DEPS="libgtk-4-dev libadwaita-1-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
+            liblcms2-dev libfontconfig1-dev libseccomp-dev bubblewrap \
+            fuse libfuse2 pkg-config meson ninja-build python3-pip cmake gettext gperf sassc \
+            libffi-dev zlib1g-dev libmount-dev libselinux1-dev libpcre2-dev \
+            libelf-dev libdbus-1-dev libexpat1-dev libxml2-dev libfreetype-dev \
+            libfribidi-dev libthai-dev \
+            libepoxy-dev libxkbcommon-dev libjpeg-dev libtiff-dev libpng-dev \
+            libgraphene-1.0-dev libdrm-dev libgbm-dev libegl-dev libgles-dev \
+            libvulkan-dev libx11-dev libxrandr-dev libxi-dev libxinerama-dev \
+            libxcursor-dev libxdamage-dev libxfixes-dev libxcomposite-dev libxext-dev \
+            libappstream-dev desktop-file-utils appstream librsvg2-dev patchelf file \
+            curl git ca-certificates"
+          # shellcheck disable=SC2086
+          sudo apt install -y $DEPS || {
+            echo "apt resolver stuck; retrying via aptitude (may downgrade libunwind8)"
+            sudo apt install -y aptitude
+            # shellcheck disable=SC2086
+            sudo aptitude install -y $DEPS
+          }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # No cargo-c package on jammy — build it (cached by rust-cache).
+      - name: Install cargo-c
+        run: cargo install cargo-c --locked
+
+      - name: Build GNOME stack + glycin-loaders from source
+        # Jammy predates the app stack (gtk4-rs 0.11 wants GTK>=4.16 vs 4.6);
+        # see packaging/build-gnome-stack.sh. Runs whole-script as root:
+        # mixing runner-owned sources with `sudo meson install` breaks
+        # ninja's build-log writes. rustc comes from the toolchain step via
+        # the explicit PATH/RUSTUP_HOME/CARGO_HOME passthrough (sudo scrubs
+        # PATH via secure_path, and the rustup proxy needs its homes).
+        run: |
+          sudo env "PATH=$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" \
+            "RUSTUP_HOME=$HOME/.rustup" "CARGO_HOME=$HOME/.cargo" \
+            sh packaging/build-gnome-stack.sh
+
+      - name: Fetch linuxdeploy + appimagetool
+        run: |
+          curl -L -o linuxdeploy https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -L -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x linuxdeploy appimagetool
+          sudo mv linuxdeploy appimagetool /usr/local/bin/
+          linuxdeploy --version || true
+
+      - name: Build AppImage
+        run: |
+          ./packaging/build-appimage.sh Organizer.AppDir Organizer-x86_64.AppImage
+          ls -lh Organizer-x86_64.AppImage Organizer-x86_64.AppImage.zsync
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Organizer-x86_64.AppImage
+          path: |
+            Organizer-x86_64.AppImage
+            Organizer-x86_64.AppImage.zsync
+
+  release:
+    name: release (attach AppImage on tag)
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/Organizer-x86_64.AppImage/Organizer-x86_64.AppImage
+            dist/Organizer-x86_64.AppImage/Organizer-x86_64.AppImage.zsync
+          generate_release_notes: true
+
+  pages:
+    name: pages (download site)
+    runs-on: ubuntu-22.04
+    needs: build
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages
+      - uses: actions/deploy-pages@v4
+        id: deployment

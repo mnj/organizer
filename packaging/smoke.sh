@@ -1,7 +1,8 @@
 #!/bin/sh
 # Smoke test for Organizer distribution (spec #21).
 #
-# Two layers (mirrors CI .github/workflows/ci.yml):
+# Local pre-push checks (CI builds the AppImage only — see
+# .github/workflows/appimage.yml):
 #   1. headless tempdir acceptance — cargo test (Queue + Config + Dedup +
 #      Mover + Undo seam, no display required);
 #   2. bundled-layout checks — glycin-loaders 2+, bwrap, libseccomp,

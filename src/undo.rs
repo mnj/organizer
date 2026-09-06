@@ -35,6 +35,24 @@ impl UndoEntry {
     }
 }
 
+/// File Classification should target after an undo that may have suffixed `_undo_N`.
+///
+/// Prefer `override_path` when that restored file still exists; otherwise the
+/// Snapshot entry at `idx`. This is the same path Preview shows, so a Category
+/// key cannot classify the clash file occupying the original Snapshot name.
+pub fn classification_target(
+    snapshot: &[PathBuf],
+    idx: usize,
+    override_path: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(ov) = override_path {
+        if ov.exists() {
+            return Some(ov.to_path_buf());
+        }
+    }
+    snapshot.get(idx).cloned()
+}
+
 /// Push with LIFO cap 50 or queue length, whichever is smaller (ADR 0005).
 /// `queue_len` is Snapshot length; cap = min(50, queue_len). If queue_len is 0, no push.
 pub fn push_undo_capped(stack: &mut Vec<UndoEntry>, entry: UndoEntry, queue_len: usize) {
@@ -191,6 +209,42 @@ mod tests {
         // oldest 5 should be evicted, so first is f5
         assert_eq!(stack[0].src_name, "f5.jpg");
         assert_eq!(stack[49].src_name, "f54.jpg");
+    }
+
+    #[test]
+    fn classification_target_prefers_existing_override_over_snapshot_slot() {
+        use std::fs;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let clash = dir.path().join("foo.jpg");
+        let restored = dir.path().join("foo_undo_1.jpg");
+        fs::write(&clash, b"clash").unwrap();
+        fs::write(&restored, b"restored").unwrap();
+        let snapshot = vec![clash.clone()];
+        let target = classification_target(&snapshot, 0, Some(&restored)).unwrap();
+        assert_eq!(
+            target, restored,
+            "Classification must use the restored _undo_N file, not the clash occupying the Snapshot name"
+        );
+    }
+
+    #[test]
+    fn classification_target_falls_back_to_snapshot_when_override_missing() {
+        use std::fs;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let original = dir.path().join("foo.jpg");
+        fs::write(&original, b"orig").unwrap();
+        let snapshot = vec![original.clone()];
+        let missing = dir.path().join("foo_undo_1.jpg");
+        let target = classification_target(&snapshot, 0, Some(&missing)).unwrap();
+        assert_eq!(target, original);
+    }
+
+    #[test]
+    fn classification_target_none_when_index_out_of_range() {
+        let snapshot: Vec<PathBuf> = vec![PathBuf::from("/tmp/a.jpg")];
+        assert!(classification_target(&snapshot, 1, None).is_none());
     }
 
     #[test]

@@ -151,6 +151,21 @@ pub fn default_categories() -> Vec<Category> {
     ]
 }
 
+/// Persistable form of Categories: trimmed display/shortcut, slug folder_name.
+/// Classification creates `Source Folder/<folder_name>/`, so the stored folder
+/// must already be the slug the Settings preview shows (`a-z0-9_-`), not the
+/// raw typed text.
+pub fn canonicalize_categories(categories: &[Category]) -> Vec<Category> {
+    categories
+        .iter()
+        .map(|c| Category {
+            display_name: c.display_name.trim().to_string(),
+            folder_name: slugify(&c.folder_name),
+            shortcut: c.shortcut.trim().to_string(),
+        })
+        .collect()
+}
+
 /// First unused shortcut `1`-`9`, or `None` when all are taken.
 /// Pure helper for the Settings Add flow so it never invents a duplicate.
 pub fn first_free_shortcut(categories: &[Category]) -> Option<String> {
@@ -296,6 +311,29 @@ mod tests {
         ];
         let err = validate_categories(&slash).unwrap_err();
         assert!(err.iter().any(|e| matches!(e, ValidationError::ReservedPath(_))), "got {err:?}");
+    }
+
+    #[test]
+    fn canonicalize_categories_trims_and_slugifies_folder_name() {
+        let cats = vec![Category {
+            display_name: "  Top Picks  ".into(),
+            folder_name: "Top Picks".into(),
+            shortcut: " 1 ".into(),
+        }];
+        let out = canonicalize_categories(&cats);
+        assert_eq!(out[0].display_name, "Top Picks");
+        assert_eq!(out[0].folder_name, "top_picks");
+        assert_eq!(out[0].shortcut, "1");
+        // Idempotent on already-canonical input.
+        assert_eq!(canonicalize_categories(&out), out);
+        // A typed database filename cannot survive as a folder (would collide
+        // with organizer.db); the slug strips the dot.
+        let db_name = vec![Category {
+            display_name: "Db".into(),
+            folder_name: "organizer.db".into(),
+            shortcut: "1".into(),
+        }];
+        assert_eq!(canonicalize_categories(&db_name)[0].folder_name, "organizerdb");
     }
 
     #[test]

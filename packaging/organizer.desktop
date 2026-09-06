@@ -8,5 +8,6 @@ Type=Application
 Categories=Graphics;Photography;
 Terminal=false
 StartupNotify=true
+StartupWMClass=io.github.mnj.Organizer
 MimeType=image/png;image/jpeg;image/webp;image/gif;image/bmp;image/tiff;image/avif;image/heif;image/svg+xml;video/webm;video/mp4;video/x-matroska;video/quicktime;video/x-msvideo;
 X-AppImage-Name=Organizer

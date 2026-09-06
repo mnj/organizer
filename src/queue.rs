@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 const SUPPORTED_EXTS: &[&str] = &[
     // stills / animated stills via glycin
     "png", "jpg", "jpeg", "bmp", "tiff", "tif", "webp", "gif", "avif", "heic", "heif", "svg",
-    "ico",
+    "svgz", "ico",
     // video via GStreamer
     "webm", "mp4", "mov", "mkv", "avi",
 ];
@@ -99,6 +99,7 @@ mod tests {
         touch(p, "10.jpg");
         touch(p, "2.jpg");
         touch(p, "clip.webm");
+        touch(p, "icon.svgz");
         touch(p, "photo.TIFF");
         // Legacy + other unsupported silently skipped (#25)
         touch(p, "organizer.toml");
@@ -114,10 +115,18 @@ mod tests {
         let names = snapshot_names(p);
 
         // Expected: only supported, natural sorted case-insensitive
-        // Natural order: 2.jpg, 10.jpg, a.png, b.JPG, clip.webm, photo.TIFF
+        // Natural order: 2.jpg, 10.jpg, a.png, b.JPG, clip.webm, icon.svgz, photo.TIFF
         assert_eq!(
             names,
-            vec!["2.jpg", "10.jpg", "a.png", "b.JPG", "clip.webm", "photo.TIFF"],
+            vec![
+                "2.jpg",
+                "10.jpg",
+                "a.png",
+                "b.JPG",
+                "clip.webm",
+                "icon.svgz",
+                "photo.TIFF"
+            ],
             "snapshot must be filtered and natural sorted: got {names:?}"
         );
         // Ensure legacy and other unsupported not present

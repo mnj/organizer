@@ -149,6 +149,7 @@ fn desktop_file_is_valid_entry() {
             "Icon=organizer",
             "Type=Application",
             "Categories=",
+            "StartupWMClass=io.github.mnj.Organizer",
         ],
     );
 }

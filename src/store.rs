@@ -1,4 +1,4 @@
-use crate::config::{default_categories, validate_categories, Category, ValidationError};
+use crate::config::{canonicalize_categories, default_categories, validate_categories, Category, ValidationError};
 use crate::dedup::{is_valid_hash, FileHash};
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 use std::collections::HashSet;
@@ -520,9 +520,11 @@ impl Store {
     }
 
     /// Replace all Categories atomically after running existing validation.
-    /// On validation failure the database is left unchanged.
+    /// Folder names are stored as slugs (`a-z0-9_-`) so Classification never
+    /// creates a raw typed path. On validation failure the database is unchanged.
     pub fn set_categories(&self, categories: &[Category]) -> Result<(), StoreError> {
-        validate_categories(categories).map_err(StoreError::Validation)?;
+        let categories = canonicalize_categories(categories);
+        validate_categories(&categories).map_err(StoreError::Validation)?;
         retry_on_busy(|| {
             let mut conn = self.connection()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -831,6 +833,34 @@ mod tests {
         assert_eq!(store.categories().unwrap(), nine);
         // Restore defaults check: before was 3 defaults, now nine — proves writes work when valid.
         assert_ne!(before, nine);
+    }
+
+    #[test]
+    fn set_categories_stores_slug_not_raw_folder_name() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        let store = Store::open(&source).unwrap();
+        store
+            .set_categories(&[Category {
+                display_name: "  Top Picks  ".into(),
+                folder_name: "Top Picks".into(),
+                shortcut: "1".into(),
+            }])
+            .unwrap();
+        let got = store.categories().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].display_name, "Top Picks");
+        assert_eq!(got[0].folder_name, "top_picks");
+        assert_eq!(got[0].shortcut, "1");
+        // Typed organizer.db must not be stored as a folder (file/dir clash).
+        store
+            .set_categories(&[Category {
+                display_name: "Db".into(),
+                folder_name: "organizer.db".into(),
+                shortcut: "1".into(),
+            }])
+            .unwrap();
+        assert_eq!(store.categories().unwrap()[0].folder_name, "organizerdb");
     }
 
     #[test]

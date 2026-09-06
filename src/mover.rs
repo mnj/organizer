@@ -1,3 +1,4 @@
+use crate::config::slugify;
 use crate::dedup::FileHash;
 use crate::store::{FileRecord, Store};
 use std::path::{Path, PathBuf};
@@ -185,6 +186,7 @@ pub fn classify_file(
 ) -> Result<ClassifyOutcome, MoverError> {
     let hash_lower = hash.as_str().to_ascii_lowercase();
     let source_folder = store.source_folder().to_path_buf();
+    let folder_name = slugify(folder_name);
     if folder_name.is_empty() {
         return Err(MoverError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -229,7 +231,7 @@ pub fn classify_file(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let dest_dir = dest_subdir(&source_folder, folder_name);
+    let dest_dir = dest_subdir(&source_folder, &folder_name);
     let dest_path = atomic_rename_with_suffix(&dest_dir, current_file, &file_name)?;
 
     let dest_file_name = dest_path
@@ -244,7 +246,7 @@ pub fn classify_file(
         hash,
         &original_rel,
         &final_rel,
-        folder_name,
+        &folder_name,
         size,
         mtime,
         triaged_at,
@@ -338,6 +340,20 @@ mod tests {
         // no extension
         fs::write(p.join("README"), b"x").unwrap();
         assert_eq!(resolve_collision_path(p, "README"), p.join("README_1"));
+    }
+
+    #[test]
+    fn classify_uses_slug_folder_not_raw_typed_name() {
+        let (_dir, source, store) = setup_source();
+        let foo = source.join("foo.jpg");
+        fs::write(&foo, b"slug dest").unwrap();
+        let hash = hash_of(&foo);
+        let outcome = classify_file(&store, &foo, "Top Picks", &hash).unwrap();
+        assert_eq!(outcome.dest(), &source.join("top_picks").join("foo.jpg"));
+        let rec = store.lookup(hash.as_str()).unwrap().expect("row must exist");
+        assert_eq!(rec.category_folder, "top_picks");
+        assert_eq!(rec.final_rel, "top_picks/foo.jpg");
+        assert!(!source.join("Top Picks").exists());
     }
 
     #[test]

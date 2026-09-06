@@ -21,13 +21,23 @@ pub struct SweepMatch {
     pub triaged_at: i64,
 }
 
+/// One per-file failure: hash during scan, or apply (trash/perm-delete).
+/// The run continues with remaining files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyError {
+    pub path: PathBuf,
+    pub message: String,
+}
+
 /// Read-only Sweep report: matched files plus scan counts. Never modifies files or database.
+/// Unreadable files are recorded in `hash_errors` and skipped; other files still match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepReport {
     pub target: PathBuf,
     pub reference_db: PathBuf,
     pub scanned: usize,
     pub matches: Vec<SweepMatch>,
+    pub hash_errors: Vec<ApplyError>,
 }
 
 #[derive(Debug)]
@@ -36,7 +46,6 @@ pub enum SweepError {
     TargetUnreadable(PathBuf, String),
     MissingDatabase(PathBuf),
     Database(String),
-    HashFailed(PathBuf, String),
 }
 
 impl std::fmt::Display for SweepError {
@@ -50,9 +59,6 @@ impl std::fmt::Display for SweepError {
             }
             SweepError::MissingDatabase(p) => write!(f, "{}", missing_reference_message(p)),
             SweepError::Database(e) => write!(f, "{e}"),
-            SweepError::HashFailed(p, e) => {
-                write!(f, "failed to hash {}: {}", p.display(), e)
-            }
         }
     }
 }
@@ -262,10 +268,18 @@ pub fn run_sweep_report_with_filter(
             .collect()
     });
     let mut matches = Vec::new();
+    let mut hash_errors = Vec::new();
     for path in snapshot {
-        let hash = compute_sha256(&path)
-            .map(|h| h.to_ascii_lowercase())
-            .map_err(|e| SweepError::HashFailed(path.clone(), e.to_string()))?;
+        let hash = match compute_sha256(&path).map(|h| h.to_ascii_lowercase()) {
+            Ok(h) => h,
+            Err(e) => {
+                hash_errors.push(ApplyError {
+                    path,
+                    message: e.to_string(),
+                });
+                continue;
+            }
+        };
         let rec = store
             .lookup(&hash)
             .map_err(|e| SweepError::Database(e.to_string()))?;
@@ -288,6 +302,7 @@ pub fn run_sweep_report_with_filter(
         reference_db: db_path.to_path_buf(),
         scanned,
         matches,
+        hash_errors,
     })
 }
 
@@ -299,13 +314,6 @@ pub enum Action {
     Report,
     Trash,
     PermDelete,
-}
-
-/// One per-file apply failure: the run continues with remaining matches.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApplyError {
-    pub path: PathBuf,
-    pub message: String,
 }
 
 /// Outcome of a Sweep run with an Action: the read-only match report plus
@@ -326,6 +334,11 @@ impl SweepOutcome {
     /// the report lists what `--execute` would apply.
     pub fn is_dry_run(&self) -> bool {
         !self.executed && self.action != Action::Report
+    }
+
+    /// Per-file failures from scan (hash) plus apply (trash/perm-delete).
+    pub fn file_error_count(&self) -> usize {
+        self.errors.len() + self.report.hash_errors.len()
     }
 }
 
@@ -450,6 +463,26 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+/// Shared per-file error array (`hash_errors` / apply `errors`) so the
+/// machine-readable shape cannot drift between report and outcome JSON.
+fn push_file_errors_json(out: &mut String, field: &str, errors: &[ApplyError]) {
+    out.push_str(&format!("  \"{field}\": ["));
+    if errors.is_empty() {
+        out.push_str("],\n");
+        return;
+    }
+    out.push('\n');
+    for (i, e) in errors.iter().enumerate() {
+        out.push_str(&format!(
+            "    {{\"path\": \"{}\", \"message\": \"{}\"}}{}\n",
+            json_escape(&e.path.to_string_lossy()),
+            json_escape(&e.message),
+            if i + 1 == errors.len() { "" } else { "," }
+        ));
+    }
+    out.push_str("  ],\n");
+}
+
 /// Shared `matches` array serializer for report and outcome JSON so the
 /// machine-readable match shape cannot drift between the two.
 fn push_matches_json(out: &mut String, matches: &[SweepMatch]) {
@@ -500,6 +533,15 @@ fn format_table(report: &SweepReport) -> String {
             ));
         }
     }
+    if !report.hash_errors.is_empty() {
+        out.push_str(&format!(
+            "Hash errors: {} file(s) skipped:\n",
+            report.hash_errors.len()
+        ));
+        for e in &report.hash_errors {
+            out.push_str(&format!("  {}: {}\n", e.path.display(), e.message));
+        }
+    }
     out
 }
 
@@ -516,6 +558,7 @@ fn format_json(report: &SweepReport) -> String {
     ));
     out.push_str(&format!("  \"scanned\": {},\n", report.scanned));
     out.push_str(&format!("  \"matched\": {},\n", report.matches.len()));
+    push_file_errors_json(&mut out, "hash_errors", &report.hash_errors);
     push_matches_json(&mut out, &report.matches);
     out.push_str("}\n");
     out
@@ -550,6 +593,7 @@ pub fn format_outcome(outcome: &SweepOutcome, format: OutputFormat) -> String {
             ));
             out.push_str(&format!("  \"scanned\": {},\n", outcome.report.scanned));
             out.push_str(&format!("  \"matched\": {},\n", outcome.report.matches.len()));
+            push_file_errors_json(&mut out, "hash_errors", &outcome.report.hash_errors);
             out.push_str(&format!(
                 "  \"action\": \"{}\",\n",
                 outcome.action.as_str()
@@ -573,21 +617,7 @@ pub fn format_outcome(outcome: &SweepOutcome, format: OutputFormat) -> String {
                 }
                 out.push_str("  ],\n");
             }
-            out.push_str("  \"errors\": [");
-            if outcome.errors.is_empty() {
-                out.push_str("],\n");
-            } else {
-                out.push('\n');
-                for (i, e) in outcome.errors.iter().enumerate() {
-                    out.push_str(&format!(
-                        "    {{\"path\": \"{}\", \"message\": \"{}\"}}{}\n",
-                        json_escape(&e.path.to_string_lossy()),
-                        json_escape(&e.message),
-                        if i + 1 == outcome.errors.len() { "" } else { "," }
-                    ));
-                }
-                out.push_str("  ],\n");
-            }
+            push_file_errors_json(&mut out, "errors", &outcome.errors);
             push_matches_json(&mut out, &outcome.report.matches);
             out.push_str("}\n");
             out
@@ -659,6 +689,68 @@ mod tests {
         assert_eq!(fs::read(&known).unwrap(), b"known content");
         assert_eq!(store.all_hashes().unwrap().len(), 1);
         assert!(!store.contains(&compute_sha256(&unknown).unwrap()).unwrap());
+        assert!(report.hash_errors.is_empty());
+    }
+
+    #[test]
+    fn hash_failure_skips_that_file_and_continues_with_the_rest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let store = Store::open(&source).unwrap();
+
+        let target = tmp.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        let known = write_target(&target, "known.jpg", b"known content");
+        let locked = write_target(&target, "locked.jpg", b"locked content");
+        insert_known(&store, &known, "known.jpg", "keep", 11);
+        // Same bytes as a known hash so this *would* match if hashing succeeded.
+        insert_known(&store, &locked, "locked.jpg", "keep", 12);
+
+        let mut perms = fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&locked, perms).unwrap();
+
+        let outcome = run_sweep_with_action(
+            &target,
+            &store.db_path(),
+            None,
+            Action::PermDelete,
+            true,
+        );
+        // Restore so TempDir cleanup and later asserts can read the file.
+        let mut restore = fs::metadata(&locked)
+            .map(|m| m.permissions())
+            .unwrap_or_else(|_| fs::Permissions::from_mode(0o644));
+        restore.set_mode(0o644);
+        let _ = fs::set_permissions(&locked, restore);
+
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.report.scanned, 2, "unreadable files still count as scanned");
+        assert_eq!(
+            outcome.report.matches.len(),
+            1,
+            "readable match must still be reported"
+        );
+        assert_eq!(outcome.report.matches[0].path, known);
+        assert_eq!(outcome.report.hash_errors.len(), 1);
+        assert_eq!(outcome.report.hash_errors[0].path, locked);
+        assert_eq!(outcome.file_error_count(), 1);
+        assert_eq!(outcome.removed, vec![known.clone()]);
+        assert!(!known.exists(), "readable match is still applied");
+        assert!(locked.exists(), "unhashed file must not be applied");
+
+        let table = format_outcome(&outcome, OutputFormat::Table);
+        assert!(
+            table.contains("Hash errors: 1 file(s) skipped:"),
+            "table must list hash failures:\n{table}"
+        );
+        assert!(table.contains("locked.jpg"), "table must name the skipped file:\n{table}");
+        let json = format_outcome(&outcome, OutputFormat::Json);
+        assert!(json.contains("\"hash_errors\""), "json must carry hash_errors:\n{json}");
+        assert!(json.contains("locked.jpg"), "json must name the skipped file:\n{json}");
     }
 
     #[test]
@@ -1260,6 +1352,7 @@ mod tests {
                 reference_db: PathBuf::from("/tmp/source/organizer.db"),
                 scanned: 2,
                 matches: vec![first.clone(), second.clone()],
+                hash_errors: Vec::new(),
             },
             action: Action::Trash,
             executed: true,

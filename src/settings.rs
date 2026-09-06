@@ -2,7 +2,10 @@ use gtk4::prelude::*;
 use gtk4::{gio, glib, ApplicationWindow, Box as GtkBox, Button, Entry, Label, Orientation};
 use libadwaita as adw;
 use adw::prelude::*;
-use crate::config::{first_free_shortcut, slugify, suggest_unique_category, validate_categories, Category};
+use crate::config::{
+    canonicalize_categories, first_free_shortcut, slugify, suggest_unique_category,
+    validate_categories, Category,
+};
 use crate::store::Store;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -110,6 +113,64 @@ fn swap_categories(categories: &mut Vec<Category>, i: usize, j: usize) {
     }
 }
 
+/// Validate the draft, persist slug folder names, and only then update live/disk.
+/// Returns Err without touching live/disk when validation or the database write fails.
+fn persist_categories(
+    store: &Store,
+    categories: &[Category],
+    live: &Rc<RefCell<Vec<Category>>>,
+    disk: &Rc<RefCell<Vec<Category>>>,
+    rebuild_bar: &Rc<dyn Fn()>,
+) -> Result<(), String> {
+    if let Err(errs) = validate_categories(categories) {
+        return Err(errs
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+    let canonical = canonicalize_categories(categories);
+    store
+        .set_categories(&canonical)
+        .map_err(|e| e.to_string())?;
+    *live.borrow_mut() = canonical.clone();
+    *disk.borrow_mut() = canonical;
+    rebuild_bar();
+    Ok(())
+}
+
+/// Whether closing the settings dialog must prompt Save/Discard/Cancel.
+/// Pure seam for the close_request handler: prompt exactly when the draft
+/// differs from the last-saved disk state.
+pub(crate) fn needs_save_prompt(draft: &[Category], disk: &[Category]) -> bool {
+    draft != disk
+}
+
+/// Reconcile state on Discard/Cancel: restore both live preview and draft
+/// to disk so a follow-up close_request sees a clean state and proceeds.
+/// Forgetting draft here re-prompts forever (discard loop).
+pub(crate) fn apply_discard(
+    live: &Rc<RefCell<Vec<Category>>>,
+    draft: &Rc<RefCell<Vec<Category>>>,
+    disk: &[Category],
+) {
+    *live.borrow_mut() = disk.to_vec();
+    *draft.borrow_mut() = disk.to_vec();
+}
+
+/// Reconcile draft after a successful Save: draft tracks the canonical disk
+/// state so a follow-up close_request proceeds instead of re-prompting.
+pub(crate) fn apply_saved(draft: &Rc<RefCell<Vec<Category>>>, disk: &[Category]) {
+    *draft.borrow_mut() = disk.to_vec();
+}
+
+fn show_save_error(parent: &adw::PreferencesWindow, message: &str) {
+    let dlg = gtk4::AlertDialog::builder()
+        .message(format!("Failed to save: {message}"))
+        .build();
+    dlg.show(Some(parent));
+}
+
 /// Open modal settings dialog. Uses AdwPreferencesWindow when libadwaita is available,
 /// fallback is plain gtk4::Window. Shows 3-field rows + Add/Remove/Up/Down,
 /// live slug preview, inline per-row errors, Save sensitive=valid, Add disabled at 9,
@@ -215,7 +276,8 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
                         if err.folder { h.folder.add_css_class("error"); } else { h.folder.remove_css_class("error"); }
                         if err.shortcut { h.dropdown.add_css_class("error"); } else { h.dropdown.remove_css_class("error"); }
                     }
-                    *live.borrow_mut() = categories.clone();
+                    // Live Classification uses slugs; the form keeps the raw typed text.
+                    *live.borrow_mut() = canonicalize_categories(&categories);
                     rebuild_bar();
                 }
                 Err(errs) => {
@@ -464,6 +526,11 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
     }
 
     // Save
+    // allow_close bypasses the close_request prompt after an explicit
+    // Save/Discard/Cancel already reconciled draft with disk. Without it,
+    // dialog.close() re-enters close_request, sees stale draft != disk,
+    // and re-prompts forever (discard loop).
+    let allow_close: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
     {
         let dialog = adw_win.clone();
         let store = ctx.store.clone();
@@ -471,32 +538,33 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
         let live = ctx.live_categories.clone();
         let disk = ctx.disk_categories.clone();
         let rebuild_bar = ctx.rebuild_category_bar.clone();
+        let allow_close = allow_close.clone();
         btn_save.connect_clicked(move |_| {
             let collected = draft.borrow().clone();
-            if validate_categories(&collected).is_err() { return; }
-            match store.set_categories(&collected) {
+            match persist_categories(&store, &collected, &live, &disk, &rebuild_bar) {
                 Ok(()) => {
-                    *live.borrow_mut() = collected.clone();
-                    *disk.borrow_mut() = collected.clone();
-                    rebuild_bar();
-                    dialog.close();
+                    let saved = disk.borrow().clone();
+                    apply_saved(&draft, &saved);
+                    *allow_close.borrow_mut() = true;
+                    dialog.close()
                 }
-                Err(e) => {
-                    let dlg = gtk4::AlertDialog::builder().message(format!("Failed to save: {e}")).build();
-                    dlg.show(Some(&dialog));
-                }
+                Err(e) => show_save_error(&dialog, &e),
             }
         });
     }
     // Cancel
     {
         let dialog = adw_win.clone();
+        let draft = draft_categories.clone();
         let live = ctx.live_categories.clone();
         let disk = ctx.disk_categories.clone();
         let rebuild_bar = ctx.rebuild_category_bar.clone();
+        let allow_close = allow_close.clone();
         btn_cancel.connect_clicked(move |_| {
-            *live.borrow_mut() = disk.borrow().clone();
+            let saved = disk.borrow().clone();
+            apply_discard(&live, &draft, &saved);
             rebuild_bar();
+            *allow_close.borrow_mut() = true;
             dialog.close();
         });
     }
@@ -508,10 +576,14 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
         let disk = ctx.disk_categories.clone();
         let store = ctx.store.clone();
         let rebuild_bar = ctx.rebuild_category_bar.clone();
+        let allow_close = allow_close.clone();
         adw_win.connect_close_request(move |w| {
+            if *allow_close.borrow() {
+                return glib::Propagation::Proceed;
+            }
             let collected = draft.borrow().clone();
             let saved = disk.borrow().clone();
-            if collected == saved {
+            if !needs_save_prompt(&collected, &saved) {
                 return glib::Propagation::Proceed;
             }
             let alert = gtk4::AlertDialog::builder()
@@ -523,23 +595,31 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
                 .build();
             let dialog = w.clone();
             let store = store.clone();
+            let draft = draft.clone();
             let live = live.clone();
             let disk = disk.clone();
             let rebuild_bar = rebuild_bar.clone();
+            let allow_close = allow_close.clone();
             let collected = collected.clone();
             alert.choose(Some(w), gio::Cancellable::NONE, move |res| {
                 if let Ok(idx) = res {
                     match idx {
                         0 => {
-                            let _ = store.set_categories(&collected);
-                            *live.borrow_mut() = collected.clone();
-                            *disk.borrow_mut() = collected.clone();
-                            rebuild_bar();
-                            dialog.close();
+                            match persist_categories(&store, &collected, &live, &disk, &rebuild_bar) {
+                                Ok(()) => {
+                                    let saved = disk.borrow().clone();
+                                    apply_saved(&draft, &saved);
+                                    *allow_close.borrow_mut() = true;
+                                    dialog.close()
+                                }
+                                Err(e) => show_save_error(&dialog, &e),
+                            }
                         }
                         1 => {
-                            *live.borrow_mut() = disk.borrow().clone();
+                            let saved = disk.borrow().clone();
+                            apply_discard(&live, &draft, &saved);
                             rebuild_bar();
+                            *allow_close.borrow_mut() = true;
                             dialog.close();
                         }
                         _ => {}
@@ -551,4 +631,61 @@ pub fn open_settings(parent: &ApplicationWindow, ctx: SettingsContext) {
     }
 
     adw_win.present();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Category;
+
+    fn cats(names: &[&str]) -> Vec<Category> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| Category {
+                display_name: (*n).into(),
+                folder_name: n.to_ascii_lowercase().replace(' ', "_"),
+                shortcut: format!("{}", i + 1),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn close_prompts_only_when_draft_differs_from_disk() {
+        let disk = cats(&["Keep", "Maybe"]);
+        let clean = disk.clone();
+        assert!(!needs_save_prompt(&clean, &disk));
+        let mut dirty = disk.clone();
+        dirty.push(Category {
+            display_name: "New".into(),
+            folder_name: "new".into(),
+            shortcut: "3".into(),
+        });
+        assert!(needs_save_prompt(&dirty, &disk));
+    }
+
+    #[test]
+    fn discard_resets_draft_so_second_close_proceeds() {
+        // Regression for the discard infinite-prompt loop: Discard must
+        // reconcile both live and draft, otherwise close_request re-prompts.
+        let disk = cats(&["Keep", "Maybe"]);
+        let live: Rc<RefCell<Vec<Category>>> =
+            Rc::new(RefCell::new(cats(&["Keep", "Maybe", "New"])));
+        let draft: Rc<RefCell<Vec<Category>>> = Rc::new(RefCell::new(live.borrow().clone()));
+        assert!(needs_save_prompt(&draft.borrow(), &disk));
+        let saved = disk.clone();
+        apply_discard(&live, &draft, &saved);
+        assert_eq!(*live.borrow(), disk);
+        assert!(!needs_save_prompt(&draft.borrow(), &disk));
+    }
+
+    #[test]
+    fn saved_draft_tracks_disk_so_second_close_proceeds() {
+        let disk = cats(&["Keep", "Maybe"]);
+        let draft: Rc<RefCell<Vec<Category>>> =
+            Rc::new(RefCell::new(cats(&["Keep", "Maybe", "New"])));
+        assert!(needs_save_prompt(&draft.borrow(), &disk));
+        apply_saved(&draft, &disk);
+        assert!(!needs_save_prompt(&draft.borrow(), &disk));
+    }
 }

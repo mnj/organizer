@@ -17,12 +17,12 @@ The file at the queue index currently shown in preview; the target of Classifica
 _Avoid_: Selected file, active file
 
 **Supported Format**:
-A file extension decodeable by glycin (png, jpg/jpeg, bmp, tiff/tif, webp, gif-anim, avif/heic/heif/svg/ico) or GStreamer (webm/mp4/mov/mkv/avi); only these enter the Queue.
+A file extension decodeable by glycin (png, jpg/jpeg, bmp, tiff/tif, webp, gif-anim, avif/heic/heif/svg/svgz/ico) or GStreamer (webm/mp4/mov/mkv/avi); only these enter the Queue.
 _Avoid_: Image type, valid file
 
 **Unsupported File**:
-A file with an extension outside Supported Format; shown as a placeholder card with filename and “Unsupported” badge, skippable via Next/Prev but never moved or hashed.
-_Avoid_: Invalid file, skipped file
+A file with an extension outside Supported Format; excluded from the Queue Snapshot and never shown, moved, or hashed.
+_Avoid_: Invalid file, skipped file, placeholder
 
 **Category**:
 A user-configured triage destination with a display name, folder name (subfolder of Source Folder), and shortcut; moving Current File to it records its sha256 in the Organizer Database.

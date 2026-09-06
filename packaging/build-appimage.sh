@@ -116,7 +116,9 @@ cargo cinstall \
 #    without loaders would fail its own acceptance (sandbox-missing dialog
 #    on loader-less hosts), so never ship one silently.
 if [ -d /tmp/glycin/builddir ]; then
-  DESTDIR="$PWD/$APPDIR" meson install -C /tmp/glycin/builddir
+  # --no-rebuild: the tree is already compiled; a default install would
+  # re-invoke ninja/cargo and fail on locks (or waste minutes rebuilding).
+  DESTDIR="$PWD/$APPDIR" meson install -C /tmp/glycin/builddir --no-rebuild
 elif [ -d /usr/libexec/glycin-loaders ]; then
   mkdir -p "$APPDIR/usr/libexec" "$APPDIR/usr/share"
   cp -r /usr/libexec/glycin-loaders "$APPDIR/usr/libexec/"

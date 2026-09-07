@@ -112,6 +112,11 @@ jobs:
 
   pages:
     name: pages (download site)
+    # The github-pages environment only allows deploys from main (tag
+    # pushes are rejected by its branch policy). The site is static and
+    # links at releases/latest, so deploying from main is sufficient —
+    # tag pushes still build + release the AppImage above.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
     needs: build
     permissions:

@@ -1,6 +1,6 @@
 # Organizer
 
-File-triaging desktop app — shows one image at a time and moves it to a
+File-classifying desktop app — shows one media file at a time and moves it to a
 chosen action folder with shortcuts, while tracking duplicates by content
 hash. Native GTK4 Rust, maximized split-view: **Preview** on top,
 **Action Bar** below. This is mostly done with Muse Spark 1.3 and Grok 4.6.
@@ -8,7 +8,7 @@ hash. Native GTK4 Rust, maximized split-view: **Preview** on top,
 ## Quick start
 
 ```sh
-organizer /tmp/src        # triage a folder
+organizer /tmp/src        # classify a folder
 organizer                 # folder picker when no arg is given
 ```
 
